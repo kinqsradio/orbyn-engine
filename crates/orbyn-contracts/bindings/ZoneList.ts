@@ -4,4 +4,12 @@ import type { Zone } from "./Zone";
 /**
  * `GET /v1/zones`, deleted zones included.
  */
-export type ZoneList = { zones: Array<Zone>, };
+export type ZoneList = { 
+/**
+ * Up to 500 zones by name, deleted ones included.
+ */
+zones: Array<Zone>, 
+/**
+ * When there are more, pass this as `after` to `GET /v1/zones` for the next page.
+ */
+next?: string, };

@@ -201,6 +201,8 @@ impl Store {
 
         let mut conflicts = Vec::new();
         let mut live_delta: i64 = 0;
+        let mut rows_delta: i64 = 0;
+        let mut bytes_delta: i64 = 0;
         for change in &upload.changes {
             let server = current.get(change.record_id());
             let matches = match (change.expected_version(), server) {
@@ -216,6 +218,19 @@ impl Store {
                 continue;
             }
             let was_live = server.is_some_and(|r| !r.deleted);
+            if server.is_none() {
+                rows_delta += 1;
+            }
+            let old_bytes = server.map_or(0, record_bytes);
+            let new_bytes = match change {
+                Change::Save {
+                    ciphertext,
+                    wrapped_key,
+                    ..
+                } => (ciphertext.len() + wrapped_key.len()) as i64,
+                Change::Delete { .. } => 0,
+            };
+            bytes_delta += new_bytes - old_bytes;
             live_delta += match (change, was_live) {
                 (Change::Save { .. }, false) => 1,
                 (Change::Delete { .. }, true) => -1,
@@ -226,8 +241,24 @@ impl Store {
             return Err(StoreError::RecordChanged(conflicts));
         }
         let live = i64::from(row.live_records) + live_delta;
-        if live > i64::from(self.limits.max_records_per_zone) {
+        // Tombstones count towards the record limit, so delete-and-recreate
+        // cannot grow a zone without limit.
+        if row.total_records + rows_delta > i64::from(self.limits.max_records_per_zone) {
             return Err(StoreError::TooManyRecords);
+        }
+        // The account's stored bytes across its zones. Checked under this
+        // zone's lock only, so concurrent uploads to other zones can overshoot
+        // by at most one batch each; that bound is accepted.
+        if bytes_delta > 0 {
+            let used: i64 = sqlx::query_scalar(
+                "SELECT coalesce(sum(stored_bytes), 0)::bigint FROM zones WHERE owner_id = $1",
+            )
+            .bind(session.account_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if used + bytes_delta > self.limits.max_account_bytes {
+                return Err(StoreError::QuotaExceeded);
+            }
         }
 
         let modified_at: DateTime<Utc> = sqlx::query_scalar("SELECT now()")
@@ -286,12 +317,17 @@ impl Store {
                 deleted,
             });
         }
-        sqlx::query("UPDATE zones SET seq = $2, live_records = $3 WHERE id = $1")
-            .bind(row.id)
-            .bind(seq)
-            .bind(i32::try_from(live).map_err(|_| StoreError::Internal)?)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "UPDATE zones SET seq = $2, live_records = $3, total_records = total_records + $4,
+                              stored_bytes = stored_bytes + $5 WHERE id = $1",
+        )
+        .bind(row.id)
+        .bind(seq)
+        .bind(i32::try_from(live).map_err(|_| StoreError::Internal)?)
+        .bind(i32::try_from(rows_delta).map_err(|_| StoreError::Internal)?)
+        .bind(bytes_delta)
+        .execute(&mut *tx)
+        .await?;
 
         let stored = Stored {
             seq,
@@ -426,6 +462,13 @@ fn replay(zone: Uuid, stored: Stored) -> Result<UploadResult> {
             .collect(),
         replayed: true,
     })
+}
+
+/// Bytes a stored record uses: its ciphertext and wrapped key.
+fn record_bytes(record: &Record) -> i64 {
+    let c = record.ciphertext.as_ref().map_or(0, Vec::len);
+    let k = record.wrapped_key.as_ref().map_or(0, Vec::len);
+    (c + k) as i64
 }
 
 #[cfg(test)]

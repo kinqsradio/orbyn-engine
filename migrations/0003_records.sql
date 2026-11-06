@@ -13,6 +13,10 @@ CREATE TABLE zones (
     name         text        NOT NULL CHECK (char_length(name) BETWEEN 1 AND 64),
     seq          bigint      NOT NULL DEFAULT 0 CHECK (seq >= 0),
     live_records integer     NOT NULL DEFAULT 0 CHECK (live_records >= 0),
+    -- Every record row, tombstones included, and the bytes they store: the
+    -- quotas count these, so deleting and recreating cannot grow without limit.
+    total_records integer    NOT NULL DEFAULT 0 CHECK (total_records >= 0),
+    stored_bytes  bigint     NOT NULL DEFAULT 0 CHECK (stored_bytes >= 0),
     created_at   timestamptz NOT NULL DEFAULT now(),
     -- Set when the zone is deleted: every record is a tombstone. Creating the
     -- zone again clears it and keeps the sequence, so old tokens stay valid.

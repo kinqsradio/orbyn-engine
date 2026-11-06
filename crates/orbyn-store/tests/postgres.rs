@@ -291,7 +291,7 @@ async fn tombstones_appear_in_changes_and_a_deleted_zone_comes_back_empty() {
         .await
         .expect_err("deleted");
     assert!(matches!(err, StoreError::ZoneDeleted));
-    let zones = store.list_zones(&me).await.expect("list");
+    let zones = store.list_zones(&me, None).await.expect("list").0;
     assert!(zones[0].deleted);
 
     let (zone, created) = store.create_zone(&me, "list").await.expect("recreate");
@@ -386,9 +386,10 @@ async fn changes_come_in_sequence_order_page_by_page() {
         assert!(matches!(err, StoreError::InvalidToken), "{bad}: {err:?}");
     }
     let current = store
-        .list_zones(&me)
+        .list_zones(&me, None)
         .await
         .expect("list")
+        .0
         .into_iter()
         .find(|z| z.name == "z")
         .expect("z")
@@ -452,7 +453,14 @@ async fn another_account_cannot_see_or_write_the_zone() {
         .await
         .expect_err("hidden");
     assert!(matches!(err, StoreError::ZoneNotFound));
-    assert!(store.list_zones(&them).await.expect("list").is_empty());
+    assert!(
+        store
+            .list_zones(&them, None)
+            .await
+            .expect("list")
+            .0
+            .is_empty()
+    );
 
     // The same name in their database is their own zone.
     let (theirs, created) = store.create_zone(&them, "private").await.expect("create");
@@ -492,7 +500,7 @@ async fn a_pending_or_removed_device_cannot_read_or_write() {
     let pending = device(&db, me.account_id, "pending").await;
     let checks = [
         store.create_zone(&pending, "new").await.err(),
-        store.list_zones(&pending).await.err(),
+        store.list_zones(&pending, None).await.err(),
         store
             .fetch_changes(&pending, "inbox", None, None)
             .await
@@ -514,7 +522,7 @@ async fn a_pending_or_removed_device_cannot_read_or_write() {
         .execute(db.pool())
         .await
         .expect("remove");
-    let err = store.list_zones(&me).await.expect_err("removed");
+    let err = store.list_zones(&me, None).await.expect_err("removed");
     assert!(matches!(err, StoreError::DeviceNotTrusted));
 }
 
@@ -536,10 +544,15 @@ async fn limits_are_enforced() {
     store.create_zone(&me, "two").await.expect("two");
     let err = store.create_zone(&me, "three").await.expect_err("limit");
     assert!(matches!(err, StoreError::TooManyZones));
+    // A deleted zone still counts until it is purged, so its slot is not free
+    // for a new name, but it can be brought back.
     store.delete_zone(&me, "two").await.expect("delete");
-    store.create_zone(&me, "three").await.expect("room again");
-    let err = store.create_zone(&me, "two").await.expect_err("limit");
+    let err = store
+        .create_zone(&me, "three")
+        .await
+        .expect_err("deleted still counts");
     assert!(matches!(err, StoreError::TooManyZones));
+    store.create_zone(&me, "two").await.expect("bring back");
 
     for name in ["", &"z".repeat(65), "tab\there"] {
         let err = store.create_zone(&me, name).await.expect_err("name");
@@ -600,15 +613,25 @@ async fn limits_are_enforced() {
         .await
         .expect_err("full");
     assert!(matches!(err, StoreError::TooManyRecords));
-    // A tombstone frees its place.
-    store
+    // A tombstone keeps its place until it is purged, so a new id is still
+    // refused, but the deleted id itself can be saved again.
+    let err = store
         .upload(
             &me,
             "one",
             &batch(vec![delete("r0", 1), save("r3", None, b"x")]),
         )
         .await
-        .expect("delete and save");
+        .expect_err("tombstones count");
+    assert!(matches!(err, StoreError::TooManyRecords));
+    store
+        .upload(&me, "one", &batch(vec![delete("r0", 1)]))
+        .await
+        .expect("delete");
+    store
+        .upload(&me, "one", &batch(vec![save("r0", Some(4), b"x")]))
+        .await
+        .expect("save the deleted id again");
 }
 
 #[tokio::test]
@@ -728,4 +751,142 @@ async fn other_devices_hear_committed_changes_across_replicas() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn creating_zones_never_deadlocks_with_removing_the_device() {
+    let (store, db) = store().await;
+    let me = trusted(&db).await;
+    // A device hammers zone creation while the owner removes it, using the lock
+    // order removing a device uses: the account, then the device.
+    let hammer = {
+        let store = store.clone();
+        tokio::spawn(async move {
+            let mut errors = Vec::new();
+            for n in 0..200 {
+                match store.create_zone(&me, &format!("z{}", n % 5)).await {
+                    Ok(_) | Err(StoreError::DeviceNotTrusted) => {}
+                    Err(err) => errors.push(format!("{err:?}")),
+                }
+            }
+            errors
+        })
+    };
+    for _ in 0..20 {
+        let mut tx = db.pool().begin().await.expect("begin");
+        sqlx::query("SELECT 1 FROM accounts WHERE id = $1 FOR UPDATE")
+            .bind(me.account_id)
+            .execute(&mut *tx)
+            .await
+            .expect("lock account");
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        sqlx::query("UPDATE devices SET state = 'trusted' WHERE id = $1")
+            .bind(me.device_id)
+            .execute(&mut *tx)
+            .await
+            .expect("update device without deadlock");
+        tx.commit().await.expect("commit");
+    }
+    let errors = hammer.await.expect("join");
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn deleted_zones_and_tombstones_count_towards_the_limits() {
+    let (store, db) = store_with(Limits {
+        max_zones: 3,
+        max_records_per_zone: 2,
+        ..Limits::default()
+    })
+    .await;
+    let me = trusted(&db).await;
+    for name in ["a", "b", "c"] {
+        store.create_zone(&me, name).await.expect("zone");
+    }
+    store.delete_zone(&me, "a").await.expect("delete");
+    // A deleted zone still counts, so a new name is refused...
+    assert!(matches!(
+        store.create_zone(&me, "d").await,
+        Err(StoreError::TooManyZones)
+    ));
+    // ...but bringing the deleted one back is fine.
+    store.create_zone(&me, "a").await.expect("recreate");
+
+    store
+        .upload(
+            &me,
+            "b",
+            &batch(vec![save("1", None, b"x"), save("2", None, b"y")]),
+        )
+        .await
+        .expect("two");
+    let token = store.delete_zone(&me, "b").await.expect("delete b");
+    let _ = token;
+    store.create_zone(&me, "b").await.expect("recreate b");
+    // The two tombstones still count, so a third record is refused.
+    assert!(matches!(
+        store
+            .upload(&me, "b", &batch(vec![save("3", None, b"z")]))
+            .await,
+        Err(StoreError::TooManyRecords)
+    ));
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn an_account_cannot_store_more_bytes_than_its_quota() {
+    let (store, db) = store_with(Limits {
+        max_account_bytes: 2_000,
+        ..Limits::default()
+    })
+    .await;
+    let me = trusted(&db).await;
+    store.create_zone(&me, "a").await.expect("zone");
+    store.create_zone(&me, "b").await.expect("zone");
+    // Each record is 900 bytes of ciphertext plus a 48-byte key.
+    store
+        .upload(&me, "a", &batch(vec![save("1", None, &[1; 900])]))
+        .await
+        .expect("first");
+    store
+        .upload(&me, "b", &batch(vec![save("2", None, &[1; 900])]))
+        .await
+        .expect("second");
+    assert!(matches!(
+        store
+            .upload(&me, "a", &batch(vec![save("3", None, &[1; 900])]))
+            .await,
+        Err(StoreError::QuotaExceeded)
+    ));
+    // Deleting frees the space again.
+    let (zones, _) = store.list_zones(&me, None).await.expect("list");
+    assert_eq!(zones.len(), 2);
+    store.delete_zone(&me, "a").await.expect("delete");
+    store.create_zone(&me, "a").await.expect("recreate");
+    store
+        .upload(&me, "a", &batch(vec![save("3", None, &[1; 900])]))
+        .await
+        .expect("fits again");
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn zones_are_listed_in_pages() {
+    let (store, db) = store().await;
+    let me = trusted(&db).await;
+    for n in 0..505 {
+        store
+            .create_zone(&me, &format!("z{n:04}"))
+            .await
+            .expect("zone");
+    }
+    let (first, next) = store.list_zones(&me, None).await.expect("page one");
+    assert_eq!(first.len(), 500);
+    let next = next.expect("more");
+    let (second, end) = store.list_zones(&me, Some(&next)).await.expect("page two");
+    assert_eq!(second.len(), 5);
+    assert!(end.is_none());
+    assert!(first.last().map(|z| z.name.as_str()) < second.first().map(|z| z.name.as_str()));
 }
