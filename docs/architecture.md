@@ -60,8 +60,17 @@ The compose Postgres trusts every connection without a password, and any contain
 
 ## Repeat rules
 
-Daily, weekly (on chosen weekdays), monthly and yearly, every N periods, ending never, on a date or after a count. A monthly rule on a day a month lacks skips that month, and 29 February repeats only in leap years, as RFC 5545 does. "This one only" adds the date to the series' skipped dates. "This and following" ends the series the day before and starts a new one; a count is shared between the two so the total stays the same. One query returns at most 1000 occurrences.
+Daily, weekly (on chosen weekdays), monthly and yearly, every N periods, ending never, on an inclusive date, or after a count. The full rules a port must match are at the top of `crates/orbyn-planner/src/repeat.rs`. In short:
+- repeats work on dates, and a timed item keeps its local wall time on each date;
+- weeks start on Monday;
+- the start is the first date a series may fall on, and is not an occurrence unless it matches the rule;
+- a monthly rule on a missing day skips that month, and 29 February repeats only in leap years;
+- one query returns at most 1000 dates, and a walk looks at most 200,000 periods from the start.
+
+"This one only" skips a date; changing a single occurrence is not supported yet. "This and following" ends the series the day before and starts a new one, sharing a count so the total stays the same; it is refused at the first occurrence, where the whole series should be edited instead.
 
 ## Records
 
-A task or event is stored as fields (`kind`, `title`, `notes`, `list_id`, `due`, `priority`, `done_at`, `deleted_at`, `checklist`, `repeat`), each stamped for merging. A record with a missing or malformed field is refused, never guessed.
+A task or event is stored as fields, each stamped for merging: `kind`, `title`, `notes`, `list_id`, `due`, `priority`, `done_at`, `deleted_at` and `repeat` (the rule without its skips), plus one field per checklist entry (`checklist.<id>`, `null` once removed) and one per skipped date (`repeat.skip.<date>`, `false` once unskipped). Two devices that each add a step or skip a date therefore both keep their change. Edits are sent with `Item::changed_fields`, which includes the removals.
+
+Reading a record checks it fully, repeat rule included; a repeating item's due date must be on or after the series start. A missing or malformed field is refused, never guessed. Unknown fields are ignored on read.

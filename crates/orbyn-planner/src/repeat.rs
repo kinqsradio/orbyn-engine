@@ -2,8 +2,22 @@
 //! every N days, weeks (on chosen weekdays), months or years, ending never, on a
 //! date, or after a number of times.
 //!
-//! A monthly rule on the 31st skips months without a 31st, and a yearly rule on
-//! 29 February repeats only in leap years, as RFC 5545 does.
+//! Rules a port must match exactly:
+//!
+//! - Repeats work on dates. A timed task or event repeats at the same local wall
+//!   time on each date, so it stays at 09:00 across a daylight-saving change.
+//! - Weeks start on Monday (ISO 8601). "Every 2 weeks on Monday and Sunday"
+//!   counts in Monday-to-Sunday weeks from the week containing the start.
+//! - The start is the first date the series *may* fall on. Unlike RFC 5545's
+//!   DTSTART, a start that does not match the rule (a Saturday start for "every
+//!   Monday") is not itself an occurrence.
+//! - A monthly rule on the 31st skips months without a 31st, and a yearly rule on
+//!   29 February repeats only in leap years, as RFC 5545 does. Skipped months do
+//!   not count towards a count end.
+//! - An until date is inclusive.
+//! - One query returns at most [`MAX_OCCURRENCES`] dates, and a walk looks at
+//!   most [`MAX_STEPS`] periods from the start (about 500 years of a daily
+//!   rule), after which the series has no more occurrences.
 
 use jiff::civil::{Date, Weekday};
 use serde::{Deserialize, Serialize};
@@ -12,7 +26,7 @@ use std::collections::BTreeSet;
 /// The most occurrences one call returns, so a bad range cannot run away.
 pub const MAX_OCCURRENCES: usize = 1000;
 /// The most periods a walk looks at before giving up.
-const MAX_STEPS: u32 = 200_000;
+pub const MAX_STEPS: u32 = 200_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -85,8 +99,8 @@ pub struct Repeat {
     pub end: End,
 }
 
-/// A repeating task or event: its first date, its rule, and dates removed with
-/// "this one only".
+/// A repeating task or event: the first date it may fall on, its rule, and dates
+/// removed with "this one only".
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Series {
     pub start: Date,
@@ -107,6 +121,8 @@ pub enum RepeatError {
     WeekdaysNotWeekly,
     #[error("that date is not part of this repeat")]
     NotAnOccurrence,
+    #[error("this is the first time it repeats: edit the whole series instead")]
+    SplitAtFirst,
 }
 
 impl Repeat {
@@ -180,7 +196,11 @@ impl Series {
     }
 
     /// "This one only": removes one date from the series.
+    /// Skipping a date that is already skipped changes nothing.
     pub fn skip(&mut self, date: Date) -> Result<(), RepeatError> {
+        if self.skipped.contains(&date) {
+            return Ok(());
+        }
         if !self.is_occurrence(date) {
             return Err(RepeatError::NotAnOccurrence);
         }
@@ -192,8 +212,11 @@ impl Series {
     /// new series starting at `at` with the same rule. A count is shared out, so
     /// the two series together repeat the same number of times as before.
     pub fn split_at(&mut self, at: Date) -> Result<Series, RepeatError> {
-        if at <= self.start || !self.is_occurrence(at) {
+        if !self.is_occurrence(at) {
             return Err(RepeatError::NotAnOccurrence);
+        }
+        if self.raw_count_before(at) == 0 {
+            return Err(RepeatError::SplitAtFirst);
         }
         let before = self.raw_count_before(at);
         let mut following = Series {
@@ -363,7 +386,7 @@ mod tests {
 
     #[test]
     fn weekly_on_chosen_weekdays_starts_on_or_after_the_start() {
-        // Friday 7 November 2026.
+        // Saturday 7 November 2026.
         let s = series(date(2026, 11, 7), Frequency::Weekly, |r| {
             r.weekdays = vec![Day::Mon, Day::Sat];
         });
@@ -483,7 +506,7 @@ mod tests {
         assert_eq!(second.repeat.end, End::Count(7));
         assert_eq!(
             first.split_at(date(2026, 11, 1)).err(),
-            Some(RepeatError::NotAnOccurrence)
+            Some(RepeatError::SplitAtFirst)
         );
         Ok(())
     }
@@ -506,5 +529,136 @@ mod tests {
         let json = serde_json::to_string(&s)?;
         assert_eq!(serde_json::from_str::<Series>(&json)?, s);
         Ok(())
+    }
+
+    #[test]
+    fn a_start_off_the_rule_is_not_an_occurrence_and_cannot_be_split_to_nothing() {
+        // Saturday start, every Monday, five times.
+        let mut s = series(date(2026, 11, 7), Frequency::Weekly, |r| {
+            r.weekdays = vec![Day::Mon];
+            r.end = End::Count(5);
+        });
+        assert!(!s.is_occurrence(date(2026, 11, 7)));
+        assert_eq!(s.occurrences(date(2026, 11, 1), date(2027, 1, 1)).len(), 5);
+        assert_eq!(
+            s.split_at(date(2026, 11, 9)).err(),
+            Some(RepeatError::SplitAtFirst)
+        );
+        let rest = s
+            .split_at(date(2026, 11, 16))
+            .expect("split at the second occurrence");
+        assert_eq!(s.repeat.end, End::Count(1));
+        assert_eq!(rest.repeat.end, End::Count(4));
+        assert!(s.validate().is_ok() && rest.validate().is_ok());
+    }
+
+    #[test]
+    fn weeks_start_on_monday() {
+        // Sunday start, Monday and Sunday every 2 weeks.
+        let s = series(date(2026, 11, 8), Frequency::Weekly, |r| {
+            r.interval = 2;
+            r.weekdays = vec![Day::Mon, Day::Sun];
+        });
+        assert_eq!(
+            s.occurrences(date(2026, 11, 1), date(2026, 11, 30)),
+            vec![
+                date(2026, 11, 8),
+                date(2026, 11, 16),
+                date(2026, 11, 22),
+                date(2026, 11, 30)
+            ]
+        );
+    }
+
+    #[test]
+    fn skipping_twice_is_a_no_op() -> Result<(), RepeatError> {
+        let mut s = series(date(2026, 11, 7), Frequency::Daily, |_| {});
+        s.skip(date(2026, 11, 8))?;
+        s.skip(date(2026, 11, 8))?;
+        assert_eq!(s.skipped.len(), 1);
+        Ok(())
+    }
+
+    /// SplitMix64, so the property test needs no dependency and is repeatable.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    #[test]
+    fn a_split_never_loses_or_doubles_an_occurrence() {
+        let days = [
+            Day::Mon,
+            Day::Tue,
+            Day::Wed,
+            Day::Thu,
+            Day::Fri,
+            Day::Sat,
+            Day::Sun,
+        ];
+        let mut rng = Rng(7);
+        // Under two years, so a daily rule stays below MAX_OCCURRENCES.
+        let (from, to) = (date(2026, 1, 1), date(2027, 11, 30));
+        let mut checked = 0;
+        for _ in 0..3000 {
+            let start = date(2026, 1, 1)
+                .checked_add(jiff::Span::new().days(rng.below(400) as i64))
+                .expect("date");
+            let frequency = [
+                Frequency::Daily,
+                Frequency::Weekly,
+                Frequency::Monthly,
+                Frequency::Yearly,
+            ][rng.below(4) as usize];
+            let mut repeat = Repeat::every(frequency);
+            repeat.interval = 1 + rng.below(3) as u16;
+            if frequency == Frequency::Weekly && rng.below(2) == 0 {
+                repeat.weekdays = (0..1 + rng.below(3))
+                    .map(|_| days[rng.below(7) as usize])
+                    .collect();
+            }
+            repeat.end = match rng.below(3) {
+                0 => End::Never,
+                1 => End::Count(1 + rng.below(20) as u32),
+                _ => End::Until(
+                    start
+                        .checked_add(jiff::Span::new().days(30 + rng.below(900) as i64))
+                        .expect("date"),
+                ),
+            };
+            let mut original = Series::new(start, repeat).expect("valid");
+            let all = original.occurrences(from, to);
+            for d in all
+                .iter()
+                .filter(|_| rng.below(5) == 0)
+                .copied()
+                .collect::<Vec<_>>()
+            {
+                original.skip(d).expect("skip");
+            }
+            let kept = original.occurrences(from, to);
+            if kept.len() < 2 {
+                continue;
+            }
+            let at = kept[1 + rng.below(kept.len() as u64 - 1) as usize];
+            let mut first = original.clone();
+            let second = first.split_at(at).expect("split at a later occurrence");
+            first.validate().expect("first stays valid");
+            second.validate().expect("second is valid");
+            let mut joined = first.occurrences(from, to);
+            joined.extend(second.occurrences(from, to));
+            assert_eq!(joined, kept, "split of {original:?} at {at}");
+            checked += 1;
+        }
+        assert!(checked > 1000, "only {checked} cases had a split point");
     }
 }
