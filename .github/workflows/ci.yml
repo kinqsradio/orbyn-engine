@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-24.04
     services:
       postgres:
-        image: postgres:17-bookworm
+        image: postgres:17-bookworm@sha256:665dc7b37ac52a17e298511414c21d23ffa4e6a6ef6225b3e5d59c7afb35e994
         env:
           POSTGRES_USER: orbyn
           POSTGRES_HOST_AUTH_METHOD: trust
@@ -68,6 +68,18 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo test --workspace
 
+  audit:
+    name: Security audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+        with:
+          tool: cargo-audit
+      - run: cargo audit
+
   docker:
     name: Docker image
     runs-on: ubuntu-24.04
@@ -79,7 +91,7 @@ jobs:
       - name: The image starts and answers its health check
         run: |
           docker network create orbyn
-          docker run -d --name db --network orbyn -e POSTGRES_USER=orbyn -e POSTGRES_HOST_AUTH_METHOD=trust -e POSTGRES_DB=orbyn postgres:17-bookworm
+          docker run -d --name db --network orbyn -e POSTGRES_USER=orbyn -e POSTGRES_HOST_AUTH_METHOD=trust -e POSTGRES_DB=orbyn postgres:17-bookworm@sha256:665dc7b37ac52a17e298511414c21d23ffa4e6a6ef6225b3e5d59c7afb35e994
           for i in $(seq 1 30); do docker exec db pg_isready -U orbyn -d orbyn && break; sleep 1; done
           docker run --rm --network orbyn -e DATABASE_URL=postgres://orbyn@db:5432/orbyn orbyn-engine:ci migrate
           docker run -d --name api --network orbyn -p 8080:8080 -e DATABASE_URL=postgres://orbyn@db:5432/orbyn orbyn-engine:ci serve
