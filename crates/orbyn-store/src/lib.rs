@@ -12,15 +12,19 @@
 //! - A committed change is announced with `pg_notify`, which Postgres delivers
 //!   only on commit and to every replica, and enqueues a `zone_changed` job when
 //!   another device subscribed to the zone.
+//! - The keychain keeps zone keys that one trusted device sealed to another
+//!   trusted device of the account, as envelopes the server never opens.
 //!
 //! Every operation checks in the database that the session's account owns the
 //! zone and that its device is trusted, not only the route.
 
+mod keychain;
 mod live;
 mod records;
 mod token;
 mod zones;
 
+pub use keychain::{Envelope, KEY_ID_LEN, NewEnvelope, Rotation};
 pub use live::{Feed, Hub, Notice};
 pub use token::ChangeToken;
 
@@ -49,11 +53,19 @@ pub struct Limits {
     pub max_batch_bytes: usize,
     pub max_ciphertext: usize,
     pub max_wrapped_key: usize,
+    /// Bytes of a delete proof.
+    pub max_delete_proof: usize,
     /// Records in one fetch.
     pub max_fetch: usize,
     /// A fetch stops adding records once they hold this many bytes (it always
     /// returns at least one).
     pub fetch_bytes: i64,
+    /// Envelopes in one keychain upload.
+    pub max_envelope_batch: usize,
+    /// Bytes of one envelope.
+    pub max_envelope: usize,
+    /// Envelopes kept for one recipient device.
+    pub max_envelopes_per_device: i64,
 }
 
 impl Default for Limits {
@@ -66,8 +78,12 @@ impl Default for Limits {
             max_batch_bytes: 4 * 1024 * 1024,
             max_ciphertext: 256 * 1024,
             max_wrapped_key: 1024,
+            max_delete_proof: 256,
             max_fetch: 200,
             fetch_bytes: 4 * 1024 * 1024,
+            max_envelope_batch: 100,
+            max_envelope: 1024,
+            max_envelopes_per_device: 5000,
         }
     }
 }
@@ -102,6 +118,12 @@ pub enum StoreError {
     TooManyZones,
     #[error("the zone has too many records")]
     TooManyRecords,
+    #[error("a key envelope is not valid")]
+    InvalidEnvelope,
+    #[error("an envelope's recipient is not a trusted device of this account")]
+    RecipientNotTrusted,
+    #[error("the device has too many key envelopes")]
+    TooManyEnvelopes,
     #[error("the account stores as many bytes as it may")]
     QuotaExceeded,
     #[error("the database failed")]
@@ -133,6 +155,8 @@ pub struct Record {
     pub author_device_id: Uuid,
     pub modified_at: DateTime<Utc>,
     pub deleted: bool,
+    /// A tombstone's proof from the deleting device; opaque to the server.
+    pub delete_proof: Option<Vec<u8>>,
 }
 
 /// One change in an upload.
@@ -147,10 +171,12 @@ pub enum Change {
         ciphertext: Vec<u8>,
         wrapped_key: Vec<u8>,
     },
-    /// Turns the record into a tombstone.
+    /// Turns the record into a tombstone. `proof` is the deleting device's
+    /// signature, stored with the tombstone for other devices to check.
     Delete {
         record_id: String,
         expected_version: i64,
+        proof: Option<Vec<u8>>,
     },
 }
 

@@ -6,7 +6,8 @@
 use orbyn_core::Database;
 use orbyn_core::accounts::{DeviceState, Session};
 use orbyn_store::{
-    Change, ChangeToken, Hub, Limits, Notice, Store, StoreError, Upload, ZONE_CHANGED_JOB,
+    Change, ChangeToken, Hub, KEY_ID_LEN, Limits, NewEnvelope, Notice, Rotation, Store, StoreError,
+    Upload, ZONE_CHANGED_JOB,
 };
 use std::time::Duration;
 use uuid::Uuid;
@@ -80,6 +81,7 @@ fn delete(id: &str, expected: i64) -> Change {
     Change::Delete {
         record_id: id.into(),
         expected_version: expected,
+        proof: Some(vec![5; 89]),
     }
 }
 
@@ -262,14 +264,17 @@ async fn tombstones_appear_in_changes_and_a_deleted_zone_comes_back_empty() {
         .await
         .expect("fetch")
         .token;
-    let token = store.delete_zone(&me, "list").await.expect("delete zone");
+    let token = store
+        .delete_zone(&me, "list", Some(&[2; 73]))
+        .await
+        .expect("delete zone");
     assert_eq!(
         token.seq(),
         before.seq() + 3,
         "two tombstones and the deletion"
     );
     assert_eq!(
-        store.delete_zone(&me, "list").await.expect("again"),
+        store.delete_zone(&me, "list", None).await.expect("again"),
         token,
         "deleting twice changes nothing"
     );
@@ -283,7 +288,7 @@ async fn tombstones_appear_in_changes_and_a_deleted_zone_comes_back_empty() {
         changes
             .records
             .iter()
-            .all(|r| r.deleted && r.ciphertext.is_none())
+            .all(|r| r.deleted && r.ciphertext.is_none() && r.delete_proof == Some(vec![2; 73]))
     );
     assert_eq!(changes.token, token);
     let err = store
@@ -449,7 +454,7 @@ async fn another_account_cannot_see_or_write_the_zone() {
         .expect_err("hidden");
     assert!(matches!(err, StoreError::ZoneNotFound));
     let err = store
-        .delete_zone(&them, "private")
+        .delete_zone(&them, "private", None)
         .await
         .expect_err("hidden");
     assert!(matches!(err, StoreError::ZoneNotFound));
@@ -509,7 +514,7 @@ async fn a_pending_or_removed_device_cannot_read_or_write() {
             .upload(&pending, "inbox", &batch(vec![save("a", None, b"x")]))
             .await
             .err(),
-        store.delete_zone(&pending, "inbox").await.err(),
+        store.delete_zone(&pending, "inbox", None).await.err(),
         store.feed(&pending).await.err(),
     ];
     for err in checks {
@@ -546,7 +551,7 @@ async fn limits_are_enforced() {
     assert!(matches!(err, StoreError::TooManyZones));
     // A deleted zone still counts until it is purged, so its slot is not free
     // for a new name, but it can be brought back.
-    store.delete_zone(&me, "two").await.expect("delete");
+    store.delete_zone(&me, "two", None).await.expect("delete");
     let err = store
         .create_zone(&me, "three")
         .await
@@ -805,7 +810,7 @@ async fn deleted_zones_and_tombstones_count_towards_the_limits() {
     for name in ["a", "b", "c"] {
         store.create_zone(&me, name).await.expect("zone");
     }
-    store.delete_zone(&me, "a").await.expect("delete");
+    store.delete_zone(&me, "a", None).await.expect("delete");
     // A deleted zone still counts, so a new name is refused...
     assert!(matches!(
         store.create_zone(&me, "d").await,
@@ -822,7 +827,7 @@ async fn deleted_zones_and_tombstones_count_towards_the_limits() {
         )
         .await
         .expect("two");
-    let token = store.delete_zone(&me, "b").await.expect("delete b");
+    let token = store.delete_zone(&me, "b", None).await.expect("delete b");
     let _ = token;
     store.create_zone(&me, "b").await.expect("recreate b");
     // The two tombstones still count, so a third record is refused.
@@ -863,7 +868,7 @@ async fn an_account_cannot_store_more_bytes_than_its_quota() {
     // Deleting frees the space again.
     let (zones, _) = store.list_zones(&me, None).await.expect("list");
     assert_eq!(zones.len(), 2);
-    store.delete_zone(&me, "a").await.expect("delete");
+    store.delete_zone(&me, "a", None).await.expect("delete");
     store.create_zone(&me, "a").await.expect("recreate");
     store
         .upload(&me, "a", &batch(vec![save("3", None, &[1; 900])]))
@@ -889,4 +894,237 @@ async fn zones_are_listed_in_pages() {
     assert_eq!(second.len(), 5);
     assert!(end.is_none());
     assert!(first.last().map(|z| z.name.as_str()) < second.first().map(|z| z.name.as_str()));
+}
+
+fn envelope(to: &Session, zone: &str, key: u8, bytes: &[u8]) -> NewEnvelope {
+    NewEnvelope {
+        recipient_device_id: to.device_id,
+        zone: zone.into(),
+        key_id: vec![key; KEY_ID_LEN],
+        envelope: bytes.to_vec(),
+        rotation: None,
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn key_envelopes_reach_only_trusted_devices_of_the_account() {
+    let (store, db) = store_with(Limits {
+        max_envelopes_per_device: 3,
+        ..Limits::default()
+    })
+    .await;
+    let laptop = trusted(&db).await;
+    let phone = device(&db, laptop.account_id, "trusted").await;
+    let pending = device(&db, laptop.account_id, "pending").await;
+    let stranger = trusted(&db).await;
+
+    store
+        .put_envelopes(
+            &laptop,
+            &[
+                envelope(&phone, "inbox", 1, b"first"),
+                envelope(&phone, "work", 1, b"work"),
+            ],
+        )
+        .await
+        .expect("put");
+    // Sending the same key again replaces the envelope.
+    store
+        .put_envelopes(&laptop, &[envelope(&phone, "inbox", 1, b"again")])
+        .await
+        .expect("again");
+    let got = store.list_envelopes(&phone).await.expect("list");
+    assert_eq!(got.len(), 2);
+    let inbox = got.iter().find(|e| e.zone == "inbox").expect("inbox");
+    assert_eq!(inbox.envelope, b"again");
+    assert_eq!(inbox.sender_device_id, laptop.device_id);
+    assert!(store.list_envelopes(&laptop).await.expect("own").is_empty());
+
+    // Recipients must be trusted devices of the same account, never the sender.
+    for (to, expected) in [
+        (&pending, "recipient"),
+        (&stranger, "recipient"),
+        (&laptop, "invalid"),
+    ] {
+        let err = store
+            .put_envelopes(&laptop, &[envelope(to, "inbox", 2, b"x")])
+            .await
+            .expect_err("refused");
+        match (expected, err) {
+            ("recipient", StoreError::RecipientNotTrusted)
+            | ("invalid", StoreError::InvalidEnvelope) => {}
+            (_, other) => panic!("unexpected {other:?}"),
+        }
+    }
+    // One bad envelope refuses the whole batch.
+    let err = store
+        .put_envelopes(
+            &laptop,
+            &[
+                envelope(&phone, "home", 3, b"x"),
+                envelope(&pending, "home", 3, b"x"),
+            ],
+        )
+        .await
+        .expect_err("refused");
+    assert!(matches!(err, StoreError::RecipientNotTrusted));
+    assert_eq!(store.list_envelopes(&phone).await.expect("list").len(), 2);
+    let mut short = envelope(&phone, "inbox", 4, b"x");
+    short.key_id.pop();
+    assert!(matches!(
+        store.put_envelopes(&laptop, &[short]).await,
+        Err(StoreError::InvalidEnvelope)
+    ));
+    assert!(matches!(
+        store.put_envelopes(&laptop, &[]).await,
+        Err(StoreError::BatchTooLarge)
+    ));
+    // A pending device can neither send nor fetch.
+    assert!(matches!(
+        store
+            .put_envelopes(&pending, &[envelope(&phone, "inbox", 5, b"x")])
+            .await,
+        Err(StoreError::DeviceNotTrusted)
+    ));
+    assert!(matches!(
+        store.list_envelopes(&pending).await,
+        Err(StoreError::DeviceNotTrusted)
+    ));
+
+    // A recipient holds a bounded number of envelopes.
+    store
+        .put_envelopes(&laptop, &[envelope(&phone, "home", 6, b"x")])
+        .await
+        .expect("third");
+    assert!(matches!(
+        store
+            .put_envelopes(&laptop, &[envelope(&phone, "home", 7, b"x")])
+            .await,
+        Err(StoreError::TooManyEnvelopes)
+    ));
+
+    // A rotated key carries its record, returned as stored; a malformed one is refused.
+    let mut rotated = envelope(&phone, "work", 9, b"rotated");
+    rotated.rotation = Some(Rotation {
+        previous_key_id: vec![1; KEY_ID_LEN],
+        signer_device_id: laptop.device_id,
+        signature: vec![4; 64],
+    });
+    let mut bad = rotated.clone();
+    bad.key_id = vec![8; KEY_ID_LEN];
+    if let Some(r) = bad.rotation.as_mut() {
+        r.signature.pop();
+    }
+    assert!(matches!(
+        store.put_envelopes(&laptop, &[bad]).await,
+        Err(StoreError::InvalidEnvelope)
+    ));
+    sqlx::query("DELETE FROM key_envelopes WHERE recipient_device_id = $1 AND zone = 'home'")
+        .bind(phone.device_id)
+        .execute(db.pool())
+        .await
+        .expect("make room");
+    store
+        .put_envelopes(&laptop, &[rotated.clone()])
+        .await
+        .expect("rotation");
+    let got = store.list_envelopes(&phone).await.expect("list");
+    let stored = got
+        .iter()
+        .find(|e| e.key_id == rotated.key_id)
+        .expect("rotated");
+    assert_eq!(stored.rotation, rotated.rotation);
+
+    // Once the sender is removed, its envelopes are no longer handed out.
+    sqlx::query("UPDATE devices SET state = 'removed' WHERE id = $1")
+        .bind(laptop.device_id)
+        .execute(db.pool())
+        .await
+        .expect("remove");
+    assert!(store.list_envelopes(&phone).await.expect("list").is_empty());
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn sending_envelopes_never_deadlocks_with_removing_a_device() {
+    let (store, db) = store().await;
+    let laptop = trusted(&db).await;
+    let phone = device(&db, laptop.account_id, "trusted").await;
+    let hammer = {
+        let store = store.clone();
+        tokio::spawn(async move {
+            let mut errors = Vec::new();
+            for n in 0..200u8 {
+                let sent = store
+                    .put_envelopes(&laptop, &[envelope(&phone, "inbox", n % 5, b"x")])
+                    .await;
+                match sent {
+                    Ok(()) | Err(StoreError::DeviceNotTrusted) => {}
+                    Err(err) => errors.push(format!("{err:?}")),
+                }
+            }
+            errors
+        })
+    };
+    // The lock order removing a device uses: the account, then the device.
+    for n in 0..20 {
+        let target = if n % 2 == 0 { &laptop } else { &phone };
+        let mut tx = db.pool().begin().await.expect("begin");
+        sqlx::query("SELECT 1 FROM accounts WHERE id = $1 FOR UPDATE")
+            .bind(laptop.account_id)
+            .execute(&mut *tx)
+            .await
+            .expect("lock account");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        sqlx::query("UPDATE devices SET state = 'trusted' WHERE id = $1")
+            .bind(target.device_id)
+            .execute(&mut *tx)
+            .await
+            .expect("update device without deadlock");
+        tx.commit().await.expect("commit");
+    }
+    let errors = hammer.await.expect("join");
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_tombstone_keeps_the_deleting_devices_proof() {
+    let (store, db) = store().await;
+    let me = trusted(&db).await;
+    store.create_zone(&me, "inbox").await.expect("zone");
+    store
+        .upload(&me, "inbox", &batch(vec![save("a", None, b"one")]))
+        .await
+        .expect("save");
+    let oversized = Change::Delete {
+        record_id: "a".into(),
+        expected_version: 1,
+        proof: Some(vec![1; 257]),
+    };
+    assert!(matches!(
+        store.upload(&me, "inbox", &batch(vec![oversized])).await,
+        Err(StoreError::InvalidRecord)
+    ));
+    store
+        .upload(&me, "inbox", &batch(vec![delete("a", 1)]))
+        .await
+        .expect("delete");
+    let changes = store
+        .fetch_changes(&me, "inbox", None, None)
+        .await
+        .expect("fetch");
+    assert!(changes.records[0].deleted);
+    assert_eq!(changes.records[0].delete_proof, Some(vec![5; 89]));
+    // Saving over the tombstone clears the proof.
+    store
+        .upload(&me, "inbox", &batch(vec![save("a", Some(2), b"back")]))
+        .await
+        .expect("save again");
+    let changes = store
+        .fetch_changes(&me, "inbox", None, None)
+        .await
+        .expect("fetch");
+    assert_eq!(changes.records[0].delete_proof, None);
 }

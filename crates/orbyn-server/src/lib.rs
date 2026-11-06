@@ -3,6 +3,7 @@
 
 mod accounts;
 mod feeds;
+mod keychain;
 mod records;
 
 use axum::extract::{DefaultBodyLimit, State};
@@ -96,6 +97,7 @@ pub fn router(state: AppState, allowed_origins: &[String]) -> Router {
         .route("/ready", get(ready))
         .merge(accounts::routes())
         .merge(records::routes())
+        .merge(keychain::routes())
         .merge(feeds::routes())
         .fallback(not_found)
         .layer(DefaultBodyLimit::max(BODY_LIMIT))

@@ -15,4 +15,9 @@ ciphertext: string,
 /**
  * Base64url, at most 1 KiB decoded.
  */
-wrapped_key: string, } | { "op": "delete", record_id: string, expected_version: number, };
+wrapped_key: string, } | { "op": "delete", record_id: string, expected_version: number, 
+/**
+ * The deleting device's signature over the delete, base64url, at most
+ * 256 bytes decoded. Stored with the tombstone for other devices to check.
+ */
+proof?: string, };

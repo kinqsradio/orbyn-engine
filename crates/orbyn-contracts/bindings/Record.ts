@@ -19,4 +19,9 @@ wrapped_key: string | null, author_device_id: string,
 /**
  * RFC 3339.
  */
-modified_at: string, deleted: boolean, };
+modified_at: string, deleted: boolean, 
+/**
+ * A tombstone's proof from the device that deleted it, base64url; `None`
+ * for live records and for tombstones left by deleting the zone.
+ */
+delete_proof?: string, };

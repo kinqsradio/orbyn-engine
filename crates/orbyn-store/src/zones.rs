@@ -157,8 +157,18 @@ impl Store {
     /// Turns every live record of the zone into a tombstone, each with its own
     /// new version, and marks the zone deleted. Deleting a deleted zone changes
     /// nothing. Returns the token after the deletion.
-    pub async fn delete_zone(&self, session: &Session, name: &str) -> Result<ChangeToken> {
+    /// `proof` is the deleting device's signature, stored on every tombstone
+    /// the deletion makes, for other devices to check.
+    pub async fn delete_zone(
+        &self,
+        session: &Session,
+        name: &str,
+        proof: Option<&[u8]>,
+    ) -> Result<ChangeToken> {
         check_zone_name(name)?;
+        if proof.is_some_and(|p| p.is_empty() || p.len() > self.limits.max_delete_proof) {
+            return Err(StoreError::InvalidRecord);
+        }
         let mut tx = self.pool.begin().await?;
         require_trusted(&mut *tx, session, true).await?;
         let zone = find(&mut *tx, session, name, true).await?;
@@ -168,7 +178,8 @@ impl Store {
         }
         let tombstoned = sqlx::query(
             "UPDATE records r SET version = $2 + s.n, deleted = true, ciphertext = NULL,
-                    wrapped_key = NULL, author_device_id = $3, modified_at = now()
+                    wrapped_key = NULL, author_device_id = $3, modified_at = now(),
+                    delete_proof = $4
              FROM (SELECT record_id, row_number() OVER (ORDER BY version) AS n
                    FROM records WHERE zone_id = $1 AND NOT deleted) s
              WHERE r.zone_id = $1 AND r.record_id = s.record_id",
@@ -176,6 +187,7 @@ impl Store {
         .bind(zone.id)
         .bind(zone.seq)
         .bind(session.device_id)
+        .bind(proof)
         .execute(&mut *tx)
         .await?
         .rows_affected();

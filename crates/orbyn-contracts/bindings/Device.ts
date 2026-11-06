@@ -20,6 +20,14 @@ approved_by: string | null,
  */
 approval_signature: string | null, 
 /**
+ * The approval that trusted this device; part of the signed message.
+ */
+approval_id?: string, 
+/**
+ * Unix seconds the approver chose for that approval; part of the signed message.
+ */
+approval_created_at?: number, 
+/**
  * True for the device making the request.
  */
 current: boolean, };

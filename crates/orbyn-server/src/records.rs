@@ -160,6 +160,13 @@ impl IntoResponse for Refusal {
             StoreError::OperationReused => (StatusCode::CONFLICT, "operation_reused"),
             StoreError::TooManyZones => (StatusCode::UNPROCESSABLE_ENTITY, "too_many_zones"),
             StoreError::TooManyRecords => (StatusCode::UNPROCESSABLE_ENTITY, "too_many_records"),
+            StoreError::InvalidEnvelope => (StatusCode::BAD_REQUEST, "invalid_envelope"),
+            StoreError::RecipientNotTrusted => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "recipient_not_trusted")
+            }
+            StoreError::TooManyEnvelopes => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "too_many_envelopes")
+            }
             StoreError::QuotaExceeded => (StatusCode::UNPROCESSABLE_ENTITY, "quota_exceeded"),
             StoreError::RecordChanged(conflicts) => {
                 let body = wire::RecordChanged {
@@ -204,10 +211,10 @@ impl IntoResponse for Refusal {
     }
 }
 
-type Answer<T> = Result<T, Refusal>;
+pub(crate) type Answer<T> = Result<T, Refusal>;
 
 /// A JSON body whose errors are [`wire::ApiError`]s, with this route's size limit.
-pub(crate) struct Body<T>(T);
+pub(crate) struct Body<T>(pub(crate) T);
 
 impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for Body<T> {
     type Rejection = Refusal;
@@ -228,11 +235,11 @@ impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for Body<T> {
     }
 }
 
-fn store(state: &AppState) -> Answer<&Store> {
+pub(crate) fn store(state: &AppState) -> Answer<&Store> {
     state.store.as_ref().ok_or(Refusal::Unavailable)
 }
 
-fn bytes(text: &str) -> Answer<Vec<u8>> {
+pub(crate) fn bytes(text: &str) -> Answer<Vec<u8>> {
     URL_SAFE_NO_PAD
         .decode(text)
         .map_err(|_| Refusal::BadRequest)
@@ -257,6 +264,7 @@ fn wire_record(record: orbyn_store::Record) -> wire::Record {
         author_device_id: record.author_device_id.to_string(),
         modified_at: time(record.modified_at),
         deleted: record.deleted,
+        delete_proof: record.delete_proof.as_deref().map(encode),
     }
 }
 
@@ -278,9 +286,11 @@ fn change(change: wire::RecordChange) -> Answer<Change> {
         wire::RecordChange::Delete {
             record_id,
             expected_version,
+            proof,
         } => Change::Delete {
             record_id,
             expected_version,
+            proof: proof.as_deref().map(bytes).transpose()?,
         },
     })
 }
@@ -319,12 +329,22 @@ async fn list_zones(
     }))
 }
 
+/// The body is optional: a `DeleteZone` with the deleting device's proof.
 async fn delete_zone(
     State(state): State<AppState>,
     Authed(session): Authed,
     Path(zone): Path<String>,
+    body: axum::body::Bytes,
 ) -> Answer<Json<wire::ZoneDeleted>> {
-    let token = store(&state)?.delete_zone(&session, &zone).await?;
+    let body: wire::DeleteZone = if body.is_empty() {
+        wire::DeleteZone::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|_| Refusal::BadRequest)?
+    };
+    let proof = body.proof.as_deref().map(bytes).transpose()?;
+    let token = store(&state)?
+        .delete_zone(&session, &zone, proof.as_deref())
+        .await?;
     Ok(Json(wire::ZoneDeleted {
         token: token.encode(),
     }))

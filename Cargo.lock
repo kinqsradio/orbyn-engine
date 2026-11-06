@@ -1476,6 +1476,7 @@ dependencies = [
  "orbyn-crypto",
  "rand_core 0.6.4",
  "sha2 0.10.9",
+ "sha2 0.11.1",
  "thiserror",
  "zeroize",
 ]
@@ -1494,6 +1495,23 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "orbyn-client"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "getrandom 0.4.3",
+ "orbyn-auth-client",
+ "orbyn-contracts",
+ "orbyn-crypto",
+ "orbyn-planner",
+ "orbyn-sync",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "zeroize",
 ]
 
 [[package]]
@@ -1564,9 +1582,11 @@ dependencies = [
  "chrono",
  "futures-util",
  "orbyn-auth-client",
+ "orbyn-client",
  "orbyn-contracts",
  "orbyn-core",
  "orbyn-crypto",
+ "orbyn-planner",
  "orbyn-store",
  "serde",
  "serde_json",
@@ -1601,6 +1621,23 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "orbyn-wasm"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "orbyn-auth-client",
+ "orbyn-client",
+ "orbyn-contracts",
+ "orbyn-crypto",
+ "orbyn-planner",
+ "orbyn-sync",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+ "zeroize",
 ]
 
 [[package]]

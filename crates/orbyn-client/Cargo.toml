@@ -1,0 +1,26 @@
+[package]
+name = "orbyn-client"
+description = "The device sync engine: encrypts planner records and syncs them through the record store. No IO; a host drives it."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+base64.workspace = true
+getrandom.workspace = true
+orbyn-auth-client.workspace = true
+orbyn-contracts.workspace = true
+orbyn-crypto.workspace = true
+orbyn-planner.workspace = true
+orbyn-sync.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { workspace = true, features = ["wasm_js"] }
+
+[lints]
+workspace = true
