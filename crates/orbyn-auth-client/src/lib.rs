@@ -254,11 +254,84 @@ pub fn trusted_start_message(email: &str, credential_request: &[u8], signed_at: 
     out
 }
 
-/// What a trusted device signs to approve a pending one, under
-/// [`DEVICE_APPROVAL_CONTEXT`]: the account, the pending device's id and its
-/// public keys. Other devices check this signature before they trust the new
-/// device, so the server alone cannot add one.
-pub fn approval_message(
+/// Committing to the approver's nonce before it sees the new device's.
+pub const APPROVAL_COMMIT_CONTEXT: &str = "orbyn/approval-commit/v1";
+/// The short authentication string both screens show.
+pub const APPROVAL_SAS_CONTEXT: &str = "orbyn/approval-sas/v1";
+/// What a trusted device signs to remove a device.
+pub const DEVICE_REMOVAL_CONTEXT: &str = "orbyn/device-removal/v1";
+/// How long an approval stays valid after the approver made it, in seconds.
+pub const APPROVAL_MAX_AGE_SECS: i64 = 10 * 60;
+
+/// Everything that names one approval: the account, the approval id and the
+/// time the approver made it (Unix seconds), and both devices with their keys.
+/// Every approval message binds all of it.
+#[derive(Clone, Copy, Debug)]
+pub struct Pairing<'a> {
+    pub account_id: &'a [u8; 16],
+    pub approval_id: &'a [u8; 16],
+    pub created_at: i64,
+    pub approver_id: &'a [u8; 16],
+    pub approver: &'a DevicePublic,
+    pub device_id: &'a [u8; 16],
+    pub device: &'a DevicePublic,
+}
+
+fn pairing_bytes(context: &str, p: &Pairing<'_>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + context.len() + 16 * 4 + 8 + 128);
+    push_len_prefixed(&mut out, context.as_bytes());
+    out.extend_from_slice(p.account_id);
+    out.extend_from_slice(p.approval_id);
+    out.extend_from_slice(&p.created_at.to_be_bytes());
+    out.extend_from_slice(p.approver_id);
+    push_device(&mut out, p.approver);
+    out.extend_from_slice(p.device_id);
+    push_device(&mut out, p.device);
+    out
+}
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes).into()
+}
+
+/// What the approver publishes first: a hash of its 32-byte nonce bound to the
+/// whole approval, so it cannot pick the nonce after seeing the new device's.
+pub fn approval_commitment(pairing: &Pairing<'_>, approver_nonce: &[u8; 32]) -> [u8; 32] {
+    let mut bytes = pairing_bytes(APPROVAL_COMMIT_CONTEXT, pairing);
+    bytes.extend_from_slice(approver_nonce);
+    sha256(&bytes)
+}
+
+/// The six digits both devices show, from both nonces and the whole approval.
+/// A server that changed either device's key, the approval id or a nonce makes
+/// the two screens differ, except by a one-in-a-million guess, and an approval
+/// gets one comparison.
+pub fn approval_sas(
+    pairing: &Pairing<'_>,
+    approver_nonce: &[u8; 32],
+    device_nonce: &[u8; 32],
+) -> String {
+    let mut bytes = pairing_bytes(APPROVAL_SAS_CONTEXT, pairing);
+    bytes.extend_from_slice(approver_nonce);
+    bytes.extend_from_slice(device_nonce);
+    let digest = sha256(&bytes);
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&digest[..8]);
+    // 2^64 is so much larger than 10^6 that the remainder's bias is negligible.
+    format!("{:06}", u64::from_be_bytes(first) % 1_000_000)
+}
+
+/// What the approver signs, under [`DEVICE_APPROVAL_CONTEXT`], once the person
+/// confirmed on it that both screens show the same digits. Other devices check
+/// it when they verify the new device by its approval chain.
+pub fn approval_message(pairing: &Pairing<'_>) -> Vec<u8> {
+    pairing_bytes(DEVICE_APPROVAL_CONTEXT, pairing)
+}
+
+/// What a trusted device signs, under [`DEVICE_REMOVAL_CONTEXT`], to remove
+/// `device_id` with `keys` from the account.
+pub fn removal_message(
     account_id: &[u8; 16],
     device_id: &[u8; 16],
     keys: &DevicePublic,
@@ -268,6 +341,20 @@ pub fn approval_message(
     out.extend_from_slice(device_id);
     push_device(&mut out, keys);
     out
+}
+
+/// A short fingerprint of a device's keys for a person to compare, such as
+/// `3F9A-0C21-77DE-B410`.
+pub fn device_fingerprint(keys: &DevicePublic) -> String {
+    let mut bytes = Vec::with_capacity(64);
+    bytes.extend_from_slice(&keys.signing);
+    bytes.extend_from_slice(&keys.agreement);
+    let digest = sha256(&bytes);
+    digest[..8]
+        .chunks(2)
+        .map(|c| format!("{:02X}{:02X}", c[0], c[1]))
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 #[cfg(test)]
@@ -303,13 +390,25 @@ mod tests {
             signing: [1; 32],
             agreement: [3; 32],
         };
+        let pairing = |id: &[u8; 16], approver: &DevicePublic, device: &DevicePublic, at: i64| {
+            approval_message(&Pairing {
+                account_id: &[0; 16],
+                approval_id: id,
+                created_at: at,
+                approver_id: &[1; 16],
+                approver,
+                device_id: &[2; 16],
+                device,
+            })
+        };
+        let base = pairing(&[0; 16], &a, &b, 1);
+        assert_ne!(base, pairing(&[9; 16], &a, &b, 1));
+        assert_ne!(base, pairing(&[0; 16], &b, &b, 1));
+        assert_ne!(base, pairing(&[0; 16], &a, &a, 1));
+        assert_ne!(base, pairing(&[0; 16], &a, &b, 2));
         assert_ne!(
-            approval_message(&[0; 16], &[0; 16], &a),
-            approval_message(&[0; 16], &[0; 16], &b)
-        );
-        assert_ne!(
-            approval_message(&[0; 16], &[1; 16], &a),
-            approval_message(&[1; 16], &[0; 16], &a)
+            removal_message(&[0; 16], &[1; 16], &a),
+            removal_message(&[1; 16], &[0; 16], &a)
         );
         assert_ne!(
             register_message("ab", b"c", &a),
@@ -322,5 +421,72 @@ mod tests {
         let (login, _) = start_login(b"password")?;
         assert!(login.finish(b"password", b"nope").is_err());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod pairing_tests {
+    use super::*;
+
+    fn keys(n: u8) -> DevicePublic {
+        DevicePublic {
+            signing: [n; 32],
+            agreement: [n + 1; 32],
+        }
+    }
+
+    #[test]
+    fn the_sas_changes_with_every_input_and_is_six_digits() {
+        let (a, d, x) = (keys(1), keys(3), keys(5));
+        let make =
+            |approver: &DevicePublic, device: &DevicePublic, id: &[u8; 16], ra: u8, rd: u8| {
+                approval_sas(
+                    &Pairing {
+                        account_id: &[7; 16],
+                        approval_id: id,
+                        created_at: 100,
+                        approver_id: &[1; 16],
+                        approver,
+                        device_id: &[2; 16],
+                        device,
+                    },
+                    &[ra; 32],
+                    &[rd; 32],
+                )
+            };
+        let base = make(&a, &d, &[0; 16], 1, 2);
+        assert_eq!(base.len(), 6);
+        assert!(base.bytes().all(|b| b.is_ascii_digit()));
+        let others = [
+            make(&x, &d, &[0; 16], 1, 2),
+            make(&a, &x, &[0; 16], 1, 2),
+            make(&a, &d, &[1; 16], 1, 2),
+            make(&a, &d, &[0; 16], 9, 2),
+            make(&a, &d, &[0; 16], 1, 9),
+        ];
+        assert!(others.iter().all(|o| *o != base));
+        assert_ne!(device_fingerprint(&a), device_fingerprint(&d));
+        assert_eq!(device_fingerprint(&a).len(), 19);
+    }
+
+    #[test]
+    fn a_commitment_binds_the_nonce_and_the_approval() {
+        let (a, d) = (keys(1), keys(3));
+        let pairing = Pairing {
+            account_id: &[7; 16],
+            approval_id: &[0; 16],
+            created_at: 100,
+            approver_id: &[1; 16],
+            approver: &a,
+            device_id: &[2; 16],
+            device: &d,
+        };
+        let c = approval_commitment(&pairing, &[4; 32]);
+        assert_ne!(c, approval_commitment(&pairing, &[5; 32]));
+        let other = Pairing {
+            approval_id: &[9; 16],
+            ..pairing
+        };
+        assert_ne!(c, approval_commitment(&other, &[4; 32]));
     }
 }
