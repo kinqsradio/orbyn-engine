@@ -52,3 +52,5 @@ Delivery is at least once: a crash or a lost lease runs a job again. Handlers mu
 ## Running
 
 `docker compose up -d` starts Postgres, runs `orbyn migrate`, then `orbyn serve` on `127.0.0.1:8080` and one `orbyn worker`. The image is distroless and runs as a non-root user; `orbyn health` is its health check. Logs are JSON in the image and never include request bodies.
+
+The compose Postgres trusts every connection without a password, and any container on the compose network can reach it. That is for local development only: no deployment may use `compose.yaml` or trust auth.
