@@ -9,6 +9,7 @@ rust-version = "1.90"
 publish = false
 
 [workspace.dependencies]
+orbyn-auth-client = { path = "crates/orbyn-auth-client" }
 orbyn-contracts = { path = "crates/orbyn-contracts" }
 orbyn-crypto = { path = "crates/orbyn-crypto" }
 orbyn-sync = { path = "crates/orbyn-sync" }
@@ -18,10 +19,19 @@ orbyn-worker = { path = "crates/orbyn-worker" }
 
 argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
 axum = "0.8"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"] }
 clap = { version = "4", features = ["derive", "env"] }
 ed25519-dalek = { version = "3", default-features = false, features = ["fast", "zeroize"] }
 getrandom = "0.4"
+# OPAQUE (RFC 9807). opaque-ke 4.0 is built on the RustCrypto 0.10 generation, so its
+# hash, key stretching and randomness come in at the versions it was released with.
+opaque-ke = { version = "4.0.1", default-features = false, features = ["ristretto255", "argon2"] }
+opaque-argon2 = { package = "argon2", version = "0.5", default-features = false, features = ["alloc"] }
+opaque-getrandom = { package = "getrandom", version = "0.2" }
+opaque-rand-core = { package = "rand_core", version = "0.6", features = ["getrandom"] }
+opaque-sha2 = { package = "sha2", version = "0.10", default-features = false }
 hkdf = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -45,6 +55,13 @@ unsafe_code = "forbid"
 dbg_macro = "warn"
 todo = "warn"
 unwrap_used = "warn"
+
+# Argon2 runs in tests (recovery keys, OPAQUE key stretching); unoptimized it takes seconds.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
 
 [profile.release]
 codegen-units = 1

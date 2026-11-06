@@ -1,0 +1,22 @@
+[package]
+name = "orbyn-auth-client"
+description = "The OPAQUE ciphersuite Orbyn uses and the device side of sign-up, sign-in and device approval."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+opaque-argon2.workspace = true
+opaque-ke.workspace = true
+opaque-rand-core.workspace = true
+opaque-sha2.workspace = true
+orbyn-crypto.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+opaque-getrandom = { workspace = true, features = ["js"] }
+
+[lints]
+workspace = true
