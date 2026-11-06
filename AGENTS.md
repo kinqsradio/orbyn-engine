@@ -15,7 +15,9 @@ Read [docs/architecture.md](docs/architecture.md) before changing behaviour. Its
 cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
 ```
 
-Tests that need Postgres read `DATABASE_URL`. `docker compose up -d postgres` starts one locally.
+The Postgres tests are `#[ignore]`d, so that command skips them. CI runs `cargo test --workspace -- --include-ignored` against a Postgres service; run it the same way, with `DATABASE_URL` set (they read it) and a database made for the run, because a leftover one can hide a missing migration or a test that depends on old rows. `docker compose up -d postgres` starts a server locally; `docker compose exec -T postgres psql -U orbyn -d orbyn -c "CREATE DATABASE <name>"` makes the database, and `DATABASE_URL=postgres://orbyn@127.0.0.1/<name>` points the tests at it.
+
+`cargo test -p orbyn-contracts` regenerates the TypeScript bindings in `crates/orbyn-contracts/bindings/` (ts-rs writes them as the tests run). Run it after any change to a wire type and commit the result; CI fails when the committed files differ.
 
 ## Delivery
 
