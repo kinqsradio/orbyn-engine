@@ -6,6 +6,8 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 const LEASE: Duration = Duration::from_secs(60);
+/// How often expired sign-in data is removed.
+const PRUNE_EVERY: Duration = Duration::from_secs(5 * 60);
 const IDLE: Duration = Duration::from_secs(2);
 
 /// What a handler decided about a job.
@@ -54,7 +56,18 @@ where
 /// Claims and runs jobs until `stop` turns true.
 pub async fn run(db: Database, worker_id: String, mut stop: watch::Receiver<bool>) {
     tracing::info!(worker = %worker_id, "worker started");
+    let mut next_prune = tokio::time::Instant::now();
     while !*stop.borrow() {
+        // Housekeeping on a schedule, not on requests, so a flood of refused
+        // requests can never stop it. Every replica may run it; deletes are batched.
+        if tokio::time::Instant::now() >= next_prune {
+            match orbyn_core::accounts::limits::prune(db.pool()).await {
+                Ok(n) if n > 0 => tracing::info!(removed = n, "pruned expired sign-in data"),
+                Ok(_) => {}
+                Err(err) => tracing::warn!(error = %err, "could not prune sign-in data"),
+            }
+            next_prune = tokio::time::Instant::now() + PRUNE_EVERY;
+        }
         match jobs::claim(db.pool(), &worker_id, LEASE).await {
             Ok(Some(job)) => {
                 let pool = db.pool();

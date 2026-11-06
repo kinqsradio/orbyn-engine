@@ -1,12 +1,15 @@
 //! The HTTP API. Routes parse requests and map results; behaviour lives in the
 //! domain crates.
 
-use axum::extract::State;
-use axum::http::{HeaderValue, Method, StatusCode, header};
+mod accounts;
+
+use axum::extract::{DefaultBodyLimit, State};
+use axum::http::{HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use orbyn_contracts::{ApiError, Health, ServiceState};
+use orbyn_core::Accounts;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -24,14 +27,37 @@ impl Readiness for orbyn_core::Database {
     }
 }
 
+/// The largest request body accepted.
+pub const BODY_LIMIT: usize = 64 * 1024;
+
 #[derive(Clone)]
 pub struct AppState {
     readiness: Arc<dyn Readiness>,
+    accounts: Option<Accounts>,
+    client_ip_header: Option<HeaderName>,
 }
 
 impl AppState {
+    /// A state without accounts: the `/v1` account routes answer 503.
     pub fn new(readiness: Arc<dyn Readiness>) -> Self {
-        Self { readiness }
+        Self {
+            readiness,
+            accounts: None,
+            client_ip_header: None,
+        }
+    }
+
+    pub fn with_accounts(mut self, accounts: Accounts) -> Self {
+        self.accounts = Some(accounts);
+        self
+    }
+
+    /// Reads the client address from `header`, set by a trusted proxy, instead
+    /// of the connection. Only for deployments where every request comes
+    /// through that proxy.
+    pub fn with_client_ip_header(mut self, header: HeaderName) -> Self {
+        self.client_ip_header = Some(header);
+        self
     }
 }
 
@@ -49,7 +75,9 @@ pub fn router(state: AppState, allowed_origins: &[String]) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
+        .merge(accounts::routes())
         .fallback(not_found)
+        .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -166,6 +194,49 @@ mod tests {
         let (status, body) = call(true, "/nope").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["code"], "not_found");
+    }
+
+    #[tokio::test]
+    async fn account_routes_answer_503_without_a_sign_in_setup() {
+        let app = router(AppState::new(Arc::new(Fixed(true))), &[]);
+        let response = app
+            .oneshot(
+                Request::post("/v1/sessions/login/start")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"email":"a@b.c","credential_request":""}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(body["code"], "accounts_unavailable");
+    }
+
+    #[tokio::test]
+    async fn bodies_over_64_kib_are_refused() {
+        let app = router(AppState::new(Arc::new(Fixed(true))), &[]);
+        let email = "a".repeat(BODY_LIMIT);
+        let response = app
+            .oneshot(
+                Request::post("/v1/sessions/login/start")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"email":"{email}","credential_request":""}}"#
+                    )))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(body["code"], "payload_too_large");
     }
 
     #[tokio::test]

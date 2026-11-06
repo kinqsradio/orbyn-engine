@@ -42,6 +42,8 @@ services:
     environment:
       DATABASE_URL: postgres://orbyn@postgres:5432/orbyn
       ORBYN_ALLOWED_ORIGINS: http://localhost:5173
+      # From `docker compose run --rm server auth-setup`; sign-in answers 503 without it.
+      ORBYN_AUTH_SETUP: ${ORBYN_AUTH_SETUP:-}
     ports:
       - "127.0.0.1:8080:8080"
     depends_on:

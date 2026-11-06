@@ -18,9 +18,10 @@ The plan lives in the [Orbyn platform plan](https://claude.ai/artifact/BBhxZSmXR
 | --- | --- | --- |
 | `orbyn-contracts` | Wire types; generates TypeScript into `bindings/` | Everywhere |
 | `orbyn-crypto` | Symmetric sealing, device keys, key wrapping, signatures, recovery keys | Devices (native and WebAssembly) |
+| `orbyn-auth-client` | The OPAQUE ciphersuite, the device side of sign-in, the messages devices sign | Devices (native and WebAssembly); the server uses its ciphersuite |
 | `orbyn-sync` | Hybrid logical clocks and field-by-field merge | Devices |
 | `orbyn-planner` | Tasks, events, lists, repeat rules and their record fields | Devices |
-| `orbyn-core` | Configuration, Postgres, migrations, job queue | Server |
+| `orbyn-core` | Configuration, Postgres, migrations, job queue, accounts and devices | Server |
 | `orbyn-server` | HTTP API | Server |
 | `orbyn-worker` | Job runner | Server |
 | `orbyn-cli` | The `orbyn` binary with every role | Server |
@@ -28,6 +29,8 @@ The plan lives in the [Orbyn platform plan](https://claude.ai/artifact/BBhxZSmXR
 Later phases add `orbyn-client` (the device engine with SQLite), `orbyn-keychain`, `orbyn-store` (the CloudKit-style record store) and `orbyn-keyservice` (HSM-held keys), as the plan describes.
 
 ## Cryptography
+
+- `cargo audit` ignores RUSTSEC-2026-0387 (crypto-bigint 0.5 timing) in `.cargo/audit.toml`. It is pulled in only through opaque-ke 4.0's elliptic-curve support, whose group code is generic over NIST-style curves. Our suite is Ristretto255 on curve25519-dalek, and no such curve is in the build, so crypto-bigint arithmetic never runs. Remove the exception when opaque-ke depends on crypto-bigint 0.7.6 or later.
 
 - Records, zone keys and service keys are 256-bit keys used with XChaCha20-Poly1305 and a random 192-bit nonce.
 - Every seal and signature binds a context string such as `orbyn/record/v1` with a length prefix, so a value made for one purpose cannot be accepted as another.
@@ -37,6 +40,30 @@ Later phases add `orbyn-client` (the device engine with SQLite), `orbyn-keychain
 - The recovery key is 28 Crockford base32 characters (140 bits), turned into a key with Argon2id (64 MiB, 3 passes).
 - Secret types wipe themselves on drop and never print their bytes.
 - An outside review of this crate is required before launch.
+
+## Accounts and devices
+
+- Passwords use OPAQUE (RFC 9807, `opaque-ke` 4.0): Ristretto255 for the OPRF and the key exchange, triple Diffie-Hellman with SHA-512, and Argon2id (64 MiB, 3 passes, one lane) run on the device. The password never reaches the server; it stores only the registration record. Changing the ciphersuite or the Argon2id cost needs a versioned migration, because every record depends on it.
+- Emails are trimmed and lowercased, and unique. Sign-in never tells whether an email has an account: an unknown email gets a fake answer from the server setup, the same limits count it, and every failure is `login_failed`. Sign-up can tell that an email is taken (`email_unavailable`) until email verification exists.
+- `ORBYN_AUTH_SETUP` holds the OPAQUE server setup. It is a secret from `orbyn auth-setup`, the same on every replica and never in the database; a new one makes every password unusable. Without it the account routes answer 503. Two keys are derived from it with HKDF: one seals the server's half of a sign-in, the other keys the digests of IP addresses, rate-limit subjects and approval codes.
+- The server's half of a sign-in is sealed (XChaCha20-Poly1305, bound to the login id) and kept in Postgres for five minutes, so any replica can finish it. Finishing deletes it, so it works once.
+- A session token is 32 random bytes in base64url, returned once. Postgres keeps its SHA-256 digest with the account, device, creation, last use and expiry. Each use moves the expiry to 30 days later, never past one year after sign-in. A device can sign out itself; a trusted device can sign out every session.
+- Each device registers its Ed25519 and X25519 public keys with a name and platform, and signs a message that names the sign-up or the login id, so knowing the password is not enough to act as another device. The first device is trusted at sign-up. A device that signs in later is `pending` and can only see itself, answer an approval and sign out.
+- A trusted device approves a pending one by signing the account id, the pending device's id and its keys under `orbyn/device-approval/v1`. The server checks the signature, makes a uniform six-digit code (shown only on the trusted device) and keeps a keyed digest of it. The person types the code on the new device. Five wrong codes or ten minutes close the approval. On the right code the server checks the signature again, against the approver as it is now, before it trusts the device. The device list shows the approver and signature. **Planned, not built yet:** devices will check them before trusting a new device's keys, so a compromised server cannot add a device on its own. Until that check ships, a compromised server can.
+- Removing a device ends its sessions and closes its approvals at once. The last trusted device cannot be removed.
+- Rate limits live in Postgres as sliding windows and answer 429 `too_many_attempts`. Sign-in starts: 30 per email an hour from anywhere, 10 per email per address and 100 per address in 15 minutes. OPAQUE lets a client learn that a password is wrong without finishing, so every start counts. A successful sign-in gives its start back. A start signed by a device already trusted on the account (`trusted_device`: its Ed25519 signature over the normalised email, the credential request and the time, under `orbyn/trusted-login-start/v1`, valid for five minutes) counts in a per-email bucket of its own (30 an hour) and still under the per-(email, address) limit, so someone guessing cannot lock the owner out of the devices they have, and a stolen trusted device still cannot guess quickly. An invalid proof is ignored. Sign-up: 20 per address an hour. Approval codes: 10 per pending device and 50 per address in 10 minutes. IPv6 addresses count by their /64. A refused attempt is not recorded. Attempts for one subject take a non-blocking advisory lock, and a busy lock refuses the attempt rather than waiting. Every five minutes the worker removes old attempts, expired sign-in states and pending devices older than a week, in batches, until it has caught up. An account may have at most 20 pending devices, counted under a lock on the account; a trusted device can remove pending ones at any time.
+- The audit log records sign-ups, sign-ins (and failures), sign-outs, approvals, wrong codes and removals with the account, device, time and a keyed digest of the address. It holds no emails, tokens, keys or plain addresses.
+- Behind a proxy, `ORBYN_CLIENT_IP_HEADER` names the header with the client address (its last entry is used). Set it only when every request comes through that proxy, or a caller can choose its own address.
+
+### Threat model
+
+- **Server compromise.** An attacker running the server sees no passwords. Until devices check approval signatures (planned), it could add a device of its own. It can refuse service, issue sessions for pending devices it invents, and run an offline guessing attack on records with the setup secret, slowed by Argon2id on each guess.
+- **Stolen database.** Records cannot be tested against guesses without `ORBYN_AUTH_SETUP` (OPAQUE needs the OPRF key). Token digests cannot sign anyone in. Sealed sign-in states cannot be finished, and each is bound to its id and its account, so moving one to another account's row makes it fail to open. Code, address and email digests are keyed, so small spaces cannot be reversed by trying every value.
+- **Phished code.** A code works only for the device the trusted device signed, and only for ten minutes and five tries. Someone who tricks a person into reading a code still needs the password and a pending device the trusted device chose to approve; the trusted device shows the pending device's name and platform before it signs.
+- **Known risk: new devices can be blocked.** Thirty unproven starts an hour from one address use up an email's untrusted bucket, so while someone keeps that up, a new device, or an owner who has lost every trusted device, cannot sign in. Recovery-key and email-verified sign-in will skip that bucket when they ship; until then this is accepted and documented.
+- **Brute force.** Each password guess needs an OPAQUE start, and starts are limited per email from anywhere, per email per address and per address, with no difference between known and unknown emails. Codes are limited per approval, pending device and address.
+
+Next: passkeys (WebAuthn) as a second sign-in method, TOTP as a second factor, email verification so sign-up stops revealing taken emails, and recovery-key sign-in for Advanced protection.
 
 ## Merging
 
@@ -54,7 +81,7 @@ Delivery is at least once: a crash or a lost lease runs a job again. Handlers mu
 
 ## Running
 
-`docker compose up -d` starts Postgres, runs `orbyn migrate`, then `orbyn serve` on `127.0.0.1:8080` and one `orbyn worker`. The image is distroless and runs as a non-root user; `orbyn health` is its health check. Logs are JSON in the image and never include request bodies.
+`docker compose up -d` starts Postgres, runs `orbyn migrate`, then `orbyn serve` on `127.0.0.1:8080` and one `orbyn worker`. Sign-in needs `ORBYN_AUTH_SETUP` in the environment, from `orbyn auth-setup`. The image is distroless and runs as a non-root user; `orbyn health` is its health check. Logs are JSON in the image and never include request bodies.
 
 The compose Postgres trusts every connection without a password, and any container on the compose network can reach it. That is for local development only: no deployment may use `compose.yaml` or trust auth.
 
