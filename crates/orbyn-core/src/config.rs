@@ -23,6 +23,12 @@ pub struct Config {
     /// How long tombstones and deleted zones are kept before the worker purges
     /// them. A device that was offline longer fetches the zone from the start.
     pub purge_after: Duration,
+    /// Uploads that may run at once on this replica; `None` keeps half the
+    /// database pool.
+    pub max_uploads_in_flight: Option<usize>,
+    /// Uploads one client address may run at once on this replica; `None`
+    /// keeps the store's default.
+    pub max_uploads_per_address: Option<usize>,
 }
 
 impl std::fmt::Debug for Config {
@@ -34,6 +40,8 @@ impl std::fmt::Debug for Config {
             .field("auth_setup", &self.auth_setup.as_ref().map(|_| "(hidden)"))
             .field("client_ip_header", &self.client_ip_header)
             .field("purge_after", &self.purge_after)
+            .field("max_uploads_in_flight", &self.max_uploads_in_flight)
+            .field("max_uploads_per_address", &self.max_uploads_per_address)
             .finish()
     }
 }
@@ -46,13 +54,18 @@ pub enum ConfigError {
     InvalidBind,
     #[error("ORBYN_PURGE_AFTER_DAYS is not a whole number of days from 1 to 3650")]
     InvalidRetention,
+    #[error("ORBYN_MAX_UPLOADS_IN_FLIGHT is not a whole number from 1 to 1000")]
+    InvalidUploadCap,
+    #[error("ORBYN_MAX_UPLOADS_PER_ADDRESS is not a whole number from 1 to 1000")]
+    InvalidAddressUploadCap,
 }
 
 impl Config {
     /// Reads `DATABASE_URL`, `ORBYN_BIND` (default `127.0.0.1:8080`) and
     /// `ORBYN_ALLOWED_ORIGINS` (comma-separated, default the planner's dev server),
     /// `ORBYN_AUTH_SETUP` and `ORBYN_CLIENT_IP_HEADER` (both optional), and
-    /// `ORBYN_PURGE_AFTER_DAYS` (default 30).
+    /// `ORBYN_PURGE_AFTER_DAYS` (default 30) and `ORBYN_MAX_UPLOADS_IN_FLIGHT`
+    /// (optional, 1 to 1000; default half the database pool).
     pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_lookup(|name| std::env::var(name).ok())
     }
@@ -85,6 +98,26 @@ impl Config {
                 .filter(|days| (1..=3650).contains(days))
                 .ok_or(ConfigError::InvalidRetention)?,
         };
+        let max_uploads_in_flight = match get("ORBYN_MAX_UPLOADS_IN_FLIGHT") {
+            None => None,
+            Some(text) => Some(
+                text.trim()
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| (1..=1000).contains(n))
+                    .ok_or(ConfigError::InvalidUploadCap)?,
+            ),
+        };
+        let max_uploads_per_address = match get("ORBYN_MAX_UPLOADS_PER_ADDRESS") {
+            None => None,
+            Some(text) => Some(
+                text.trim()
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| (1..=1000).contains(n))
+                    .ok_or(ConfigError::InvalidAddressUploadCap)?,
+            ),
+        };
         Ok(Self {
             database_url,
             bind,
@@ -92,6 +125,8 @@ impl Config {
             auth_setup: optional("ORBYN_AUTH_SETUP"),
             client_ip_header: optional("ORBYN_CLIENT_IP_HEADER").map(|v| v.to_lowercase()),
             purge_after: Duration::from_secs(purge_days * 24 * 60 * 60),
+            max_uploads_in_flight,
+            max_uploads_per_address,
         })
     }
 }
@@ -117,6 +152,48 @@ mod tests {
         assert_eq!(config.auth_setup, None);
         assert_eq!(config.client_ip_header, None);
         assert_eq!(config.purge_after, Duration::from_secs(30 * 24 * 60 * 60));
+        Ok(())
+    }
+
+    #[test]
+    fn the_upload_cap_is_optional_and_bounded() -> Result<(), ConfigError> {
+        let with = |value: &str| {
+            Config::from_lookup(lookup(&[
+                ("DATABASE_URL", "postgres://x"),
+                ("ORBYN_MAX_UPLOADS_IN_FLIGHT", value),
+            ]))
+        };
+        assert_eq!(with("12")?.max_uploads_in_flight, Some(12));
+        for bad in ["0", "1001", "many", ""] {
+            assert_eq!(
+                with(bad).err(),
+                Some(ConfigError::InvalidUploadCap),
+                "{bad}"
+            );
+        }
+        let unset = Config::from_lookup(lookup(&[("DATABASE_URL", "postgres://x")]))?;
+        assert_eq!(unset.max_uploads_in_flight, None);
+        Ok(())
+    }
+
+    #[test]
+    fn the_address_upload_cap_is_optional_and_bounded() -> Result<(), ConfigError> {
+        let with = |value: &str| {
+            Config::from_lookup(lookup(&[
+                ("DATABASE_URL", "postgres://x"),
+                ("ORBYN_MAX_UPLOADS_PER_ADDRESS", value),
+            ]))
+        };
+        assert_eq!(with("32")?.max_uploads_per_address, Some(32));
+        for bad in ["0", "1001", "many", ""] {
+            assert_eq!(
+                with(bad).err(),
+                Some(ConfigError::InvalidAddressUploadCap),
+                "{bad}"
+            );
+        }
+        let unset = Config::from_lookup(lookup(&[("DATABASE_URL", "postgres://x")]))?;
+        assert_eq!(unset.max_uploads_per_address, None);
         Ok(())
     }
 

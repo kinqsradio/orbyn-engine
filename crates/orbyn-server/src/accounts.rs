@@ -169,8 +169,21 @@ impl FromRequestParts<AppState> for Caller {
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Failure> {
         let from_header = state.client_ip_header.as_ref().and_then(|name| {
-            let value = parts.headers.get(name)?.to_str().ok()?;
-            value.rsplit(',').next()?.trim().parse::<IpAddr>().ok()
+            let found = parts
+                .headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.rsplit(',').next())
+                .and_then(|last| last.trim().parse::<IpAddr>().ok());
+            if found.is_none() {
+                // Every such request falls back to the proxy's own address and
+                // shares one limit bucket: say so once, so the setup is fixed.
+                static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(header = %name, "the configured client address header is missing or not an address; using the connection's address");
+                }
+            }
+            found
         });
         let ip = from_header.or_else(|| {
             parts

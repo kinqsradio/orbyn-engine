@@ -369,6 +369,7 @@ async fn delete_zone(
 
 async fn upload(
     State(state): State<AppState>,
+    crate::accounts::Caller(client): crate::accounts::Caller,
     Authed(session): Authed,
     Path(zone): Path<String>,
     Body(body): Body<wire::UploadChanges>,
@@ -381,7 +382,14 @@ async fn upload(
             .map(change)
             .collect::<Answer<_>>()?,
     };
-    let result = store(&state)?.upload(&session, &zone, &upload).await?;
+    let result = store(&state)?
+        .upload_from(
+            &session,
+            client.ip.map(|ip| address_key(Some(ip))),
+            &zone,
+            &upload,
+        )
+        .await?;
     Ok(Json(wire::UploadResult {
         token: result.token.encode(),
         modified_at: time(result.modified_at),

@@ -1988,3 +1988,146 @@ async fn a_zone_being_purged_is_finished_even_if_the_window_grows() {
     let (zone, created) = store.create_zone(&me, "list").await.expect("name is free");
     assert!(created && zone.token.seq() == 0);
 }
+
+/// Floods `inbox` of 30 accounts until `stop`. `address` says where each
+/// flooder's requests come from. Returns, per flooder, (saved, refused).
+fn flood(
+    store: &Store,
+    flooders: Vec<Session>,
+    address: impl Fn(usize) -> Option<[u8; 16]>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Vec<tokio::task::JoinHandle<(u32, u32)>> {
+    use std::sync::atomic::Ordering;
+    flooders
+        .into_iter()
+        .enumerate()
+        .map(|(n, session)| {
+            let (store, stop, address) = (store.clone(), stop.clone(), address(n));
+            tokio::spawn(async move {
+                let (mut saved, mut refused) = (0, 0);
+                let mut i = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    i += 1;
+                    let changes = batch(vec![save(&format!("f{i}"), None, b"x")]);
+                    match store
+                        .upload_from(&session, address, "inbox", &changes)
+                        .await
+                    {
+                        Ok(_) => saved += 1,
+                        Err(StoreError::TooManyUploads { .. }) => {
+                            refused += 1;
+                            tokio::task::yield_now().await;
+                        }
+                        Err(other) => panic!("a flood must only be limited: {other:?}"),
+                    }
+                }
+                (saved, refused)
+            })
+        })
+        .collect()
+}
+
+async fn flooding_store() -> (Store, Database) {
+    // Rate limits out of the way: this is about the pool, not the limiter.
+    store_with(Limits {
+        uploads_per_device: limit(1_000_000),
+        uploads_per_account: limit(1_000_000),
+        ..Limits::default()
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs DATABASE_URL"]
+async fn thirty_accounts_flooding_from_one_address_leave_another_account_fast() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (store, db) = flooding_store().await;
+    let mut flooders = Vec::new();
+    for _ in 0..30 {
+        let s = trusted(&db).await;
+        store.create_zone(&s, "inbox").await.expect("zone");
+        flooders.push(s);
+    }
+    let other = trusted(&db).await;
+    store.create_zone(&other, "inbox").await.expect("zone");
+
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let tasks = flood(&store, flooders, |_| Some([1; 16]), stop.clone());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut slowest = Duration::ZERO;
+    for n in 0..10 {
+        let started = std::time::Instant::now();
+        store
+            .upload_from(
+                &other,
+                Some([2; 16]),
+                "inbox",
+                &batch(vec![save(&format!("o{n}"), None, b"x")]),
+            )
+            .await
+            .expect("another address is not refused");
+        slowest = slowest.max(started.elapsed());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    stop.store(true, Ordering::Relaxed);
+    let (mut saved, mut refused) = (0, 0);
+    for task in tasks {
+        let (s, r) = task.await.expect("task");
+        saved += s;
+        refused += r;
+    }
+    assert!(slowest < Duration::from_millis(200), "slowest {slowest:?}");
+    assert!(saved > 0 && refused > 0, "{saved} saved, {refused} refused");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs DATABASE_URL"]
+async fn thirty_accounts_from_thirty_addresses_meet_the_replica_cap_and_never_the_pool() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (store, db) = flooding_store().await;
+    let mut flooders = Vec::new();
+    for _ in 0..30 {
+        let s = trusted(&db).await;
+        store.create_zone(&s, "inbox").await.expect("zone");
+        flooders.push(s);
+    }
+    let other = trusted(&db).await;
+    store.create_zone(&other, "inbox").await.expect("zone");
+
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let tasks = flood(&store, flooders, |n| Some([n as u8 + 10; 16]), stop.clone());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // With the replica full, another account is answered at once, one way or
+    // the other: saved, or told to come back in a second. It never waits for a
+    // connection, and it never gets a pool timeout (the flooders would panic
+    // on one, and so would this).
+    let mut answered = 0;
+    for n in 0..20 {
+        let started = std::time::Instant::now();
+        let result = store
+            .upload_from(
+                &other,
+                Some([99; 16]),
+                "inbox",
+                &batch(vec![save(&format!("o{n}"), None, b"x")]),
+            )
+            .await;
+        assert!(
+            matches!(result, Ok(_) | Err(StoreError::TooManyUploads { .. })),
+            "{result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "{:?}",
+            started.elapsed()
+        );
+        answered += 1;
+    }
+    stop.store(true, Ordering::Relaxed);
+    let mut refused = 0;
+    for task in tasks {
+        refused += task.await.expect("task").1;
+    }
+    assert_eq!(answered, 20);
+    assert!(refused > 0, "the replica cap refused some of the flood");
+}
