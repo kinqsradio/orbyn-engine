@@ -48,7 +48,13 @@ async fn server_with(limits: Limits) -> Server {
     let setup = SETUP.get_or_init(|| AuthSecrets::generate().to_string());
     let secrets = AuthSecrets::from_encoded(setup).expect("setup");
     let accounts = Accounts::new(db.pool().clone(), secrets).with_limits(limits);
-    let app = router(AppState::new(Arc::new(Up)).with_accounts(accounts), &[]);
+    let feeds = orbyn_core::feeds::Feeds::new(db.pool().clone()).expect("feeds");
+    let app = router(
+        AppState::new(Arc::new(Up))
+            .with_accounts(accounts)
+            .with_feeds(feeds),
+        &[],
+    );
     Server {
         app,
         db,
@@ -1326,4 +1332,56 @@ async fn approval_codes_are_limited_per_device() {
         (status, &body["code"]),
         (StatusCode::TOO_MANY_REQUESTS, &json!("too_many_attempts"))
     );
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn feed_fetch_refuses_plain_http_internal_addresses_and_strangers() {
+    let _turn = TURN.lock().await;
+    let server = server().await;
+    let session = server
+        .register(&email(), b"pw", &DeviceKeys::generate().expect("keys"))
+        .await;
+    let call = |url: &str| json!({ "url": url });
+    let (status, body) = server
+        .call(
+            Method::POST,
+            "/v1/feeds/fetch",
+            Some(token(&session)),
+            Some(call("http://calendar.example.com/a.ics")),
+        )
+        .await;
+    assert_eq!(
+        (status, &body["code"]),
+        (StatusCode::BAD_REQUEST, &json!("invalid_url"))
+    );
+    for internal in [
+        "https://127.0.0.1/a.ics",
+        "https://169.254.169.254/latest",
+        "https://[::1]/a.ics",
+        "https://localhost/a.ics",
+    ] {
+        let (status, body) = server
+            .call(
+                Method::POST,
+                "/v1/feeds/fetch",
+                Some(token(&session)),
+                Some(call(internal)),
+            )
+            .await;
+        assert_eq!(
+            (status, &body["code"]),
+            (StatusCode::UNPROCESSABLE_ENTITY, &json!("blocked_address")),
+            "{internal}"
+        );
+    }
+    let (status, _) = server
+        .call(
+            Method::POST,
+            "/v1/feeds/fetch",
+            None,
+            Some(call("https://calendar.example.com/a.ics")),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }

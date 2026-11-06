@@ -135,7 +135,7 @@ impl IntoResponse for Failure {
 type Answer<T> = Result<T, Failure>;
 
 /// A JSON body whose errors are [`wire::ApiError`]s too.
-pub(crate) struct Body<T>(T);
+pub(crate) struct Body<T>(pub(crate) T);
 
 impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for Body<T> {
     type Rejection = Failure;
