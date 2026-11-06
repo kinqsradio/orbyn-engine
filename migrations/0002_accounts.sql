@@ -57,6 +57,9 @@ CREATE TABLE login_states (
     account_id    uuid        REFERENCES accounts (id) ON DELETE CASCADE,
     -- Keyed digest of the email, so a failed finish counts against it.
     email_subject bytea       NOT NULL CHECK (length(email_subject) = 32),
+    -- Whether this start counted against the per-email limit; a successful
+    -- finish gives it back.
+    counted       boolean     NOT NULL DEFAULT false,
     sealed        bytea       NOT NULL,
     expires_at timestamptz NOT NULL
 );

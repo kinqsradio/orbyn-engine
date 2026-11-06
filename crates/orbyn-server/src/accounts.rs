@@ -319,8 +319,21 @@ async fn login_start(
     Caller(client): Caller,
     Body(body): Body<wire::LoginStart>,
 ) -> Answer<Json<wire::LoginStarted>> {
+    let trusted = match &body.trusted_device {
+        Some(proof) => Some(orbyn_core::accounts::TrustedStart {
+            signing_key: fixed(&proof.signing_key)?,
+            signed_at: proof.signed_at,
+            signature: fixed(&proof.signature)?,
+        }),
+        None => None,
+    };
     let challenge = service(&state)?
-        .login_start(&client, &body.email, &bytes(&body.credential_request)?)
+        .login_start(
+            &client,
+            &body.email,
+            &bytes(&body.credential_request)?,
+            trusted.as_ref(),
+        )
         .await?;
     Ok(Json(wire::LoginStarted {
         login_id: challenge.login_id.to_string(),

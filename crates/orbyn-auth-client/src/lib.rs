@@ -45,6 +45,8 @@ pub const DEVICE_REGISTER_CONTEXT: &str = "orbyn/device-register/v1";
 pub const DEVICE_LOGIN_CONTEXT: &str = "orbyn/device-login/v1";
 /// What a trusted device signs to approve another: [`approval_message`].
 pub const DEVICE_APPROVAL_CONTEXT: &str = "orbyn/device-approval/v1";
+/// Context for [`trusted_start_message`].
+pub const TRUSTED_START_CONTEXT: &str = "orbyn/trusted-login-start/v1";
 
 /// Argon2id with 64 MiB, 3 passes and one lane, the same cost as the recovery key.
 pub fn ksf() -> Argon2<'static> {
@@ -237,6 +239,18 @@ pub fn login_message(login_id: &[u8; 16], keys: &DevicePublic) -> Vec<u8> {
     let mut out = Vec::with_capacity(16 + 64);
     out.extend_from_slice(login_id);
     push_device(&mut out, keys);
+    out
+}
+
+/// What a device that is already trusted signs when it starts a sign-in, under
+/// [`TRUSTED_START_CONTEXT`]: the normalised email, this sign-in's credential
+/// request and the time. Bound to the request, so a copy cannot be reused for
+/// other password guesses.
+pub fn trusted_start_message(email: &str, credential_request: &[u8], signed_at: i64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(24 + email.len() + credential_request.len());
+    push_len_prefixed(&mut out, email.as_bytes());
+    push_len_prefixed(&mut out, credential_request);
+    out.extend_from_slice(&signed_at.to_be_bytes());
     out
 }
 

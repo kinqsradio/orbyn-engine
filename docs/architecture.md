@@ -20,17 +20,18 @@ The plan lives in the [Orbyn platform plan](https://claude.ai/artifact/BBhxZSmXR
 | `orbyn-crypto` | Symmetric sealing, device keys, key wrapping, signatures, recovery keys | Devices (native and WebAssembly) |
 | `orbyn-auth-client` | The OPAQUE ciphersuite, the device side of sign-in, the messages devices sign | Devices (native and WebAssembly); the server uses its ciphersuite |
 | `orbyn-sync` | Hybrid logical clocks and field-by-field merge | Devices |
+| `orbyn-planner` | Tasks, events, lists, repeat rules and their record fields | Devices |
 | `orbyn-core` | Configuration, Postgres, migrations, job queue, accounts and devices | Server |
 | `orbyn-store` | The CloudKit-style record store: zones, encrypted records, change tokens, uploads, live notices | Server |
 | `orbyn-server` | HTTP API and the `/v1/sync` WebSocket | Server |
 | `orbyn-worker` | Job runner | Server |
 | `orbyn-cli` | The `orbyn` binary with every role | Server |
 
-Later phases add `orbyn-planner` (planner rules), `orbyn-client` (the device engine with SQLite), `orbyn-keychain` and `orbyn-keyservice` (HSM-held keys), as the plan describes.
+Later phases add `orbyn-client` (the device engine with SQLite), `orbyn-keychain` and `orbyn-keyservice` (HSM-held keys), as the plan describes.
 
 ## Cryptography
 
-- `cargo audit` ignores RUSTSEC-2026-0387 (crypto-bigint 0.5 timing) in `.cargo/audit.toml`. It is pulled in only through opaque-ke 4.0's elliptic-curve support, whose group code is generic over NIST-style curves. Our suite is Ristretto255 on curve25519-dalek, and no such curve is in the build, so crypto-bigint arithmetic never runs. Remove the exception when opaque-ke moves to crypto-bigint 0.7.6 or later.
+- `cargo audit` ignores RUSTSEC-2026-0387 (crypto-bigint 0.5 timing) in `.cargo/audit.toml`. It is pulled in only through opaque-ke 4.0's elliptic-curve support, whose group code is generic over NIST-style curves. Our suite is Ristretto255 on curve25519-dalek, and no such curve is in the build, so crypto-bigint arithmetic never runs. Remove the exception when opaque-ke depends on crypto-bigint 0.7.6 or later.
 
 - Records, zone keys and service keys are 256-bit keys used with XChaCha20-Poly1305 and a random 192-bit nonce.
 - Every seal and signature binds a context string such as `orbyn/record/v1` with a length prefix, so a value made for one purpose cannot be accepted as another.
@@ -51,7 +52,7 @@ Later phases add `orbyn-planner` (planner rules), `orbyn-client` (the device eng
 - Each device registers its Ed25519 and X25519 public keys with a name and platform, and signs a message that names the sign-up or the login id, so knowing the password is not enough to act as another device. The first device is trusted at sign-up. A device that signs in later is `pending` and can only see itself, answer an approval and sign out.
 - A trusted device approves a pending one by signing the account id, the pending device's id and its keys under `orbyn/device-approval/v1`. The server checks the signature, makes a uniform six-digit code (shown only on the trusted device) and keeps a keyed digest of it. The person types the code on the new device. Five wrong codes or ten minutes close the approval. On the right code the server checks the signature again, against the approver as it is now, before it trusts the device. The device list shows the approver and signature. **Planned, not built yet:** devices will check them before trusting a new device's keys, so a compromised server cannot add a device on its own. Until that check ships, a compromised server can.
 - Removing a device ends its sessions and closes its approvals at once. The last trusted device cannot be removed.
-- Rate limits live in Postgres as sliding windows and answer 429 `too_many_attempts`: sign-in starts 10 per email per address and 100 per address in 15 minutes, plus 100 wrong passwords per email an hour from anywhere; sign-up 20 per address an hour; approval codes 10 per pending device and 50 per address in 10 minutes. IPv6 addresses count by their /64. Limits are keyed on email and address together, so knowing someone's email is not enough to lock them out, and only wrong passwords count across addresses. A refused attempt is not recorded, so a flood neither grows the table nor keeps a window full. Attempts for one subject are serialised with an advisory lock. The worker removes old attempts, expired sign-in states and pending devices older than a week every five minutes. An account may have at most 20 pending devices.
+- Rate limits live in Postgres as sliding windows and answer 429 `too_many_attempts`. Sign-in starts: 30 per email an hour from anywhere, 10 per email per address and 100 per address in 15 minutes. OPAQUE lets a client learn that a password is wrong without finishing, so every start counts. A successful sign-in gives its start back. A start signed by a device already trusted on the account (`trusted_device`: its Ed25519 signature over the normalised email, the credential request and the time, under `orbyn/trusted-login-start/v1`, valid for five minutes) skips the per-email limits, so someone guessing can slow new devices but never lock the owner out of the ones they have. An invalid proof is ignored. Sign-up: 20 per address an hour. Approval codes: 10 per pending device and 50 per address in 10 minutes. IPv6 addresses count by their /64. A refused attempt is not recorded. Attempts for one subject take a non-blocking advisory lock, and a busy lock refuses the attempt rather than waiting. Every five minutes the worker removes old attempts, expired sign-in states and pending devices older than a week, in batches, until it has caught up. An account may have at most 20 pending devices, counted under a lock on the account; a trusted device can remove pending ones at any time.
 - The audit log records sign-ups, sign-ins (and failures), sign-outs, approvals, wrong codes and removals with the account, device, time and a keyed digest of the address. It holds no emails, tokens, keys or plain addresses.
 - Behind a proxy, `ORBYN_CLIENT_IP_HEADER` names the header with the client address (its last entry is used). Set it only when every request comes through that proxy, or a caller can choose its own address.
 
@@ -60,7 +61,7 @@ Later phases add `orbyn-planner` (planner rules), `orbyn-client` (the device eng
 - **Server compromise.** An attacker running the server sees no passwords. Until devices check approval signatures (planned), it could add a device of its own. It can refuse service, issue sessions for pending devices it invents, and run an offline guessing attack on records with the setup secret, slowed by Argon2id on each guess.
 - **Stolen database.** Records cannot be tested against guesses without `ORBYN_AUTH_SETUP` (OPAQUE needs the OPRF key). Token digests cannot sign anyone in. Sealed sign-in states cannot be finished, and each is bound to its id and its account, so moving one to another account's row makes it fail to open. Code, address and email digests are keyed, so small spaces cannot be reversed by trying every value.
 - **Phished code.** A code works only for the device the trusted device signed, and only for ten minutes and five tries. Someone who tricks a person into reading a code still needs the password and a pending device the trusted device chose to approve; the trusted device shows the pending device's name and platform before it signs.
-- **Brute force.** Password guesses need a full OPAQUE exchange each and are limited per email and per address, with no difference between known and unknown emails. Codes are limited per approval, pending device and address.
+- **Brute force.** Each password guess needs an OPAQUE start, and starts are limited per email from anywhere, per email per address and per address, with no difference between known and unknown emails. Codes are limited per approval, pending device and address.
 
 Next: passkeys (WebAuthn) as a second sign-in method, TOTP as a second factor, email verification so sign-up stops revealing taken emails, and recovery-key sign-in for Advanced protection.
 
@@ -99,3 +100,25 @@ Delivery is at least once: a crash or a lost lease runs a job again. Handlers mu
 `docker compose up -d` starts Postgres, runs `orbyn migrate`, then `orbyn serve` on `127.0.0.1:8080` and one `orbyn worker`. Sign-in needs `ORBYN_AUTH_SETUP` in the environment, from `orbyn auth-setup`. The image is distroless and runs as a non-root user; `orbyn health` is its health check. Logs are JSON in the image and never include request bodies.
 
 The compose Postgres trusts every connection without a password, and any container on the compose network can reach it. That is for local development only: no deployment may use `compose.yaml` or trust auth.
+
+## Repeat rules
+
+Daily, weekly (on chosen weekdays), monthly and yearly, every N periods, ending never, on an inclusive date, or after a count. The full rules a port must match are at the top of `crates/orbyn-planner/src/repeat.rs`. In short:
+- repeats work on dates, and a timed item keeps its local wall time on each date;
+- weeks start on Monday;
+- the start is the first date a series may fall on, and is not an occurrence unless it matches the rule;
+- a monthly rule on a missing day skips that month, and 29 February repeats only in leap years;
+- one query returns at most 1000 dates, and a walk looks at most 200,000 periods from the start.
+
+"This one only" skips a date; changing a single occurrence is not supported yet. "This and following" ends the series the day before and starts a new one, sharing a count so the total stays the same; it is refused at the first occurrence, where the whole series should be edited instead.
+
+## Records
+
+A task or event is stored as fields, each stamped for merging: `kind`, `title`, `notes`, `list_id`, `due`, `priority`, `done_at`, `deleted_at` and `repeat` (the rule without its skips). Each checklist step has its own `checklist.<id>.title`, `.done` and `.order` fields, plus `.removed` once deleted. Each skipped date is a `repeat.skip.<date>` field, `false` once unskipped. So two devices that each add a step, tick a step, reorder or skip a date keep both changes. Step orders are fractional keys (base-62 strings, `orbyn_planner::order`), so inserting a step anywhere changes only that step. Steps sort by key, then by id, so two devices that pick the same key still agree. The key algorithm is written out in `order.rs` for ports; keys are at most 1024 characters and grow about one character per six inserts in one spot or appends at the end. Restoring a deleted step writes `.removed: false`. Edits are sent with `Item::changed_fields`, which includes the removals.
+
+Reading a record checks it fully: the repeat rule, unique step ids and valid order keys. A rule that carries skips inline is refused, because skips live only in their own fields. A missing or malformed field is refused, never guessed. Unknown fields are ignored. One merge result is repaired instead of refused: a repeating item's due date that is before its series start, or on a date the rule no longer falls on (one device moved the series while another completed an occurrence), moves to the next occurrence, keeping its time of day.
+
+Known limits, to revisit with compaction:
+- Removal markers (`.removed`, `false` skips) are never cleaned up yet.
+- A skip that reaches a record after another device split the series lands on the old part, so the date still shows in the new part.
+- A skip made while another device turned repeat off returns if repeat is turned on again.
