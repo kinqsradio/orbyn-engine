@@ -76,7 +76,7 @@ impl Feeds {
 
     /// Fetches `url` for `account`, refusing anything the module rules forbid.
     pub async fn fetch(&self, account: Uuid, url: &str) -> Result<Feed, FeedError> {
-        let mut current = checked_url(url)?;
+        let current = checked_url(url)?;
         let subject = account_subject(account);
         if !limits::allow(&self.pool, "feed-fetch", &subject, self.limit)
             .await
@@ -84,6 +84,13 @@ impl Feeds {
         {
             return Err(FeedError::TooManyAttempts);
         }
+        // One deadline for the whole fetch, redirects included.
+        tokio::time::timeout(TIMEOUT, self.follow(current))
+            .await
+            .map_err(|_| FeedError::Timeout)?
+    }
+
+    async fn follow(&self, mut current: reqwest::Url) -> Result<Feed, FeedError> {
         for _ in 0..=MAX_REDIRECTS {
             let response = self
                 .client
@@ -133,16 +140,14 @@ fn map_send_error(err: reqwest::Error) -> FeedError {
     if err.is_timeout() {
         return FeedError::Timeout;
     }
-    // The resolver's refusal surfaces as a connect error with our message inside.
-    let blocked = std::error::Error::source(&err)
-        .map(|s| format!("{s:?}"))
-        .is_some_and(|s| s.contains("blocked address"))
-        || format!("{err:?}").contains("blocked address");
-    if blocked {
-        FeedError::BlockedAddress
-    } else {
-        FeedError::Upstream
+    let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&err);
+    while let Some(cause) = source {
+        if cause.downcast_ref::<Blocked>().is_some() {
+            return FeedError::BlockedAddress;
+        }
+        source = cause.source();
     }
+    FeedError::Upstream
 }
 
 async fn read_capped(mut response: reqwest::Response) -> Result<String, FeedError> {
@@ -222,22 +227,37 @@ fn is_public_v4(ip: Ipv4Addr) -> bool {
         || (a == 100 && (64..=127).contains(&b)) // shared address space (CGNAT)
         || (a == 192 && b == 0 && c == 0) // IETF protocol assignments
         || (a == 198 && (18..=19).contains(&b)) // benchmarking
+        || (a == 192 && b == 88 && c == 99) // 6to4 relay anycast
         || a >= 240) // reserved
 }
 
+/// Only global unicast (2000::/3) counts, minus the special ranges inside it.
+/// Everything outside 2000::/3, including IPv4-compatible (::a.b.c.d),
+/// IPv4-translated (::ffff:0:a.b.c.d), NAT64 (64:ff9b::/96) and discard
+/// (100::/64) forms, is refused.
 fn is_public_v6(ip: Ipv6Addr) -> bool {
     let s = ip.segments();
-    !(ip.is_unspecified()
-        || ip.is_loopback()
-        || ip.is_multicast()
-        || (s[0] & 0xfe00) == 0xfc00 // unique local
-        || (s[0] & 0xffc0) == 0xfe80 // link local
-        || (s[0] & 0xffc0) == 0xfec0 // site local (deprecated)
-        || (s[0] == 0x2001 && s[1] == 0x0db8) // documentation
-        || (s[0] == 0x0064 && s[1] == 0xff9b) // NAT64, may reach IPv4 private space
-        || (s[0] == 0x2002) // 6to4, embeds an IPv4 address
-        || (s[0] == 0x2001 && s[1] == 0x0000)) // Teredo
+    let global_unicast = (s[0] & 0xe000) == 0x2000;
+    global_unicast
+        && !(s[0] == 0x2001 && s[1] == 0x0000 // Teredo, 2001::/32
+            || s[0] == 0x2001 && s[1] == 0x0002 && s[2] == 0x0000 // benchmarking, 2001:2::/48
+            || s[0] == 0x2001 && (s[1] & 0xfff0) == 0x0010 // ORCHID, 2001:10::/28
+            || s[0] == 0x2001 && (s[1] & 0xfff0) == 0x0020 // ORCHIDv2, 2001:20::/28
+            || s[0] == 0x2001 && s[1] == 0x0db8 // documentation, 2001:db8::/32
+            || s[0] == 0x2002) // 6to4, 2002::/16, embeds an IPv4 address
 }
+
+/// The resolver's refusal, found again by type in reqwest's error chain.
+#[derive(Debug)]
+struct Blocked;
+
+impl std::fmt::Display for Blocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("blocked address")
+    }
+}
+
+impl std::error::Error for Blocked {}
 
 /// Resolves names and keeps only public addresses, so the check happens at
 /// connection time and a rebinding name cannot slip a private address in.
@@ -250,9 +270,7 @@ impl Resolve for GuardedResolver {
             let addrs: Vec<SocketAddr> = tokio::net::lookup_host(host).await?.collect();
             let public: Vec<SocketAddr> = addrs.into_iter().filter(|a| is_public(a.ip())).collect();
             if public.is_empty() {
-                return Err(Box::<dyn std::error::Error + Send + Sync>::from(
-                    "blocked address",
-                ));
+                return Err(Box::new(Blocked) as Box<dyn std::error::Error + Send + Sync>);
             }
             let addrs: Addrs = Box::new(public.into_iter());
             Ok(addrs)
@@ -337,5 +355,23 @@ mod tests {
         let result = client.get("https://localhost./a.ics").send().await;
         let err = result.expect_err("refused");
         assert_eq!(map_send_error(err), FeedError::BlockedAddress);
+    }
+
+    #[test]
+    fn ipv6_forms_that_embed_ipv4_or_are_special_are_refused() {
+        for bad in [
+            "::127.0.0.1",
+            "::ffff:0:10.0.0.1",
+            "100::1",
+            "2001:2::1",
+            "2001:10::1",
+            "64:ff9b::a00:1",
+            "2002:7f00:1::1",
+            "2001:0:4136:e378::1",
+        ] {
+            assert!(!is_public(bad.parse().expect("ip")), "{bad}");
+        }
+        assert!(!is_public("192.88.99.1".parse().expect("ip")));
+        assert!(is_public("2a00:1450:4001:82a::200e".parse().expect("ip")));
     }
 }
