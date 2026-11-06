@@ -18,12 +18,43 @@ pub struct Stamp {
     pub device: u64,
 }
 
+/// How far ahead of the local wall clock a received stamp may be, in milliseconds.
+/// A stamp further ahead would drag every later local edit's clock far into the
+/// future, so it is refused.
+pub const MAX_SKEW_MILLIS: u64 = 60 * 60 * 1000;
+
+/// Why a received stamp was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClockError {
+    /// The stamp is more than [`MAX_SKEW_MILLIS`] ahead of the local wall clock.
+    TooFarAhead,
+}
+
+impl std::fmt::Display for ClockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooFarAhead => f.write_str("stamp is too far ahead of the local clock"),
+        }
+    }
+}
+
+impl std::error::Error for ClockError {}
+
 /// A device's clock. It never goes backwards, even when the wall clock does, and
 /// it moves past any stamp it receives.
 #[derive(Clone, Debug)]
 pub struct Clock {
     device: u64,
     last: Stamp,
+}
+
+/// The reading after `millis`/`counter`, moving to the next millisecond when the
+/// counter is full instead of saturating (a saturated counter would repeat a stamp).
+fn successor(millis: u64, counter: u32) -> (u64, u32) {
+    match counter.checked_add(1) {
+        Some(next) => (millis, next),
+        None => (millis.saturating_add(1), 0),
+    }
 }
 
 impl Clock {
@@ -40,39 +71,41 @@ impl Clock {
 
     /// The stamp for a new local edit at wall time `now_millis`.
     pub fn tick(&mut self, now_millis: u64) -> Stamp {
-        self.last = if now_millis > self.last.millis {
-            Stamp {
-                millis: now_millis,
-                counter: 0,
-                device: self.device,
-            }
+        let (millis, counter) = if now_millis > self.last.millis {
+            (now_millis, 0)
         } else {
-            Stamp {
-                millis: self.last.millis,
-                counter: self.last.counter.saturating_add(1),
-                device: self.device,
-            }
-        };
-        self.last
-    }
-
-    /// Moves the clock past a stamp seen from another device.
-    pub fn observe(&mut self, seen: Stamp, now_millis: u64) {
-        let millis = now_millis.max(self.last.millis).max(seen.millis);
-        let counter = if millis == self.last.millis && millis == seen.millis {
-            self.last.counter.max(seen.counter).saturating_add(1)
-        } else if millis == self.last.millis {
-            self.last.counter.saturating_add(1)
-        } else if millis == seen.millis {
-            seen.counter.saturating_add(1)
-        } else {
-            0
+            successor(self.last.millis, self.last.counter)
         };
         self.last = Stamp {
             millis,
             counter,
             device: self.device,
         };
+        self.last
+    }
+
+    /// Moves the clock past a stamp seen from another device. A stamp more than
+    /// [`MAX_SKEW_MILLIS`] ahead of `now_millis` is refused and the clock is unchanged.
+    pub fn observe(&mut self, seen: Stamp, now_millis: u64) -> Result<(), ClockError> {
+        if seen.millis > now_millis.saturating_add(MAX_SKEW_MILLIS) {
+            return Err(ClockError::TooFarAhead);
+        }
+        let millis = now_millis.max(self.last.millis).max(seen.millis);
+        let (millis, counter) = if millis == self.last.millis && millis == seen.millis {
+            successor(millis, self.last.counter.max(seen.counter))
+        } else if millis == self.last.millis {
+            successor(millis, self.last.counter)
+        } else if millis == seen.millis {
+            successor(millis, seen.counter)
+        } else {
+            (millis, 0)
+        };
+        self.last = Stamp {
+            millis,
+            counter,
+            device: self.device,
+        };
+        Ok(())
     }
 }
 
@@ -92,7 +125,11 @@ pub struct Fields(pub BTreeMap<String, Field>);
 
 impl Fields {
     pub fn set(&mut self, name: &str, value: serde_json::Value, stamp: Stamp) {
-        let replace = self.0.get(name).is_none_or(|f| stamp > f.stamp);
+        // On an exact stamp tie (a buggy or malicious device reusing a stamp) keep the
+        // value with the greater canonical JSON, so every device picks the same one.
+        let replace = self.0.get(name).is_none_or(|f| {
+            stamp > f.stamp || (stamp == f.stamp && canonical(&value) > canonical(&f.value))
+        });
         if replace {
             self.0.insert(name.to_owned(), Field { value, stamp });
         }
@@ -114,6 +151,10 @@ impl Fields {
     pub fn latest(&self) -> Option<Stamp> {
         self.0.values().map(|f| f.stamp).max()
     }
+}
+
+fn canonical(value: &serde_json::Value) -> String {
+    serde_json::to_string(value).unwrap_or_default()
 }
 
 /// Merges two copies of a record. The result is the same whichever copy is
@@ -146,7 +187,7 @@ mod tests {
         let b = clock.tick(90);
         let c = clock.tick(100);
         assert!(a < b && b < c);
-        clock.observe(stamp(500, 2), 120);
+        assert_eq!(clock.observe(stamp(500, 2), 120), Ok(()));
         assert!(clock.tick(130) > stamp(500, 2));
     }
 
@@ -203,5 +244,102 @@ mod tests {
         laptop.delete(stamp(2, 2));
         assert!(merge(&phone, &laptop).is_deleted());
         assert_eq!(merge(&phone, &laptop).latest(), Some(stamp(2, 2)));
+    }
+
+    #[test]
+    fn a_stamp_too_far_ahead_is_refused_and_changes_nothing() {
+        let mut clock = Clock::new(1);
+        clock.tick(1_000);
+        let before = clock.clone().tick(1_000);
+        let far = stamp(1_000 + MAX_SKEW_MILLIS + 1, 2);
+        assert_eq!(clock.observe(far, 1_000), Err(ClockError::TooFarAhead));
+        assert_eq!(clock.clone().tick(1_000), before);
+        // Exactly at the limit is accepted.
+        let edge = stamp(1_000 + MAX_SKEW_MILLIS, 2);
+        assert_eq!(clock.observe(edge, 1_000), Ok(()));
+        assert!(clock.tick(1_000) > edge);
+    }
+
+    #[test]
+    fn a_full_counter_rolls_into_the_next_millisecond() {
+        let mut clock = Clock::new(1);
+        clock.last = Stamp {
+            millis: 50,
+            counter: u32::MAX,
+            device: 1,
+        };
+        let next = clock.tick(10);
+        assert_eq!((next.millis, next.counter), (51, 0));
+        clock.last.counter = u32::MAX;
+        assert_eq!(clock.observe(stamp(40, 2), 10), Ok(()));
+        assert_eq!((clock.last.millis, clock.last.counter), (52, 0));
+    }
+
+    #[test]
+    fn equal_stamps_with_different_values_keep_the_greater_json() {
+        let mut a = Fields::default();
+        a.set("title", json!("A"), stamp(10, 1));
+        let mut b = Fields::default();
+        b.set("title", json!("B"), stamp(10, 1));
+        assert_eq!(merge(&a, &b), merge(&b, &a));
+        assert_eq!(merge(&a, &b).get("title"), Some(&json!("B")));
+    }
+
+    /// A tiny deterministic generator (SplitMix64), so the property tests need no
+    /// dependency and reproduce exactly.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// Few names, few stamps and few values, so duplicates and exact ties are common.
+    fn random_fields(rng: &mut Rng) -> Fields {
+        let mut fields = Fields::default();
+        for _ in 0..rng.below(6) {
+            let name = ["a", "b", "c"][rng.below(3) as usize];
+            let values = [
+                json!("x"),
+                json!("y"),
+                json!(1),
+                json!(null),
+                json!({"k": 2}),
+            ];
+            let value = values[rng.below(5) as usize].clone();
+            let stamp = Stamp {
+                millis: rng.below(3),
+                counter: rng.below(2) as u32,
+                device: rng.below(2),
+            };
+            fields.set(name, value, stamp);
+        }
+        fields
+    }
+
+    #[test]
+    fn merge_is_commutative_associative_and_idempotent_over_random_sets() {
+        let mut rng = Rng(0x0AB7);
+        for case in 0..3000 {
+            let a = random_fields(&mut rng);
+            let b = random_fields(&mut rng);
+            let c = random_fields(&mut rng);
+            assert_eq!(merge(&a, &b), merge(&b, &a), "commutative, case {case}");
+            assert_eq!(
+                merge(&merge(&a, &b), &c),
+                merge(&a, &merge(&b, &c)),
+                "associative, case {case}"
+            );
+            assert_eq!(merge(&a, &a), a, "idempotent, case {case}");
+        }
     }
 }
