@@ -115,7 +115,7 @@ fn unix_now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// A sign-in state as read back: account, email digest, whether it was counted, sealed state.
+/// A sign-in state as read back: account, email digest, whether the start was trusted, sealed state.
 type LoginStateRow = (Option<Uuid>, Vec<u8>, bool, Vec<u8>);
 
 /// The most devices an account may have waiting for approval at once.
@@ -482,22 +482,22 @@ impl Accounts {
             Some(proof) => self.is_trusted_start(&email, request, proof).await?,
             None => false,
         };
-        let by_email = trusted
-            || (limits::allow(
+        // Trusted starts get their own per-email bucket, so a stranger's
+        // guessing cannot use it up, and keep the per-(email, address) limit, so
+        // a stolen trusted device still cannot guess quickly.
+        let (email_action, email_limit) = if trusted {
+            ("login-email-trusted", self.limits.login_per_email_trusted)
+        } else {
+            ("login-email", self.limits.login_per_email)
+        };
+        let by_email = limits::allow(&self.pool, email_action, &email_subject, email_limit).await?
+            && limits::allow(
                 &self.pool,
-                "login-email",
-                &email_subject,
-                self.limits.login_per_email,
+                "login",
+                &pair_subject,
+                self.limits.login_per_email_and_ip,
             )
-            .await?
-                && limits::allow(
-                    &self.pool,
-                    "login",
-                    &pair_subject,
-                    self.limits.login_per_email_and_ip,
-                )
-                .await?);
-        let counted = !trusted;
+            .await?;
         let by_ip = limits::allow(
             &self.pool,
             "login-ip",
@@ -551,13 +551,13 @@ impl Accounts {
             )
             .map_err(|_| AccountError::Internal)?;
         sqlx::query(
-            "INSERT INTO login_states (id, account_id, email_subject, counted, sealed, expires_at)
+            "INSERT INTO login_states (id, account_id, email_subject, trusted_start, sealed, expires_at)
              VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6))",
         )
         .bind(login_id)
         .bind(account_id)
         .bind(email_subject.as_slice())
-        .bind(counted)
+        .bind(trusted)
         .bind(sealed.to_bytes())
         .bind(LOGIN_STATE_TTL.as_secs_f64())
         .execute(&self.pool)
@@ -583,12 +583,13 @@ impl Accounts {
         // Taken and deleted at once: a sign-in state is used at most once.
         let row: Option<LoginStateRow> = sqlx::query_as(
             "DELETE FROM login_states WHERE id = $1 AND expires_at > now()
-             RETURNING account_id, email_subject, counted, sealed",
+             RETURNING account_id, email_subject, trusted_start, sealed",
         )
         .bind(login_id)
         .fetch_optional(&self.pool)
         .await?;
-        let (account_id, email_subject, counted, sealed) = row.ok_or(AccountError::LoginFailed)?;
+        let (account_id, email_subject, trusted_start, sealed) =
+            row.ok_or(AccountError::LoginFailed)?;
         let state = Sealed::from_bytes(&sealed)
             .and_then(|sealed| {
                 self.secrets.state_key().open(
@@ -694,10 +695,16 @@ impl Accounts {
         )
         .await?;
         tx.commit().await?;
-        // A sign-in that worked gives back the start it was counted for, so the
+        // A sign-in that worked gives back the start it was counted for, to the
+        // same bucket, so the
         // owner's own sign-ins never use up the per-email limit.
-        if counted && let Ok(subject) = <[u8; 32]>::try_from(email_subject.as_slice()) {
-            limits::give_back(&self.pool, "login-email", &subject).await?;
+        if let Ok(subject) = <[u8; 32]>::try_from(email_subject.as_slice()) {
+            let action = if trusted_start {
+                "login-email-trusted"
+            } else {
+                "login-email"
+            };
+            limits::give_back(&self.pool, action, &subject).await?;
         }
         Ok(session)
     }

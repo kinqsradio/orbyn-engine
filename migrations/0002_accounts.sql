@@ -55,11 +55,11 @@ CREATE INDEX sessions_account ON sessions (account_id) WHERE revoked_at IS NULL;
 CREATE TABLE login_states (
     id            uuid        PRIMARY KEY,
     account_id    uuid        REFERENCES accounts (id) ON DELETE CASCADE,
-    -- Keyed digest of the email, so a failed finish counts against it.
+    -- Keyed digest of the email: a successful finish gives the start back to
+    -- that email's limit.
     email_subject bytea       NOT NULL CHECK (length(email_subject) = 32),
-    -- Whether this start counted against the per-email limit; a successful
-    -- finish gives it back.
-    counted       boolean     NOT NULL DEFAULT false,
+    -- Whether a trusted device signed the start, which picks the limit bucket.
+    trusted_start boolean     NOT NULL DEFAULT false,
     sealed        bytea       NOT NULL,
     expires_at timestamptz NOT NULL
 );

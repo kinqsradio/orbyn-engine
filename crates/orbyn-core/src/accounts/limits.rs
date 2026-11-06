@@ -28,6 +28,9 @@ pub struct Limits {
     /// sign-in gives its start back, and a start signed by an already trusted
     /// device is not counted, so the owner cannot be locked out.
     pub login_per_email: Limit,
+    /// Sign-in starts for one email signed by a device already trusted on it:
+    /// a bucket of its own, so a stranger's guessing cannot use it up.
+    pub login_per_email_trusted: Limit,
     pub login_per_ip: Limit,
     /// Sign-up requests, start and finish, from one address.
     pub register_per_ip: Limit,
@@ -42,6 +45,7 @@ impl Default for Limits {
         Self {
             login_per_email_and_ip: Limit::new(10, Duration::from_secs(15 * MINUTE)),
             login_per_email: Limit::new(30, Duration::from_secs(60 * MINUTE)),
+            login_per_email_trusted: Limit::new(30, Duration::from_secs(60 * MINUTE)),
             login_per_ip: Limit::new(100, Duration::from_secs(15 * MINUTE)),
             register_per_ip: Limit::new(20, Duration::from_secs(60 * MINUTE)),
             approval_code_per_device: Limit::new(10, Duration::from_secs(10 * MINUTE)),
