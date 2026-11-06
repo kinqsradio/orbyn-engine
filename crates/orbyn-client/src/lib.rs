@@ -368,6 +368,9 @@ pub struct Engine {
     trust: Trust,
     clock: Clock,
     zones: BTreeMap<String, ZoneState>,
+    /// Records whose newest stamp was more than an hour ahead of the clock when
+    /// the engine was restored, and so was not allowed to move this device's clock.
+    skipped_future_stamps: usize,
 }
 
 /// The stamp device number of a device: the first 8 bytes of its signing key.
@@ -396,6 +399,7 @@ impl Engine {
             trust: Trust::new(account, device_id.to_owned(), me),
             keys,
             zones: BTreeMap::new(),
+            skipped_future_stamps: 0,
         })
     }
 
@@ -420,8 +424,12 @@ impl Engine {
                 rotations.insert(key_id_of(&id)?, r);
             }
             for local in z.records.values() {
-                if let Some(latest) = local.fields.latest() {
-                    let _ = engine.clock.observe(latest, now_millis);
+                if let Some(latest) = local.fields.latest()
+                    && engine.clock.resume(latest, now_millis).is_err()
+                {
+                    // More than an hour ahead of this clock: it must not drag
+                    // the clock there. The record stays; the host is told.
+                    engine.skipped_future_stamps += 1;
                 }
             }
             engine.zones.insert(
@@ -546,6 +554,27 @@ impl Engine {
         self.clock.tick(now_millis)
     }
 
+    /// The stamp for an edit the person made at `edit_millis`, which may be
+    /// earlier than `now_millis` (an edit queued while the app was closed). The
+    /// clock's rules still hold: the stamp can never be earlier than the last
+    /// one this device issued or saw, so an older `edit_millis` is moved up to
+    /// just after it. An edit cannot have been made in the future, so an
+    /// `edit_millis` after `now_millis` is taken as `now_millis`, silently: a
+    /// device whose clock runs a little fast does not fail its own edits, and
+    /// never issues a stamp that other devices would drop as too far ahead.
+    pub fn tick_at(&mut self, edit_millis: u64, now_millis: u64) -> Stamp {
+        self.clock.tick(edit_millis.min(now_millis))
+    }
+
+    /// How many records the last [`Engine::restore`] found with a newest stamp
+    /// more than an hour ahead of its `now_millis`. Such a stamp is not allowed
+    /// to move the clock; the records are kept. The engine does no logging, so
+    /// a host should log a non-zero count (the clock of this or another device
+    /// is wrong).
+    pub fn skipped_future_stamps(&self) -> usize {
+        self.skipped_future_stamps
+    }
+
     fn zone_mut(&mut self, zone: &str) -> Result<&mut ZoneState> {
         if !valid_name(zone, 64) {
             return Err(ClientError::InvalidZone);
@@ -567,6 +596,12 @@ impl Engine {
     pub fn record(&self, zone: &str, record_id: &str) -> Option<&Fields> {
         let local = self.zones.get(zone)?.records.get(record_id)?;
         (!local.deleted).then_some(&local.fields)
+    }
+
+    /// A live record's type, as stored.
+    pub fn record_type(&self, zone: &str, record_id: &str) -> Option<&str> {
+        let local = self.zones.get(zone)?.records.get(record_id)?;
+        (!local.deleted).then_some(local.record_type.as_str())
     }
 
     /// Every cached record of the zone, deleted ones waiting to upload included.
@@ -918,8 +953,9 @@ impl Engine {
         let mut unseen = z.refetch.take().unwrap_or_default();
         unseen.extend(held);
         z.refetch = Some(unseen);
+        // A refetch that ends, or is given up with ExpiredAgain, resets the
+        // count, so a refetch that starts here always starts at zero.
         if !again {
-            z.refetch_restarts = 0;
             return Ok(());
         }
         if z.refetch_restarts >= MAX_REFETCH_RESTARTS {

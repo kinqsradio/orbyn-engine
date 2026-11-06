@@ -175,8 +175,9 @@ impl DeviceKeys {
 
     /// Keys saved with `export` under the same wrapping secret.
     #[wasm_bindgen(js_name = import)]
-    pub fn import_sealed(sealed: &[u8], wrap_secret: &[u8]) -> Result<DeviceKeys> {
-        let bytes = local_open(wrap_secret, DEVICE_KEYS_PURPOSE, b"", sealed)?;
+    pub fn import_sealed(sealed: &[u8], wrap_secret: Vec<u8>) -> Result<DeviceKeys> {
+        let wrap_secret = Zeroizing::new(wrap_secret);
+        let bytes = local_open(&wrap_secret, DEVICE_KEYS_PURPOSE, b"", sealed)?;
         Ok(Self {
             keys: orbyn_crypto::DeviceKeys::from_bytes(&bytes)?,
         })
@@ -184,9 +185,10 @@ impl DeviceKeys {
 
     /// The keys sealed under `wrap_secret` (see the README), for the host to
     /// store. The secret bytes themselves never leave WebAssembly.
-    pub fn export(&self, wrap_secret: &[u8]) -> Result<Vec<u8>> {
+    pub fn export(&self, wrap_secret: Vec<u8>) -> Result<Vec<u8>> {
+        let wrap_secret = Zeroizing::new(wrap_secret);
         local_seal(
-            wrap_secret,
+            &wrap_secret,
             DEVICE_KEYS_PURPOSE,
             b"",
             self.keys.to_bytes().as_slice(),
@@ -266,8 +268,9 @@ impl PendingRegistration {
 
 /// Starts sign-up.
 #[wasm_bindgen(js_name = startRegistration)]
-pub fn start_registration(password: &[u8]) -> Result<PendingRegistration> {
-    let (state, request) = auth::start_registration(password)?;
+pub fn start_registration(password: Vec<u8>) -> Result<PendingRegistration> {
+    let password = Zeroizing::new(password);
+    let (state, request) = auth::start_registration(&password)?;
     Ok(PendingRegistration {
         state: Some(state),
         request,
@@ -279,14 +282,15 @@ pub fn start_registration(password: &[u8]) -> Result<PendingRegistration> {
 #[wasm_bindgen(js_name = finishRegistration)]
 pub fn finish_registration(
     pending: &mut PendingRegistration,
-    password: &[u8],
+    password: Vec<u8>,
     response: &[u8],
 ) -> Result<Vec<u8>> {
+    let password = Zeroizing::new(password);
     let state = pending
         .state
         .take()
         .ok_or_else(|| error("already_finished", "this sign-up was already finished"))?;
-    let finish = state.finish(password, response)?;
+    let finish = state.finish(&password, response)?;
     Ok(finish.upload)
 }
 
@@ -308,8 +312,9 @@ impl PendingLogin {
 
 /// Starts sign-in.
 #[wasm_bindgen(js_name = startLogin)]
-pub fn start_login(password: &[u8]) -> Result<PendingLogin> {
-    let (state, request) = auth::start_login(password)?;
+pub fn start_login(password: Vec<u8>) -> Result<PendingLogin> {
+    let password = Zeroizing::new(password);
+    let (state, request) = auth::start_login(&password)?;
     Ok(PendingLogin {
         state: Some(state),
         request,
@@ -322,16 +327,17 @@ pub fn start_login(password: &[u8]) -> Result<PendingLogin> {
 #[wasm_bindgen(js_name = finishLogin)]
 pub fn finish_login(
     pending: &mut PendingLogin,
-    password: &[u8],
+    password: Vec<u8>,
     response: &[u8],
 ) -> Result<Vec<u8>> {
+    let password = Zeroizing::new(password);
     let state = pending
         .state
         .take()
         .ok_or_else(|| error("already_finished", "this sign-in was already finished"))?;
     // The export key is dropped (and wiped) here; nothing outside WebAssembly
     // ever sees it.
-    let finish = state.finish(password, response)?;
+    let finish = state.finish(&password, response)?;
     Ok(finish.finalization)
 }
 
@@ -448,11 +454,12 @@ impl SyncEngine {
     pub fn restore(
         keys: &DeviceKeys,
         sealed: &[u8],
-        wrap_secret: &[u8],
+        wrap_secret: Vec<u8>,
         now: f64,
     ) -> Result<SyncEngine> {
+        let wrap_secret = Zeroizing::new(wrap_secret);
         let aad = keys.keys.public().signing;
-        let json = local_open(wrap_secret, SNAPSHOT_PURPOSE, &aad, sealed)?;
+        let json = local_open(&wrap_secret, SNAPSHOT_PURPOSE, &aad, sealed)?;
         let snapshot = serde_json::from_slice(&json).map_err(|e| error("invalid_json", e))?;
         Ok(Self {
             engine: Engine::restore(keys.copy()?, snapshot, millis(now))?,
@@ -461,17 +468,35 @@ impl SyncEngine {
 
     /// The engine's state sealed under `wrap_secret`, bound to this device's
     /// keys. Zone keys inside it never leave WebAssembly in the clear.
-    pub fn snapshot(&self, wrap_secret: &[u8]) -> Result<Vec<u8>> {
+    pub fn snapshot(&self, wrap_secret: Vec<u8>) -> Result<Vec<u8>> {
+        let wrap_secret = Zeroizing::new(wrap_secret);
         let json = Zeroizing::new(
             serde_json::to_vec(&self.engine.snapshot()).map_err(|e| error("encode_failed", e))?,
         );
         let aad = self.engine.device_keys().public().signing;
-        local_seal(wrap_secret, SNAPSHOT_PURPOSE, &aad, &json)
+        local_seal(&wrap_secret, SNAPSHOT_PURPOSE, &aad, &json)
     }
 
     /// A `Stamp` for a new edit at `now` (milliseconds).
     pub fn tick(&mut self, now: f64) -> Result<String> {
         to_json(&self.engine.tick(millis(now)))
+    }
+
+    /// A `Stamp` for an edit made at `edit_at` (milliseconds), which may be
+    /// earlier than `now`: an edit queued while the app was closed. The clock's
+    /// rules hold: the stamp is never earlier than the last one this device
+    /// issued or saw. An `edit_at` after `now` is taken as `now`, silently.
+    #[wasm_bindgen(js_name = tickAt)]
+    pub fn tick_at(&mut self, edit_at: f64, now: f64) -> Result<String> {
+        to_json(&self.engine.tick_at(millis(edit_at), millis(now)))
+    }
+
+    /// How many records `restore` found with a newest stamp more than an hour
+    /// ahead of its `now`. They were kept but did not move the clock; log a
+    /// non-zero count.
+    #[wasm_bindgen(js_name = skippedFutureStamps)]
+    pub fn skipped_future_stamps(&self) -> u32 {
+        u32::try_from(self.engine.skipped_future_stamps()).unwrap_or(u32::MAX)
     }
 
     /// Stages already stamped `Fields`.
@@ -506,9 +531,27 @@ impl SyncEngine {
         Ok(self.engine.delete(zone, record_id)?)
     }
 
-    /// A live record's `Fields`, or `undefined`.
+    /// A live record as `{"record_type": ..., "fields": Fields}`, or `undefined`.
     pub fn record(&self, zone: &str, record_id: &str) -> Result<Option<String>> {
-        self.engine.record(zone, record_id).map(to_json).transpose()
+        let (Some(record_type), Some(fields)) = (
+            self.engine.record_type(zone, record_id),
+            self.engine.record(zone, record_id),
+        ) else {
+            return Ok(None);
+        };
+        to_json(&serde_json::json!({ "record_type": record_type, "fields": fields })).map(Some)
+    }
+
+    /// The zone's quarantined records, as `[{"record_id": ..., "reason": ...}]`
+    /// with the reason `missing_zone_key`, `open_failed` or `invalid_record`.
+    /// Never their bytes.
+    pub fn quarantined(&self, zone: &str) -> Result<String> {
+        let list: Vec<_> = self
+            .engine
+            .quarantine(zone)
+            .map(|(id, q)| serde_json::json!({ "record_id": id, "reason": q.reason }))
+            .collect();
+        to_json(&list)
     }
 
     /// A live record as an `Item`, or `undefined`.
