@@ -182,6 +182,30 @@ impl DeviceKeys {
         }
     }
 
+    /// The secret halves, Ed25519 then X25519, for the device's own key store.
+    /// The bytes are wiped when the returned value is dropped.
+    pub fn to_bytes(&self) -> Zeroizing<[u8; 64]> {
+        let mut out = Zeroizing::new([0u8; 64]);
+        out[..32].copy_from_slice(&self.signing.to_bytes());
+        out[32..].copy_from_slice(self.agreement.as_bytes());
+        out
+    }
+
+    /// Reads keys saved with [`DeviceKeys::to_bytes`].
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CryptoError> {
+        if bytes.len() != 64 {
+            return Err(CryptoError::InvalidKey);
+        }
+        let mut signing = Zeroizing::new([0u8; 32]);
+        signing.copy_from_slice(&bytes[..32]);
+        let mut agreement = Zeroizing::new([0u8; 32]);
+        agreement.copy_from_slice(&bytes[32..]);
+        Ok(Self {
+            signing: SigningKey::from_bytes(&signing),
+            agreement: StaticSecret::from(*agreement),
+        })
+    }
+
     /// Signs `message` under `context`, so a signature for one purpose is never
     /// valid for another.
     pub fn sign(&self, context: &str, message: &[u8]) -> [u8; 64] {
@@ -514,6 +538,22 @@ mod tests {
             unwrap_key(&phone, &laptop.public(), b"zone:groceries", &changed),
             Err(CryptoError::Signature)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn device_keys_survive_export_and_import() -> R {
+        let laptop = DeviceKeys::generate()?;
+        let restored = DeviceKeys::from_bytes(laptop.to_bytes().as_slice())?;
+        assert_eq!(restored.public(), laptop.public());
+        let zone_key = SymmetricKey::generate()?;
+        let phone = DeviceKeys::generate()?;
+        let wrapped = wrap_key(&phone, &restored.public(), b"zone", &zone_key)?;
+        assert_eq!(
+            unwrap_key(&laptop, &phone.public(), b"zone", &wrapped)?,
+            zone_key
+        );
+        assert!(DeviceKeys::from_bytes(&[0; 63]).is_err());
         Ok(())
     }
 
