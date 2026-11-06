@@ -479,12 +479,20 @@ mod tests {
         // Eight more arrive and are refused at once, without waiting for the turn.
         let late: Vec<_> = (0..8).map(|_| spawn(pool.clone())).collect();
         for attempt in late {
-            assert!(!attempt.await.expect("task"), "beyond the line");
+            // A refusal is immediate. An attempt that joined the line instead would wait for the
+            // turn the test holds, so it is bounded: the line has no limit if this times out.
+            let answer = tokio::time::timeout(Duration::from_secs(2), attempt)
+                .await
+                .expect("an attempt beyond the 32 waiting did not answer at once: it joined the line, so the line is not bounded");
+            assert!(!answer.expect("task"), "beyond the line");
         }
         assert_eq!(in_line(key), 33, "the refused ones took no place");
         drop(held);
         for attempt in waiting {
-            assert!(attempt.await.expect("task"), "a waiting attempt is served");
+            let answer = tokio::time::timeout(Duration::from_secs(10), attempt)
+                .await
+                .expect("a waiting attempt was not served after the turn was released");
+            assert!(answer.expect("task"), "a waiting attempt is served");
         }
         assert_eq!(in_line(key), 0);
     }
