@@ -480,12 +480,16 @@ async fn send(socket: &mut WebSocket, message: &wire::SyncServerMessage) -> bool
 
 /// Closes a silent socket with 1000 (normal), so its client reconnects and resyncs.
 async fn close_idle(mut socket: WebSocket) {
-    let _ = socket
-        .send(Message::Close(Some(CloseFrame {
+    // Bounded like every other send: a half-dead peer with a full window would
+    // otherwise hold the socket's cap place until the OS gives up on it.
+    let _ = tokio::time::timeout(
+        SEND_WAIT,
+        socket.send(Message::Close(Some(CloseFrame {
             code: 1000,
             reason: "idle".into(),
-        })))
-        .await;
+        }))),
+    )
+    .await;
 }
 
 /// Sends an error and closes with 1008 (policy violation).
@@ -498,12 +502,14 @@ async fn refuse(mut socket: WebSocket, code: &str, message: &str) {
         },
     )
     .await;
-    let _ = socket
-        .send(Message::Close(Some(CloseFrame {
+    let _ = tokio::time::timeout(
+        SEND_WAIT,
+        socket.send(Message::Close(Some(CloseFrame {
             code: 1008,
             reason: code.to_owned().into(),
-        })))
-        .await;
+        }))),
+    )
+    .await;
 }
 
 async fn run_sync(
