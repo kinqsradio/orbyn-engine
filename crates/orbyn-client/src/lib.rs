@@ -91,6 +91,8 @@ pub enum ClientError {
     Random,
     #[error("the zone expired again before it was fetched from the start; try again later")]
     ExpiredAgain,
+    #[error("the edit time is more than an hour ahead of this device's clock")]
+    EditTooFarAhead,
 }
 
 impl From<CryptoError> for ClientError {
@@ -421,7 +423,7 @@ impl Engine {
             }
             for local in z.records.values() {
                 if let Some(latest) = local.fields.latest() {
-                    let _ = engine.clock.observe(latest, now_millis);
+                    let _ = engine.clock.resume(latest, now_millis);
                 }
             }
             engine.zones.insert(
@@ -546,6 +548,19 @@ impl Engine {
         self.clock.tick(now_millis)
     }
 
+    /// The stamp for an edit the person made at `edit_millis`, which may be
+    /// earlier than `now_millis` (an edit queued while the app was closed). The
+    /// clock's rules still hold: the stamp can never be earlier than the last
+    /// one this device issued or saw, so an older `edit_millis` is moved up to
+    /// just after it; and an edit time more than an hour ahead of `now_millis`
+    /// is refused, the same bound other devices apply to a stamp they receive.
+    pub fn tick_at(&mut self, edit_millis: u64, now_millis: u64) -> Result<Stamp> {
+        if edit_millis > now_millis.saturating_add(orbyn_sync::MAX_SKEW_MILLIS) {
+            return Err(ClientError::EditTooFarAhead);
+        }
+        Ok(self.clock.tick(edit_millis))
+    }
+
     fn zone_mut(&mut self, zone: &str) -> Result<&mut ZoneState> {
         if !valid_name(zone, 64) {
             return Err(ClientError::InvalidZone);
@@ -567,6 +582,12 @@ impl Engine {
     pub fn record(&self, zone: &str, record_id: &str) -> Option<&Fields> {
         let local = self.zones.get(zone)?.records.get(record_id)?;
         (!local.deleted).then_some(&local.fields)
+    }
+
+    /// A live record's type, as stored.
+    pub fn record_type(&self, zone: &str, record_id: &str) -> Option<&str> {
+        let local = self.zones.get(zone)?.records.get(record_id)?;
+        (!local.deleted).then_some(local.record_type.as_str())
     }
 
     /// Every cached record of the zone, deleted ones waiting to upload included.

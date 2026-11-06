@@ -1896,3 +1896,37 @@ fn after_three_restarts_in_a_row_the_state_is_reset_and_the_next_sync_converges(
     assert_eq!(b.engine.token(ZONE), Some(store.token(ZONE).as_str()));
     Ok(())
 }
+
+#[test]
+fn an_edit_time_is_clamped_by_the_clock_and_the_skew_bound() -> R {
+    let keys = DeviceKeys::generate().expect("keys");
+    let mut engine = Engine::new(keys, ACCOUNT, A)?;
+    let first = engine.tick_at(5_000, 9_000)?;
+    assert_eq!((first.millis, first.counter), (5_000, 0));
+    // Not backwards past the last stamp issued.
+    let second = engine.tick_at(4_000, 9_000)?;
+    assert_eq!((second.millis, second.counter), (5_000, 1));
+    // Exactly the skew bound is allowed; one millisecond more is refused and
+    // leaves the clock alone.
+    let edge = 9_000 + MAX_SKEW_MILLIS;
+    assert_eq!(engine.tick_at(edge, 9_000)?.millis, edge);
+    assert_eq!(
+        engine.tick_at(edge + 1, 9_000),
+        Err(ClientError::EditTooFarAhead)
+    );
+    let next = engine.tick(0);
+    assert_eq!((next.millis, next.counter), (edge, 1));
+    Ok(())
+}
+
+#[test]
+fn a_record_reports_its_stored_type_and_a_deleted_one_has_none() -> R {
+    let mut store = FakeStore::new(10);
+    let (mut a, _b, _) = pair(&mut store);
+    a.edit("note-1", "title", json!("x"));
+    assert_eq!(a.engine.record_type(ZONE, "note-1"), Some("note"));
+    assert_eq!(a.engine.record_type(ZONE, "missing"), None);
+    a.engine.delete(ZONE, "note-1")?;
+    assert_eq!(a.engine.record_type(ZONE, "note-1"), None);
+    Ok(())
+}

@@ -27,6 +27,8 @@ const engine2 = SyncEngine.restore(keys2, sealedState, wrapSecret, Date.now());
 wrapSecret.fill(0);
 ```
 
+The functions that take the wrapping secret or the password (`export`, `import`, `snapshot`, `restore`, `startRegistration`, `finishRegistration`, `startLogin`, `finishLogin`) take them as owned buffers (`Vec<u8>` in Rust), which WebAssembly zeroes when the call ends, on every path including errors. A borrowed `&[u8]` would be copied into WebAssembly memory by the generated glue and freed without being zeroed. The `fill(0)` above clears only the JavaScript copy. Not covered: buffers inside `opaque-ke`, `argon2` and the hash functions while they run, which this crate does not own; a check that freed blocks held no copy of the password or secret found none on the error paths it exercised, but a full OPAQUE exchange was not part of it.
+
 Why this and not AES-GCM through `crypto.subtle.encrypt` inside WebAssembly: it keeps every call synchronous and testable natively, and needs no `web-sys` or futures. The trade-off: the 32-byte wrapping secret is in JavaScript memory while it is used. Script running in the page could compute it anyway with the non-extractable key, so it reveals nothing that key does not; what it never sees is a device key or zone key. The snapshot is also bound to the device's public signing key, so one device's snapshot does not open with another's keys.
 
 ## Building for the web
@@ -86,10 +88,11 @@ Clearing the site's data (or the browser's storage for it) deletes the sealed de
 `SyncEngine.create(keys, accountId, deviceId)` (from `SessionCreated`) or `SyncEngine.restore(keys, sealed, wrapSecret, nowMillis)`, then:
 
 - `snapshot(wrapSecret)`: the sealed state to store.
-- `tick(now)`: a `Stamp` for a new edit. `stage(zone, recordType, id, fieldsJson)`, `stageItem(zone, itemJson, beforeJson?, now)`, `delete(zone, id)`.
-- `record(zone, id)`, `item(zone, id)`, `token(zone)`.
+- `tick(now)`: a `Stamp` for a new edit. `tickAt(editAt, now)`: a `Stamp` for an edit made at `editAt`, which may be earlier than `now` (queued while the app was closed). It is never earlier than the last stamp this device issued or saw (an older `editAt` is moved just after it), and an `editAt` more than an hour ahead of `now` throws `edit_too_far_ahead`. `restore` no longer moves the clock to its own `now`, so a later `tickAt` can use the edit's own time. `stage(zone, recordType, id, fieldsJson)`, `stageItem(zone, itemJson, beforeJson?, now)`, `delete(zone, id)`.
+- `record(zone, id)`: `{"record_type": ..., "fields": Fields}` (this was the bare `Fields` before), `item(zone, id)`, `token(zone)`.
+- `quarantined(zone)`: `[{"record_id": ..., "reason": ...}]` for the records waiting for a key, with the reason `missing_zone_key`, `open_failed` or `invalid_record`; never their bytes.
 - `buildUpload(zone)`: an `UploadChanges` (the same batch until answered), then `uploadSucceeded(zone, uploadResultJson)`, `uploadConflicted(zone, recordChangedJson, now)` or `abandonUpload(zone)`.
-- `applyChanges(zone, zoneChangesJson, now)`: returns `{changed, removed, trashed, quarantined, unverified_deletes, rejected, more}`.
+- `applyChanges(zone, zoneChangesJson, now)` (and `applyChangesFrom(zone, since, zoneChangesJson, now)`, required while a zone is refetched after `tokenExpired`): returns `{changed, removed, trashed, quarantined, unverified_deletes, rejected, more}`.
 - `retryQuarantined(zone, now)` after new keys arrive; `trash(zone)` and `takeFromTrash(zone, id)`.
 - `checkZones(zoneListJson)`: returns `{stale, next}`; follow `next` as `?after=`.
 - Devices and keys: `verifyDevices(deviceListJson)` (the ids this device trusts: its approver, the devices that approver endorsed, and their approval chains, minus signed removals), `pinDevice(id, signingKey, agreementKey)`, `createZoneKey(zone)`, `rotateZoneKey(zone)`, `envelopesFor(zone, deviceListJson)` (a `PutKeyEnvelopes`, only to verified devices), `acceptEnvelopes(keyEnvelopeListJson, deviceListJson)`.

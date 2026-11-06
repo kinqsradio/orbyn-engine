@@ -95,7 +95,7 @@ fn approve_json(
 #[test]
 fn device_keys_export_import_and_sign_the_auth_messages() -> Result<()> {
     let keys = DeviceKeys::create()?;
-    let sealed = keys.export(&SECRET)?;
+    let sealed = keys.export(SECRET.to_vec())?;
     // The export is sealed: the secret halves are not in it.
     let raw = keys.keys.to_bytes();
     assert!(
@@ -103,19 +103,19 @@ fn device_keys_export_import_and_sign_the_auth_messages() -> Result<()> {
             .windows(32)
             .any(|w| w == &raw[..32] || w == &raw[32..])
     );
-    let again = DeviceKeys::import_sealed(&sealed, &SECRET)?;
+    let again = DeviceKeys::import_sealed(&sealed, SECRET.to_vec())?;
     assert_eq!(again.signing_key(), keys.signing_key());
     assert_eq!(
-        DeviceKeys::import_sealed(&sealed, &[7; 32])
+        DeviceKeys::import_sealed(&sealed, vec![7; 32])
             .map(|_| ())
             .map_err(|e| e.code),
         Err("open_failed")
     );
     assert_eq!(
-        keys.export(&[1; 16]).map_err(|e| e.code),
+        keys.export(vec![1; 16]).map_err(|e| e.code),
         Err("invalid_wrap_secret")
     );
-    assert!(DeviceKeys::import_sealed(&[1, 2, 3], &SECRET).is_err());
+    assert!(DeviceKeys::import_sealed(&[1, 2, 3], SECRET.to_vec()).is_err());
 
     let public = keys.keys.public();
     let login_id = "0b6f6e2e-7d1a-4c3b-9a8e-1f2d3c4b5a69";
@@ -149,19 +149,21 @@ fn device_keys_export_import_and_sign_the_auth_messages() -> Result<()> {
 
 #[test]
 fn sign_in_starts_and_refuses_a_bad_answer_once() -> Result<()> {
-    let mut registration = start_registration(b"correct horse")?;
+    let mut registration = start_registration(b"correct horse".to_vec())?;
     assert!(!registration.request().is_empty());
     assert_eq!(
-        finish_registration(&mut registration, b"correct horse", b"junk").map_err(|e| e.code),
+        finish_registration(&mut registration, b"correct horse".to_vec(), b"junk")
+            .map_err(|e| e.code),
         Err("auth_failed")
     );
     assert_eq!(
-        finish_registration(&mut registration, b"correct horse", b"junk").map_err(|e| e.code),
+        finish_registration(&mut registration, b"correct horse".to_vec(), b"junk")
+            .map_err(|e| e.code),
         Err("already_finished")
     );
-    let mut login = start_login(b"correct horse")?;
+    let mut login = start_login(b"correct horse".to_vec())?;
     assert!(!login.request().is_empty());
-    assert!(finish_login(&mut login, b"correct horse", b"junk").is_err());
+    assert!(finish_login(&mut login, b"correct horse".to_vec(), b"junk").is_err());
     Ok(())
 }
 
@@ -243,21 +245,28 @@ fn two_engines_sync_an_item_through_json() -> Result<()> {
     assert_eq!(applied["changed"], json!(["t1"]));
     assert_eq!(b.item("inbox", "t1")?, Some(item_json.clone()));
     assert_eq!(b.token("inbox").as_deref(), Some("t1"));
+    // The record comes back with its stored type, next to its fields.
+    let record: Value = serde_json::from_str(&b.record("inbox", "t1")?.expect("record"))
+        .map_err(|e| error("invalid_json", e))?;
+    assert_eq!(record["record_type"], orbyn_client::ITEM_TYPE);
+    assert_eq!(record["fields"]["title"]["value"], "Buy oat milk");
+    assert_eq!(b.record("inbox", "nope")?, None);
+    assert_eq!(b.quarantined("inbox")?, "[]");
 
     // A snapshot is sealed, restores the same engine, and opens only with the
     // same secret and device.
-    let sealed = b.snapshot(&SECRET)?;
+    let sealed = b.snapshot(SECRET.to_vec())?;
     assert!(!String::from_utf8_lossy(&sealed).contains("oat milk"));
-    let restored = SyncEngine::restore(&b_keys, &sealed, &SECRET, 3_000.0)?;
+    let restored = SyncEngine::restore(&b_keys, &sealed, SECRET.to_vec(), 3_000.0)?;
     assert_eq!(restored.item("inbox", "t1")?, Some(item_json.clone()));
     assert_eq!(
-        SyncEngine::restore(&b_keys, &sealed, &[1; 32], 0.0)
+        SyncEngine::restore(&b_keys, &sealed, vec![1; 32], 0.0)
             .map(|_| ())
             .map_err(|e| e.code),
         Err("open_failed")
     );
     assert_eq!(
-        SyncEngine::restore(&a_keys, &sealed, &SECRET, 0.0)
+        SyncEngine::restore(&a_keys, &sealed, SECRET.to_vec(), 0.0)
             .map(|_| ())
             .map_err(|e| e.code),
         Err("open_failed")
@@ -274,5 +283,77 @@ fn two_engines_sync_an_item_through_json() -> Result<()> {
         serde_json::from_str(&c.apply_changes("inbox", &to_json(&page)?, 2_000.0)?)
             .map_err(|e| error("invalid_json", e))?;
     assert_eq!(applied["quarantined"], json!(["t1"]));
+    // The quarantine can be listed, with reasons and no bytes.
+    let waiting: Value =
+        serde_json::from_str(&c.quarantined("inbox")?).map_err(|e| error("invalid_json", e))?;
+    assert_eq!(
+        waiting,
+        json!([{"record_id": "t1", "reason": "missing_zone_key"}])
+    );
+    assert_eq!(c.quarantined("elsewhere")?, "[]");
+    Ok(())
+}
+
+#[test]
+fn an_edit_keeps_its_own_time_and_the_clock_rules_still_hold() -> Result<()> {
+    let keys = DeviceKeys::create()?;
+    let mut engine = SyncEngine::create(&keys, ACCOUNT, A)?;
+    engine.create_zone_key("inbox")?;
+    let stamp = |json: &str| -> Result<(u64, u32)> {
+        let v: Value = serde_json::from_str(json).map_err(|e| error("invalid_json", e))?;
+        Ok((
+            v["millis"].as_u64().expect("millis"),
+            v["counter"].as_u64().expect("counter") as u32,
+        ))
+    };
+    // An edit made at 5 000 is stamped 5 000 even if it is staged at 9 000.
+    let first = stamp(&engine.tick_at(5_000.0, 9_000.0)?)?;
+    assert_eq!(first, (5_000, 0));
+    // An older edit time cannot run backwards past the last stamp issued.
+    let second = stamp(&engine.tick_at(4_000.0, 9_000.0)?)?;
+    assert_eq!(second, (5_000, 1));
+    // A later one takes its own time.
+    assert_eq!(stamp(&engine.tick_at(6_000.0, 9_000.0)?)?, (6_000, 0));
+    // The skew bound is the one stamps from other devices get: an hour ahead is
+    // allowed, a millisecond more is not, and the clock is unchanged by a refusal.
+    let hour = 3_600_000.0;
+    assert_eq!(
+        stamp(&engine.tick_at(9_000.0 + hour, 9_000.0)?)?.0,
+        9_000 + 3_600_000
+    );
+    assert_eq!(
+        engine
+            .tick_at(9_000.0 + 2.0 * hour, 9_000.0)
+            .map_err(|e| e.code),
+        Err("edit_too_far_ahead")
+    );
+    // The plain tick is unchanged.
+    assert!(stamp(&engine.tick(7_000.0)?)?.0 >= 7_000);
+    Ok(())
+}
+
+#[test]
+fn restoring_does_not_move_the_clock_to_the_restore_time() -> Result<()> {
+    let keys = DeviceKeys::create()?;
+    let mut engine = SyncEngine::create(&keys, ACCOUNT, A)?;
+    engine.create_zone_key("inbox")?;
+    let mut fields = |at: f64| -> Result<String> {
+        let stamp = engine.tick(at)?;
+        let item =
+            Item::task("t1", "Buy oat milk", "home").map_err(|e| error("invalid_item", e))?;
+        item_to_fields(&to_json(&item)?, None, &stamp)
+    };
+    let staged = fields(5_000.0)?;
+    engine.stage("inbox", "item", "t1", &staged)?;
+    let sealed = engine.snapshot(SECRET.to_vec())?;
+    // The app starts again much later, then stages an edit the person made at
+    // 6 000, while it was closed.
+    let mut restored = SyncEngine::restore(&keys, &sealed, SECRET.to_vec(), 90_000.0)?;
+    let v: Value = serde_json::from_str(&restored.tick_at(6_000.0, 90_000.0)?)
+        .map_err(|e| error("invalid_json", e))?;
+    assert_eq!(
+        v["millis"], 6_000,
+        "stamped at the edit, not at the restore"
+    );
     Ok(())
 }
