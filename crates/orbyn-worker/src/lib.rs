@@ -25,6 +25,11 @@ pub enum Outcome {
 pub async fn handle(job: &jobs::Job) -> Outcome {
     match job.kind.as_str() {
         "noop" => Outcome::Done,
+        // A zone changed and another device subscribed to it. The hook for
+        // silent push: with APNs and FCM it sends one push per subscribed
+        // device, using the job's idempotency key (zone and token) as the
+        // provider's operation identity. Until then there is nothing to send.
+        "zone_changed" => Outcome::Done,
         other => Outcome::Retry(format!("no handler for job kind {other:?}")),
     }
 }
@@ -126,6 +131,7 @@ mod tests {
     #[tokio::test]
     async fn known_kinds_finish_and_unknown_kinds_retry() {
         assert_eq!(handle(&job("noop")).await, Outcome::Done);
+        assert_eq!(handle(&job("zone_changed")).await, Outcome::Done);
         assert!(matches!(handle(&job("typo")).await, Outcome::Retry(_)));
     }
 
