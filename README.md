@@ -13,13 +13,23 @@ The plan, the feature map and the phases are in the [Orbyn platform plan](https:
 - `docker/`, `compose.yaml`: the image and the local stack.
 - `docs/architecture.md`: the contract. Its rules change in the same commit as the code.
 
+## Run it
+
+```bash
+docker compose up -d
+curl http://localhost:8080/health
+```
+
+For `cargo test` with the Postgres tests: `docker compose up -d postgres`, then
+`DATABASE_URL=postgres://orbyn@localhost:5432/orbyn cargo test --workspace -- --include-ignored`.
+
 ## Checks
 
 ```bash
 cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
 ```
 
-Tests that need Postgres read `DATABASE_URL`. `docker compose up -d postgres` starts one locally.
+
 
 ## Licence
 
