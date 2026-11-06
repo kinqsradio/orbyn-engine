@@ -1,0 +1,52 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-major
+    commit-message:
+      prefix: chore(deps)
+    groups:
+      cargo-updates:
+        patterns:
+          - "*"
+  - package-ecosystem: docker
+    directory: /docker
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-major
+    commit-message:
+      prefix: chore(deps)
+    groups:
+      docker-updates:
+        patterns:
+          - "*"
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+    commit-message:
+      prefix: chore(ci)
+    groups:
+      github-actions-updates:
+        patterns:
+          - "*"

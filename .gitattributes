@@ -1,0 +1,2 @@
+# Generated wire types: every checkout gets the same bytes on every platform.
+crates/orbyn-contracts/bindings/** text eol=lf

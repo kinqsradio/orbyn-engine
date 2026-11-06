@@ -1,0 +1,41 @@
+name: PR AI usage
+# Checks that the pull request body fills in its AI usage section. It reads only
+# the body from the event and never checks out or runs pull request code.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  ai-usage:
+    name: AI usage section
+    if: github.event.pull_request.user.login != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Check the AI usage section
+        env:
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          python3 - <<'PY'
+          import os, re, sys
+          body = os.environ.get("BODY") or ""
+          # Drop HTML comments, so the template's hints never count as answers.
+          body = re.sub(r"<!--.*?-->", "", body, flags=re.S)
+          match = re.search(r"^## AI usage\s*$(.*?)(?=^## |\Z)", body, flags=re.M | re.S)
+          if not match:
+              sys.exit("Add the AI usage section from the pull request template.")
+          section = match.group(1)
+          if re.search(r"^- \[[xX]\] Written by hand", section, flags=re.M):
+              print("Written by hand.")
+              sys.exit(0)
+          fields = ["Harness and version", "Models", "Effort", "Human role", "Sources"]
+          missing = []
+          for field in fields:
+              line = re.search(rf"^- {re.escape(field)}:[ \t]*(.*)$", section, flags=re.M)
+              if not line or not line.group(1).strip():
+                  missing.append(field)
+          if missing:
+              sys.exit("Tick 'Written by hand', or fill in: " + ", ".join(missing) + ".")
+          print("AI usage recorded.")
+          PY
