@@ -66,7 +66,98 @@ pub async fn allow(
     subject: &[u8; 32],
     limit: Limit,
 ) -> Result<bool, sqlx::Error> {
-    admit(pool, action, subject, limit, false).await
+    // A busy lock only means another attempt for this subject is counting at this very moment; it
+    // says nothing about the limit, and refusing for it would turn two honest requests from one
+    // address (two browsers on one network, two tabs) into "too many attempts" for a limit nobody
+    // has reached. So attempts for one subject take turns in this process first, waiting in memory
+    // (no pool connection is held while waiting), and the database lock is then only ever
+    // contended by another replica, for which a few short looks are enough.
+    let Some(_turn) = Turn::take(lock_key(action, subject)).await else {
+        // A crowd already waits on this subject: a flood. Refuse without joining it.
+        return Ok(false);
+    };
+    for pause in LOCK_RETRIES {
+        match admit(pool, action, subject, limit, false).await? {
+            Admit::Allowed => return Ok(true),
+            Admit::Refused => return Ok(false),
+            Admit::LockBusy => tokio::time::sleep(pause).await,
+        }
+    }
+    // Still busy after about 75 ms of looking: a flood on one subject. Refuse rather than queue.
+    Ok(matches!(
+        admit(pool, action, subject, limit, false).await?,
+        Admit::Allowed
+    ))
+}
+
+/// Attempts waiting for one subject's turn before a newcomer is refused as part of a flood.
+const MAX_WAITING: usize = 32;
+
+type Gates =
+    std::sync::Mutex<std::collections::HashMap<i64, std::sync::Arc<tokio::sync::Mutex<()>>>>;
+
+static GATES: std::sync::LazyLock<Gates> = std::sync::LazyLock::new(Default::default);
+
+/// One attempt's turn on a subject, within this process. Given back when dropped, and the subject
+/// is forgotten when nobody is waiting for it.
+struct Turn {
+    key: i64,
+    gate: Option<std::sync::Arc<tokio::sync::Mutex<()>>>,
+    _held: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Turn {
+    /// Waits for this subject's turn, or `None` when [`MAX_WAITING`] attempts are already waiting.
+    async fn take(key: i64) -> Option<Self> {
+        let gate = {
+            let mut gates = GATES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let gate = gates.entry(key).or_default().clone();
+            // The map's own handle and this one are two; every other is a waiter or the holder.
+            if std::sync::Arc::strong_count(&gate) > MAX_WAITING + 2 {
+                return None;
+            }
+            gate
+        };
+        let held = gate.clone().lock_owned().await;
+        Some(Self {
+            key,
+            gate: Some(gate),
+            _held: Some(held),
+        })
+    }
+}
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        // Give the turn up first, then forget the subject if no one else holds its gate.
+        self._held.take();
+        let gate = self.gate.take();
+        let mut gates = GATES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(gate) = gate
+            && std::sync::Arc::strong_count(&gate) == 2
+        {
+            gates.remove(&self.key);
+        }
+    }
+}
+
+/// How long [`allow`] waits between looks at a busy subject: about 75 ms in all.
+const LOCK_RETRIES: [Duration; 4] = [
+    Duration::from_millis(5),
+    Duration::from_millis(10),
+    Duration::from_millis(20),
+    Duration::from_millis(40),
+];
+
+enum Admit {
+    Allowed,
+    Refused,
+    /// Another attempt holds the subject's lock; nothing was counted.
+    LockBusy,
 }
 
 /// How long [`allow_queued`] waits for a subject's lock before giving up.
@@ -96,8 +187,8 @@ pub async fn allow_queued(
     limit: Limit,
 ) -> Result<Queued, sqlx::Error> {
     match admit(pool, action, subject, limit, true).await {
-        Ok(true) => Ok(Queued::Allowed),
-        Ok(false) => Ok(Queued::Refused),
+        Ok(Admit::Allowed) => Ok(Queued::Allowed),
+        Ok(Admit::Refused | Admit::LockBusy) => Ok(Queued::Refused),
         // lock_not_available: the wait timed out.
         Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("55P03") => Ok(Queued::Busy),
         Err(err) => Err(err),
@@ -110,7 +201,7 @@ async fn admit(
     subject: &[u8; 32],
     limit: Limit,
     wait: bool,
-) -> Result<bool, sqlx::Error> {
+) -> Result<Admit, sqlx::Error> {
     let mut tx = pool.begin().await?;
     if wait {
         // Local to this transaction, like SET LOCAL.
@@ -129,13 +220,13 @@ async fn admit(
             .await?;
         if !locked {
             tx.rollback().await?;
-            return Ok(false);
+            return Ok(Admit::LockBusy);
         }
     }
     let count = count_in(&mut *tx, action, subject, limit).await?;
     if count >= limit.max {
         tx.rollback().await?;
-        return Ok(false);
+        return Ok(Admit::Refused);
     }
     sqlx::query("INSERT INTO auth_attempts (action, subject) VALUES ($1, $2)")
         .bind(action)
@@ -143,7 +234,7 @@ async fn admit(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    Ok(true)
+    Ok(Admit::Allowed)
 }
 
 /// How long until `subject` may try `action` again, rounded up to whole
@@ -251,6 +342,54 @@ mod tests {
         let db = crate::Database::connect(&url).await.expect("connect");
         db.migrate().await.expect("migrate");
         db.pool().clone()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs DATABASE_URL"]
+    async fn simultaneous_attempts_of_one_subject_are_not_refused_for_a_limit_nobody_reached() {
+        let pool = pool().await;
+        let subject = *uuid::Uuid::new_v4()
+            .as_bytes()
+            .repeat(2)
+            .first_chunk()
+            .expect("32");
+        let limit = Limit::new(1000, Duration::from_secs(60));
+        // Many requests from one address at the same moment: far below the limit, so all pass.
+        let attempts: Vec<_> = (0..16)
+            .map(|_| {
+                let pool = pool.clone();
+                tokio::spawn(
+                    async move { allow(&pool, "test-simultaneous", &subject, limit).await },
+                )
+            })
+            .collect();
+        let mut refused = 0;
+        for attempt in attempts {
+            if !attempt.await.expect("task").expect("answer") {
+                refused += 1;
+            }
+        }
+        assert_eq!(
+            refused, 0,
+            "attempts refused although the limit was nowhere near"
+        );
+        // The limit itself still holds.
+        let tight = Limit::new(3, Duration::from_secs(60));
+        let other = *uuid::Uuid::new_v4()
+            .as_bytes()
+            .repeat(2)
+            .first_chunk()
+            .expect("32");
+        let mut allowed = 0;
+        for _ in 0..6 {
+            if allow(&pool, "test-simultaneous", &other, tight)
+                .await
+                .expect("answer")
+            {
+                allowed += 1;
+            }
+        }
+        assert_eq!(allowed, 3);
     }
 
     #[tokio::test]
