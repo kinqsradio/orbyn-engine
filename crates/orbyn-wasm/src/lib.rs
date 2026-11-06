@@ -63,7 +63,6 @@ impl From<ClientError> for Error {
             ClientError::InvalidInput => "invalid_input",
             ClientError::Random => "random_failed",
             ClientError::ExpiredAgain => "expired_again",
-            ClientError::EditTooFarAhead => "edit_too_far_ahead",
         };
         error(code, err)
     }
@@ -486,11 +485,18 @@ impl SyncEngine {
     /// A `Stamp` for an edit made at `edit_at` (milliseconds), which may be
     /// earlier than `now`: an edit queued while the app was closed. The clock's
     /// rules hold: the stamp is never earlier than the last one this device
-    /// issued or saw, and an `edit_at` more than an hour ahead of `now` throws
-    /// `edit_too_far_ahead`.
+    /// issued or saw. An `edit_at` after `now` is taken as `now`, silently.
     #[wasm_bindgen(js_name = tickAt)]
     pub fn tick_at(&mut self, edit_at: f64, now: f64) -> Result<String> {
-        to_json(&self.engine.tick_at(millis(edit_at), millis(now))?)
+        to_json(&self.engine.tick_at(millis(edit_at), millis(now)))
+    }
+
+    /// How many records `restore` found with a newest stamp more than an hour
+    /// ahead of its `now`. They were kept but did not move the clock; log a
+    /// non-zero count.
+    #[wasm_bindgen(js_name = skippedFutureStamps)]
+    pub fn skipped_future_stamps(&self) -> u32 {
+        u32::try_from(self.engine.skipped_future_stamps()).unwrap_or(u32::MAX)
     }
 
     /// Stages already stamped `Fields`.

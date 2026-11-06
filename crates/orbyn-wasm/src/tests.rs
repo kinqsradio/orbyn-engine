@@ -314,18 +314,16 @@ fn an_edit_keeps_its_own_time_and_the_clock_rules_still_hold() -> Result<()> {
     assert_eq!(second, (5_000, 1));
     // A later one takes its own time.
     assert_eq!(stamp(&engine.tick_at(6_000.0, 9_000.0)?)?, (6_000, 0));
-    // The skew bound is the one stamps from other devices get: an hour ahead is
-    // allowed, a millisecond more is not, and the clock is unchanged by a refusal.
+    // An edit cannot be in the future: a later `edit_at` is taken as `now`, without
+    // an error, and the clock does not move past now.
     let hour = 3_600_000.0;
     assert_eq!(
-        stamp(&engine.tick_at(9_000.0 + hour, 9_000.0)?)?.0,
-        9_000 + 3_600_000
+        stamp(&engine.tick_at(9_000.0 + hour, 9_000.0)?)?,
+        (9_000, 0)
     );
     assert_eq!(
-        engine
-            .tick_at(9_000.0 + 2.0 * hour, 9_000.0)
-            .map_err(|e| e.code),
-        Err("edit_too_far_ahead")
+        stamp(&engine.tick_at(9_000.0 + 2.0 * hour, 9_000.0)?)?,
+        (9_000, 1)
     );
     // The plain tick is unchanged.
     assert!(stamp(&engine.tick(7_000.0)?)?.0 >= 7_000);

@@ -1898,27 +1898,82 @@ fn after_three_restarts_in_a_row_the_state_is_reset_and_the_next_sync_converges(
 }
 
 #[test]
-fn an_edit_time_is_clamped_by_the_clock_and_the_skew_bound() -> R {
+fn an_edit_time_is_clamped_by_the_clock_and_a_future_one_is_taken_as_now() -> R {
     let keys = DeviceKeys::generate().expect("keys");
     let mut engine = Engine::new(keys, ACCOUNT, A)?;
-    let first = engine.tick_at(5_000, 9_000)?;
+    let first = engine.tick_at(5_000, 9_000);
     assert_eq!((first.millis, first.counter), (5_000, 0));
     // Not backwards past the last stamp issued.
-    let second = engine.tick_at(4_000, 9_000)?;
+    let second = engine.tick_at(4_000, 9_000);
     assert_eq!((second.millis, second.counter), (5_000, 1));
-    // Exactly the skew bound is allowed; one millisecond more is refused and
-    // leaves the clock alone.
-    let edge = 9_000 + MAX_SKEW_MILLIS;
-    assert_eq!(engine.tick_at(edge, 9_000)?.millis, edge);
-    assert_eq!(
-        engine.tick_at(edge + 1, 9_000),
-        Err(ClientError::EditTooFarAhead)
-    );
-    let next = engine.tick(0);
-    assert_eq!((next.millis, next.counter), (edge, 1));
+    // A future edit time is silently taken as now...
+    let future = engine.tick_at(9_000 + MAX_SKEW_MILLIS, 9_000);
+    assert_eq!((future.millis, future.counter), (9_000, 0));
+    // ...and the clock did not move past now: the next edit at now follows it.
+    let next = engine.tick(9_000);
+    assert_eq!((next.millis, next.counter), (9_000, 1));
     Ok(())
 }
 
+#[test]
+fn an_edit_stamped_in_the_future_does_not_get_a_later_edit_dropped_by_another_device() -> R {
+    let mut store = FakeStore::new(10);
+    let (mut a, mut b, _) = pair(&mut store);
+    // A's edit is dated an hour ahead by mistake; then A makes an ordinary edit.
+    let stamp = a.engine.tick_at(a.now + MAX_SKEW_MILLIS, a.now);
+    assert_eq!(stamp.millis, a.now, "taken as now");
+    let mut fields = Fields::default();
+    fields.set("title", json!("first"), stamp);
+    a.engine.stage(ZONE, "note", "n1", &fields)?;
+    a.now += 5;
+    a.edit("n1", "notes", json!("second"));
+    a.sync(&mut store);
+    // B's clock is a second behind A's. It must take both edits.
+    b.now = a.now - 1_000;
+    let applied = b.fetch_all(&store);
+    assert!(applied.rejected.is_empty(), "{:?}", applied.rejected);
+    let record = b.engine.record(ZONE, "n1").expect("n1");
+    assert_eq!(record.get("title").cloned(), Some(json!("first")));
+    assert_eq!(record.get("notes").cloned(), Some(json!("second")));
+    Ok(())
+}
+
+#[test]
+fn a_restore_counts_a_record_stamped_far_ahead_and_keeps_it() -> R {
+    let keys = DeviceKeys::generate().expect("keys");
+    let mut engine = Engine::new(copy(&keys), ACCOUNT, A)?;
+    let mut ahead = Fields::default();
+    ahead.set(
+        "title",
+        json!("from a fast clock"),
+        Stamp {
+            millis: 1_000 + MAX_SKEW_MILLIS + 1,
+            counter: 0,
+            device: 7,
+        },
+    );
+    engine.stage(ZONE, "note", "far", &ahead)?;
+    let mut fine = Fields::default();
+    fine.set(
+        "title",
+        json!("fine"),
+        Stamp {
+            millis: 900,
+            counter: 0,
+            device: 7,
+        },
+    );
+    engine.stage(ZONE, "note", "fine", &fine)?;
+    let snapshot = engine.snapshot();
+
+    let restored = Engine::restore(copy(&keys), snapshot, 1_000)?;
+    assert_eq!(restored.skipped_future_stamps(), 1, "only the far one");
+    // Both records are kept; the far stamp did not drag the clock to it.
+    assert!(restored.record(ZONE, "far").is_some() && restored.record(ZONE, "fine").is_some());
+    let mut restored = restored;
+    assert_eq!(restored.tick(1_000).millis, 1_000);
+    Ok(())
+}
 #[test]
 fn a_record_reports_its_stored_type_and_a_deleted_one_has_none() -> R {
     let mut store = FakeStore::new(10);

@@ -91,8 +91,6 @@ pub enum ClientError {
     Random,
     #[error("the zone expired again before it was fetched from the start; try again later")]
     ExpiredAgain,
-    #[error("the edit time is more than an hour ahead of this device's clock")]
-    EditTooFarAhead,
 }
 
 impl From<CryptoError> for ClientError {
@@ -370,6 +368,9 @@ pub struct Engine {
     trust: Trust,
     clock: Clock,
     zones: BTreeMap<String, ZoneState>,
+    /// Records whose newest stamp was more than an hour ahead of the clock when
+    /// the engine was restored, and so was not allowed to move this device's clock.
+    skipped_future_stamps: usize,
 }
 
 /// The stamp device number of a device: the first 8 bytes of its signing key.
@@ -398,6 +399,7 @@ impl Engine {
             trust: Trust::new(account, device_id.to_owned(), me),
             keys,
             zones: BTreeMap::new(),
+            skipped_future_stamps: 0,
         })
     }
 
@@ -422,8 +424,12 @@ impl Engine {
                 rotations.insert(key_id_of(&id)?, r);
             }
             for local in z.records.values() {
-                if let Some(latest) = local.fields.latest() {
-                    let _ = engine.clock.resume(latest, now_millis);
+                if let Some(latest) = local.fields.latest()
+                    && engine.clock.resume(latest, now_millis).is_err()
+                {
+                    // More than an hour ahead of this clock: it must not drag
+                    // the clock there. The record stays; the host is told.
+                    engine.skipped_future_stamps += 1;
                 }
             }
             engine.zones.insert(
@@ -552,13 +558,21 @@ impl Engine {
     /// earlier than `now_millis` (an edit queued while the app was closed). The
     /// clock's rules still hold: the stamp can never be earlier than the last
     /// one this device issued or saw, so an older `edit_millis` is moved up to
-    /// just after it; and an edit time more than an hour ahead of `now_millis`
-    /// is refused, the same bound other devices apply to a stamp they receive.
-    pub fn tick_at(&mut self, edit_millis: u64, now_millis: u64) -> Result<Stamp> {
-        if edit_millis > now_millis.saturating_add(orbyn_sync::MAX_SKEW_MILLIS) {
-            return Err(ClientError::EditTooFarAhead);
-        }
-        Ok(self.clock.tick(edit_millis))
+    /// just after it. An edit cannot have been made in the future, so an
+    /// `edit_millis` after `now_millis` is taken as `now_millis`, silently: a
+    /// device whose clock runs a little fast does not fail its own edits, and
+    /// never issues a stamp that other devices would drop as too far ahead.
+    pub fn tick_at(&mut self, edit_millis: u64, now_millis: u64) -> Stamp {
+        self.clock.tick(edit_millis.min(now_millis))
+    }
+
+    /// How many records the last [`Engine::restore`] found with a newest stamp
+    /// more than an hour ahead of its `now_millis`. Such a stamp is not allowed
+    /// to move the clock; the records are kept. The engine does no logging, so
+    /// a host should log a non-zero count (the clock of this or another device
+    /// is wrong).
+    pub fn skipped_future_stamps(&self) -> usize {
+        self.skipped_future_stamps
     }
 
     fn zone_mut(&mut self, zone: &str) -> Result<&mut ZoneState> {
