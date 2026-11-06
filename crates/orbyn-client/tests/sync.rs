@@ -22,11 +22,16 @@ const B: &str = "0000000b-0000-4000-8000-00000000000b";
 const C: &str = "0000000c-0000-4000-8000-00000000000c";
 const EVIL: &str = "000000ee-0000-4000-8000-0000000000ee";
 
+/// Unix seconds for approvals in these tests.
+const NOW_S: i64 = 1_800_000_000;
+
 struct Device {
     id: String,
     keys: DeviceKeys,
     engine: Engine,
     now: u64,
+    /// This device as the server lists it.
+    entry: wire::Device,
 }
 
 fn copy(keys: &DeviceKeys) -> DeviceKeys {
@@ -45,41 +50,100 @@ fn unb64(text: &str) -> Vec<u8> {
         .expect("base64url")
 }
 
+fn entry(id: &str, keys: &DeviceKeys, state: wire::DeviceState) -> wire::Device {
+    let public = keys.public();
+    wire::Device {
+        id: id.into(),
+        name: id.into(),
+        platform: wire::DevicePlatform::Web,
+        state,
+        signing_key: b64(&public.signing),
+        agreement_key: b64(&public.agreement),
+        created_at: String::new(),
+        approved_by: None,
+        approval_signature: None,
+        approval_id: None,
+        approval_created_at: None,
+        current: false,
+    }
+}
+
+/// The approval as an honest server shows it, before any step after the
+/// commitment.
+fn view_of(
+    create: &wire::CreateApproval,
+    approver: &Device,
+    new: &Device,
+) -> wire::PendingApproval {
+    wire::PendingApproval {
+        id: create.approval_id.clone(),
+        expires_at: String::new(),
+        created_at: create.created_at,
+        approver_id: approver.id.clone(),
+        approver_signing_key: approver.entry.signing_key.clone(),
+        approver_agreement_key: approver.entry.agreement_key.clone(),
+        device_id: new.id.clone(),
+        device_signing_key: new.entry.signing_key.clone(),
+        device_agreement_key: new.entry.agreement_key.clone(),
+        commitment: create.commitment.clone(),
+        device_nonce: None,
+        approver_nonce: None,
+        signature: None,
+        endorsement: None,
+    }
+}
+
+/// The whole two-way approval of `new` by `approver`, relayed by an honest
+/// server, with the person confirming on both screens. `list` is what the
+/// approver sees. Sets and returns `new`'s entry.
+fn approve(approver: &mut Device, new: &mut Device, list: &wire::DeviceList) -> wire::Device {
+    let (mut pa, create) = approver
+        .engine
+        .start_approval(&new.entry, NOW_S)
+        .expect("start");
+    let mut view = view_of(&create, approver, new);
+    let (pd, nonce) = new.engine.join_approval(&view, NOW_S).expect("join");
+    view.device_nonce = Some(nonce.nonce);
+    let reveal = pa.reveal(&view).expect("reveal");
+    view.approver_nonce = Some(reveal.nonce);
+    let sas_on_new = pd.sas(&view).expect("sas");
+    assert_eq!(
+        pa.sas().as_deref(),
+        Some(sas_on_new.as_str()),
+        "both screens match"
+    );
+    let confirm = approver.engine.confirm_approval(pa, list).expect("confirm");
+    view.signature = Some(confirm.signature.clone());
+    view.endorsement = confirm.endorsement;
+    new.engine
+        .finish_approval(pd, &view, Some(&sas_on_new), NOW_S + 30)
+        .expect("finish");
+    new.entry.state = wire::DeviceState::Trusted;
+    new.entry.approved_by = Some(approver.id.clone());
+    new.entry.approval_signature = Some(confirm.signature);
+    new.entry.approval_id = Some(view.id);
+    new.entry.approval_created_at = Some(view.created_at);
+    new.entry.clone()
+}
+
 impl Device {
+    /// A device that signed in and waits for approval.
     fn new(id: &str, now: u64) -> Self {
         let keys = DeviceKeys::generate().expect("keys");
         Self {
             id: id.into(),
             engine: Engine::new(copy(&keys), ACCOUNT, id).expect("engine"),
+            entry: entry(id, &keys, wire::DeviceState::Pending),
             keys,
             now,
         }
     }
 
-    /// This device as the server lists it, approved by `approver` (or the
-    /// first device when `None`).
-    fn listed(&self, approver: Option<&Device>) -> wire::Device {
-        let public = self.keys.public();
-        let signature = approver.map(|a| {
-            let message = auth::approval_message(
-                &uuid_bytes(ACCOUNT).expect("uuid"),
-                &uuid_bytes(&self.id).expect("uuid"),
-                &public,
-            );
-            b64(&a.keys.sign(auth::DEVICE_APPROVAL_CONTEXT, &message))
-        });
-        wire::Device {
-            id: self.id.clone(),
-            name: self.id.clone(),
-            platform: wire::DevicePlatform::Web,
-            state: wire::DeviceState::Trusted,
-            signing_key: b64(&public.signing),
-            agreement_key: b64(&public.agreement),
-            created_at: String::new(),
-            approved_by: approver.map(|a| a.id.clone()),
-            approval_signature: signature,
-            current: false,
-        }
+    /// The account's first device.
+    fn root(id: &str, now: u64) -> Self {
+        let mut device = Self::new(id, now);
+        device.entry.state = wire::DeviceState::Trusted;
+        device
     }
 
     fn edit(&mut self, record: &str, field: &str, value: serde_json::Value) -> Stamp {
@@ -171,13 +235,20 @@ fn share_keys(from: &mut Device, to: &mut Device, list: &wire::DeviceList) {
     assert!(accepted.refused.is_empty(), "{accepted:?}");
 }
 
+fn list(devices: &[&Device]) -> wire::DeviceList {
+    wire::DeviceList {
+        devices: devices.iter().map(|d| d.entry.clone()).collect(),
+        removals: Vec::new(),
+    }
+}
+
 /// A signs up; B is approved by A. A makes the zone key and shares it.
 fn pair(store: &mut FakeStore) -> (Device, Device, wire::DeviceList) {
-    let mut a = Device::new(A, 1_000_000);
+    let mut a = Device::root(A, 1_000_000);
     let mut b = Device::new(B, 1_000_000);
-    let list = wire::DeviceList {
-        devices: vec![a.listed(None), b.listed(Some(&a))],
-    };
+    let before = list(&[&a, &b]);
+    approve(&mut a, &mut b, &before);
+    let list = list(&[&a, &b]);
     store.create_zone(ZONE);
     a.engine.create_zone_key(ZONE).expect("key");
     share_keys(&mut a, &mut b, &list);
@@ -252,66 +323,275 @@ fn two_devices_share_a_key_and_see_each_others_tasks() -> R {
     Ok(())
 }
 
+/// A trusted-looking entry the server makes up: `approver` named, signed by `signer`.
+fn forged(device: &Device, approver: &str, signer: &DeviceKeys) -> wire::Device {
+    let mut e = entry(&device.id, &device.keys, wire::DeviceState::Trusted);
+    let approval_id = "0f0f0f0f-0000-4000-8000-000000000000";
+    let message = auth::approval_message(&auth::Pairing {
+        account_id: &uuid_bytes(ACCOUNT).expect("uuid"),
+        approval_id: &uuid_bytes(approval_id).expect("uuid"),
+        created_at: NOW_S,
+        approver_id: &uuid_bytes(approver).expect("uuid"),
+        approver: &signer.public(),
+        device_id: &uuid_bytes(&device.id).expect("uuid"),
+        device: &device.keys.public(),
+    });
+    e.approved_by = Some(approver.into());
+    e.approval_signature = Some(b64(&signer.sign(auth::DEVICE_APPROVAL_CONTEXT, &message)));
+    e.approval_id = Some(approval_id.into());
+    e.approval_created_at = Some(NOW_S);
+    e
+}
+
 #[test]
 fn keys_go_only_to_devices_with_a_verified_approval_chain() {
     let mut store = FakeStore::new(10);
     let (mut a, mut b, _) = pair(&mut store);
-    let mut c = Device::new(C, a.now);
-    let evil = Device::new(EVIL, a.now);
-    // The server lists its own device as trusted: unapproved, then with an
-    // approval signed by itself, then claiming a's approval.
-    let mut forged = evil.listed(Some(&evil));
-    forged.approved_by = Some(a.id.clone());
-    for evil_entry in [evil.listed(None), evil.listed(Some(&evil)), forged] {
-        let list = wire::DeviceList {
-            devices: vec![a.listed(None), b.listed(Some(&a)), evil_entry],
-        };
-        let sent = a.engine.envelopes_for(ZONE, &list).expect("envelopes");
+    let evil = Device::root(EVIL, a.now);
+    // The server lists its own device as trusted: unapproved, approved by
+    // itself, then claiming a's approval with its own signature.
+    for evil_entry in [
+        evil.entry.clone(),
+        forged(&evil, EVIL, &evil.keys),
+        forged(&evil, A, &evil.keys),
+    ] {
+        let mut devices = list(&[&a, &b]);
+        devices.devices.push(evil_entry);
+        let sent = a.engine.envelopes_for(ZONE, &devices).expect("envelopes");
         assert!(sent.iter().all(|e| e.recipient_device_id != EVIL));
         assert!(sent.iter().any(|e| e.recipient_device_id == B));
     }
-    // A chain of two approvals verifies, even once its middle link is gone.
-    let list = wire::DeviceList {
-        devices: vec![a.listed(None), b.listed(Some(&a)), c.listed(Some(&b))],
-    };
-    share_keys(&mut a, &mut c, &list);
-    let without_b = wire::DeviceList {
-        devices: vec![a.listed(None), c.listed(Some(&b))],
-    };
-    let sent = a.engine.envelopes_for(ZONE, &without_b).expect("envelopes");
-    assert!(sent.iter().any(|e| e.recipient_device_id == C));
-    // c pinned b (its approver) and a through b on first sight.
-    let peers = c.engine.verify_devices(&list);
-    assert_eq!(peers.len(), 3);
     // A pinned device whose keys the server swaps is no longer trusted.
-    let mut swapped = b.listed(Some(&a));
-    swapped.signing_key = evil.listed(None).signing_key;
-    let list = wire::DeviceList {
-        devices: vec![a.listed(None), swapped],
-    };
-    let sent = a.engine.envelopes_for(ZONE, &list).expect("envelopes");
+    let mut swapped = list(&[&a, &b]);
+    swapped.devices[1].signing_key = evil.entry.signing_key.clone();
+    let sent = a.engine.envelopes_for(ZONE, &swapped).expect("envelopes");
     assert!(sent.is_empty());
     let _ = &mut b;
 }
 
 #[test]
+fn three_devices_approve_each_other_and_trust_the_whole_chain() {
+    let mut store = FakeStore::new(10);
+    let (mut a, mut b, _) = pair(&mut store);
+    let mut c = Device::new(C, a.now);
+    let before = list(&[&a, &b, &c]);
+    approve(&mut b, &mut c, &before);
+    let all = list(&[&a, &b, &c]);
+    // c trusts b (its approver) and a (endorsed by b), never the server's word.
+    let mut peers: Vec<String> = c
+        .engine
+        .verify_devices(&all)
+        .into_iter()
+        .map(|p| p.device_id)
+        .collect();
+    peers.sort();
+    assert_eq!(peers, [A, B, C]);
+    // a verifies c through b and shares the zone key with it.
+    share_keys(&mut a, &mut c, &all);
+    a.edit("r", "x", json!(1));
+    a.sync(&mut store);
+    c.sync(&mut store);
+    assert_eq!(
+        c.engine.record(ZONE, "r").and_then(|f| f.get("x")),
+        Some(&json!(1))
+    );
+}
+
+#[test]
+fn a_fake_root_cannot_make_a_new_device_trust_it() {
+    let mut store = FakeStore::new(10);
+    let (a, _b, _) = pair(&mut store);
+    let mut d = Device::new(C, a.now);
+    let mut x = Device::root(EVIL, a.now);
+    // The server runs two approvals: x (its own root) with the real d, and
+    // the real a with a fake d.
+    let fake_d = Device::new(C, a.now);
+    let (mut px, create_x) = x.engine.start_approval(&d.entry, NOW_S).expect("start");
+    let mut view_x = view_of(&create_x, &x, &d);
+    let (pd, nonce) = d.engine.join_approval(&view_x, NOW_S).expect("join");
+    view_x.device_nonce = Some(nonce.nonce.clone());
+    let (mut pa, create_a) = a
+        .engine
+        .start_approval(&fake_d.entry, NOW_S)
+        .expect("start");
+    let mut view_a = view_of(&create_a, &a, &fake_d);
+    view_a.device_nonce = Some(nonce.nonce);
+    view_x.approver_nonce = Some(px.reveal(&view_x).expect("reveal").nonce);
+    view_a.approver_nonce = Some(pa.reveal(&view_a).expect("reveal").nonce);
+    // The person sees different digits on a and d, so neither confirms.
+    let on_d = pd.sas(&view_x).expect("sas");
+    assert_ne!(pa.sas(), Some(on_d));
+    // Typing a's digits on d fails, and d trusts nothing but itself.
+    let typed = pa.sas().expect("sas");
+    assert!(
+        d.engine
+            .finish_approval(pd, &view_x, Some(&typed), NOW_S)
+            .is_err()
+    );
+    let mut fake_list = list(&[&x, &d]);
+    fake_list.devices.push(forged(&a, EVIL, &x.keys));
+    fake_list.devices[1] = forged(&d, EVIL, &x.keys);
+    let peers = d.engine.verify_devices(&fake_list);
+    assert!(peers.iter().all(|p| p.device_id == C), "{peers:?}");
+    let _ = &mut x;
+}
+
+#[test]
+fn a_ground_reveal_or_a_swapped_key_breaks_the_comparison() {
+    let mut store = FakeStore::new(10);
+    let (a, _b, _) = pair(&mut store);
+    let d = Device::new(C, a.now);
+    let x = Device::root(EVIL, a.now);
+    let (mut pa, create) = a.engine.start_approval(&d.entry, NOW_S).expect("start");
+    let honest = view_of(&create, &a, &d);
+
+    // The server swaps a's key for its own on d's screen: the commitment was
+    // made over a's key, so the reveal does not match and d refuses.
+    let mut swapped_a = honest.clone();
+    swapped_a.approver_signing_key = x.entry.signing_key.clone();
+    swapped_a.approver_agreement_key = x.entry.agreement_key.clone();
+    let (pd, nonce) = d.engine.join_approval(&swapped_a, NOW_S).expect("join");
+    let mut seen = honest.clone();
+    seen.device_nonce = Some(nonce.nonce.clone());
+    let reveal = pa.reveal(&seen).expect("reveal");
+    swapped_a.device_nonce = Some(nonce.nonce);
+    swapped_a.approver_nonce = Some(reveal.nonce);
+    assert!(pd.sas(&swapped_a).is_err());
+
+    // A reveal chosen after seeing d's nonce (grinding for a match) does not
+    // match the commitment either.
+    let (pd, nonce) = d.engine.join_approval(&honest, NOW_S).expect("join");
+    let mut ground = honest.clone();
+    ground.device_nonce = Some(nonce.nonce);
+    ground.approver_nonce = Some(b64(&[7; 32]));
+    assert!(pd.sas(&ground).is_err());
+
+    // The server swaps d's key on a's screen: a refuses a view with other
+    // keys than it started with, and over the fake key the digits differ.
+    let fake_d = Device::new(C, a.now);
+    let (mut pa, create) = a.engine.start_approval(&d.entry, NOW_S).expect("start");
+    let mut swapped_d = view_of(&create, &a, &fake_d);
+    swapped_d.device_nonce = Some(b64(&[1; 32]));
+    assert!(pa.reveal(&swapped_d).is_err());
+    let (mut pa2, create2) = a
+        .engine
+        .start_approval(&fake_d.entry, NOW_S)
+        .expect("start");
+    let (pd, nonce) = d
+        .engine
+        .join_approval(&view_of(&create2, &a, &d), NOW_S)
+        .expect("join");
+    let mut on_a = view_of(&create2, &a, &fake_d);
+    on_a.device_nonce = Some(nonce.nonce.clone());
+    let reveal = pa2.reveal(&on_a).expect("reveal");
+    let mut on_d = view_of(&create2, &a, &d);
+    on_d.device_nonce = Some(nonce.nonce);
+    on_d.approver_nonce = Some(reveal.nonce);
+    // d's own check: the commitment was made over the fake key.
+    assert!(pd.sas(&on_d).is_err());
+    let _ = &mut pa;
+}
+
+#[test]
+fn a_replayed_commitment_a_late_join_or_an_old_approval_is_refused() {
+    let mut store = FakeStore::new(10);
+    let (a, _b, _) = pair(&mut store);
+    let mut d = Device::new(C, a.now);
+    let (mut p1, c1) = a.engine.start_approval(&d.entry, NOW_S).expect("start");
+    let (_p2, c2) = a.engine.start_approval(&d.entry, NOW_S).expect("start");
+    // The server shows d approval 2 with approval 1's commitment, then
+    // reveals approval 1's nonce.
+    let mut replayed = view_of(&c2, &a, &d);
+    replayed.commitment = c1.commitment.clone();
+    let (pd, nonce) = d.engine.join_approval(&replayed, NOW_S).expect("join");
+    let mut v1 = view_of(&c1, &a, &d);
+    v1.device_nonce = Some(nonce.nonce.clone());
+    replayed.device_nonce = Some(nonce.nonce);
+    replayed.approver_nonce = Some(p1.reveal(&v1).expect("reveal").nonce);
+    assert!(pd.sas(&replayed).is_err());
+
+    // d joins only while it holds just the commitment, and not too late.
+    let mut revealed = view_of(&c2, &a, &d);
+    revealed.approver_nonce = Some(b64(&[1; 32]));
+    assert!(d.engine.join_approval(&revealed, NOW_S).is_err());
+    assert!(
+        d.engine
+            .join_approval(&view_of(&c2, &a, &d), NOW_S + 11 * 60)
+            .is_err()
+    );
+    // Without a valid approval d trusts only itself.
+    assert_eq!(d.engine.verify_devices(&list(&[&a, &d])).len(), 0);
+    let _ = &mut d;
+}
+
+#[test]
+fn a_signed_removal_drops_the_device_and_everything_only_it_approved() {
+    let mut store = FakeStore::new(10);
+    let (mut a, mut b, _) = pair(&mut store);
+    let mut c = Device::new(C, a.now);
+    let before = list(&[&a, &b, &c]);
+    approve(&mut b, &mut c, &before);
+    let all = list(&[&a, &b, &c]);
+    assert_eq!(a.engine.verify_devices(&all).len(), 3);
+    // a removes b; the server still lists b and c as trusted.
+    let removal = a.engine.sign_removal(&b.entry).expect("sign");
+    let mut after = all.clone();
+    after.removals.push(wire::DeviceRemoval {
+        device_id: B.into(),
+        signing_key: b.entry.signing_key.clone(),
+        agreement_key: b.entry.agreement_key.clone(),
+        removed_by: A.into(),
+        signature: removal.signature.clone(),
+    });
+    let peers = a.engine.verify_devices(&after);
+    assert_eq!(peers.len(), 1, "{peers:?}");
+    let sent = a.engine.envelopes_for(ZONE, &after).expect("envelopes");
+    assert!(sent.is_empty());
+    // A removal the server forges is ignored.
+    let mut forged_removal = all.clone();
+    forged_removal.removals.push(wire::DeviceRemoval {
+        device_id: B.into(),
+        signing_key: b.entry.signing_key.clone(),
+        agreement_key: b.entry.agreement_key.clone(),
+        removed_by: A.into(),
+        signature: b64(&[0; 64]),
+    });
+    assert_eq!(c.engine.verify_devices(&forged_removal).len(), 3);
+    // b's rotations are refused once b is removed.
+    let rotated = b.engine.rotate_zone_key(ZONE).expect("rotate");
+    let sent = b.engine.envelopes_for(ZONE, &all).expect("envelopes");
+    let delivered = deliver(&b, sent, &c);
+    c.engine.verify_devices(&after);
+    let result = c.engine.accept_envelopes(&delivered, &after);
+    assert!(
+        result
+            .refused
+            .iter()
+            .all(|r| r.reason == "untrusted_sender")
+    );
+    assert_ne!(c.engine.current_key_id(ZONE), Some(rotated));
+}
+
+#[test]
+fn an_absent_approver_links_no_new_device() {
+    let mut store = FakeStore::new(10);
+    let (mut a, mut b, _) = pair(&mut store);
+    let mut c = Device::new(C, a.now);
+    let before = list(&[&a, &b, &c]);
+    approve(&mut b, &mut c, &before);
+    // a has never seen c; the server hides c's approver b.
+    let without_b = list(&[&a, &c]);
+    assert_eq!(a.engine.verify_devices(&without_b).len(), 1);
+}
+
+#[test]
 fn an_envelope_from_an_unverified_or_forging_sender_is_refused() {
     let mut store = FakeStore::new(10);
-    let (a, mut b, list) = pair(&mut store);
-    let mut evil = Device::new(EVIL, a.now);
-    evil.engine.create_zone_key("work").expect("key");
-    let evil_list = wire::DeviceList {
-        devices: vec![a.listed(None), b.listed(Some(&a)), evil.listed(None)],
-    };
-    let sent = evil.engine.envelopes_for(
-        "work",
-        &wire::DeviceList {
-            devices: vec![evil.listed(None), b.listed(None)],
-        },
-    );
-    // evil does not verify b either (b is not linked to evil's pins).
-    assert!(sent.expect("envelopes").is_empty());
-    let forged = crypt::seal_zone_key(
+    let (a, mut b, list_ab) = pair(&mut store);
+    let evil = Device::root(EVIL, a.now);
+    let mut with_evil = list_ab.clone();
+    with_evil.devices.push(evil.entry.clone());
+    let forged_key = crypt::seal_zone_key(
         &evil.keys,
         &b.keys.public(),
         &uuid_bytes(ACCOUNT).expect("uuid"),
@@ -324,13 +604,13 @@ fn an_envelope_from_an_unverified_or_forging_sender_is_refused() {
         sender_device_id: sender.into(),
         zone: "work".into(),
         key_id: b64(&[1; 16]),
-        envelope: b64(&forged),
+        envelope: b64(&forged_key),
         created_at: String::new(),
         rotation: None,
     };
-    let result = b.engine.accept_envelopes(&[envelope(EVIL)], &evil_list);
+    let result = b.engine.accept_envelopes(&[envelope(EVIL)], &with_evil);
     assert_eq!(result.refused[0].reason, "untrusted_sender");
-    let result = b.engine.accept_envelopes(&[envelope(A)], &list);
+    let result = b.engine.accept_envelopes(&[envelope(A)], &list_ab);
     assert_eq!(result.refused[0].reason, "invalid");
     assert!(result.zones.is_empty());
     assert_eq!(b.engine.current_key_id("work"), None);
@@ -528,6 +808,133 @@ fn an_unsigned_or_forged_tombstone_is_refused_and_undone() {
 }
 
 #[test]
+fn a_signed_zone_deletion_removes_its_records_everywhere() {
+    let mut store = FakeStore::new(10);
+    let (mut a, mut b, _) = pair(&mut store);
+    a.edit("r1", "x", json!(1));
+    a.edit("r2", "x", json!(2));
+    settle(&mut a, &mut b, &mut store);
+    let proof = a.engine.delete_zone_proof(ZONE).expect("proof").proof;
+    store.delete_zone(ZONE, A, proof);
+    let mut applied = b.fetch_all(&store);
+    applied.removed.sort();
+    assert_eq!(applied.removed, ["r1", "r2"]);
+    assert!(applied.unverified_deletes.is_empty());
+    // Unsigned, the same deletion would be undone.
+    let mut store = FakeStore::new(10);
+    let (mut a, mut b, _) = pair(&mut store);
+    a.edit("r1", "x", json!(1));
+    settle(&mut a, &mut b, &mut store);
+    store.delete_zone(ZONE, A, None);
+    assert_eq!(b.fetch_all(&store).unverified_deletes, ["r1"]);
+}
+
+#[test]
+fn an_old_tombstone_replayed_over_a_newer_record_is_refused() {
+    let mut store = FakeStore::new(10);
+    let (mut a, mut b, _) = pair(&mut store);
+    for n in 0..3 {
+        a.now += 1;
+        a.edit("r", "x", json!(n));
+        a.sync(&mut store);
+    }
+    b.sync(&mut store);
+    let known = b
+        .engine
+        .records(ZONE)
+        .find(|(id, _)| *id == "r")
+        .and_then(|(_, l)| l.version);
+    let known = known.expect("b has r");
+    assert!(known > 1);
+    let account = uuid_bytes(ACCOUNT).expect("uuid");
+    let place = crypt::Place {
+        account: &account,
+        zone: ZONE,
+        record_id: "r",
+    };
+    let key_id: [u8; 16] = unb64(&a.engine.current_key_id(ZONE).expect("key"))
+        .try_into()
+        .expect("id");
+    let tombstone = |deleted_version: i64, version: i64| wire::Record {
+        record_id: "r".into(),
+        record_type: "note".into(),
+        version,
+        ciphertext: None,
+        wrapped_key: None,
+        author_device_id: A.into(),
+        modified_at: String::new(),
+        deleted: true,
+        delete_proof: Some(b64(&crypt::sign_delete(
+            &a.keys,
+            place,
+            deleted_version,
+            &key_id,
+        ))),
+    };
+    let page = |r: wire::Record| wire::ZoneChanges {
+        records: vec![r],
+        token: store.token(ZONE),
+        more: false,
+        zone_deleted: false,
+    };
+    // A genuine delete a signed long ago, of version 1, replayed now.
+    let applied = b
+        .engine
+        .apply_changes(ZONE, &page(tombstone(1, known + 10)), b.now)
+        .expect("apply");
+    assert_eq!(applied.unverified_deletes, ["r"]);
+    assert!(b.engine.record(ZONE, "r").is_some());
+    // A delete of the version b now has (the ignored tombstone's) applies.
+    let applied = b
+        .engine
+        .apply_changes(ZONE, &page(tombstone(known + 10, known + 20)), b.now)
+        .expect("apply");
+    assert_eq!(applied.removed, ["r"]);
+}
+
+#[test]
+fn the_quarantine_is_bounded_and_pending_edits_stay_pending() {
+    let mut store = FakeStore::new(10);
+    let (mut a, mut b, _) = pair(&mut store);
+    a.edit("r", "x", json!(1));
+    settle(&mut a, &mut b, &mut store);
+    // b edits r while the server's newer copy of r cannot be opened.
+    b.now += 1;
+    b.edit("r", "y", json!(2));
+    let garbage = |id: String, version: i64| wire::Record {
+        record_id: id,
+        record_type: "note".into(),
+        version,
+        ciphertext: Some(b64(&[1; 40])),
+        wrapped_key: Some(b64(&[2; 40])),
+        author_device_id: A.into(),
+        modified_at: String::new(),
+        deleted: false,
+        delete_proof: None,
+    };
+    let mut records: Vec<wire::Record> = (0..orbyn_client::MAX_QUARANTINE + 5)
+        .map(|n| garbage(format!("g{n:05}"), 100 + n as i64))
+        .collect();
+    records.push(garbage("r".into(), 10_000));
+    let page = wire::ZoneChanges {
+        records,
+        token: store.token(ZONE),
+        more: false,
+        zone_deleted: false,
+    };
+    let applied = b.engine.apply_changes(ZONE, &page, b.now).expect("apply");
+    assert_eq!(
+        b.engine.quarantine(ZONE).count(),
+        orbyn_client::MAX_QUARANTINE
+    );
+    assert_eq!(applied.evicted.len(), 6);
+    assert_eq!(applied.evicted[0], "g00000", "the oldest goes first");
+    assert!(b.engine.quarantine(ZONE).any(|(id, _)| id == "r"));
+    assert!(b.engine.has_pending(ZONE), "r's edit is still waiting");
+    assert_eq!(b.engine.build_upload(ZONE).expect("build"), None);
+}
+
+#[test]
 fn a_far_future_field_is_left_out_and_reported() -> R {
     let mut store = FakeStore::new(10);
     let (mut a, mut b, _) = pair(&mut store);
@@ -660,11 +1067,11 @@ fn a_wrong_zone_key_is_refused() {
 fn devices_that_each_made_a_key_still_read_each_other() {
     let mut store = FakeStore::new(10);
     store.create_zone(ZONE);
-    let mut a = Device::new(A, 1_000);
+    let mut a = Device::root(A, 1_000);
     let mut b = Device::new(B, 1_000);
-    let list = wire::DeviceList {
-        devices: vec![a.listed(None), b.listed(Some(&a))],
-    };
+    let before = list(&[&a, &b]);
+    approve(&mut a, &mut b, &before);
+    let list = list(&[&a, &b]);
     a.engine.create_zone_key(ZONE).expect("key");
     b.engine.create_zone_key(ZONE).expect("key");
     a.edit("ra", "x", json!(1));

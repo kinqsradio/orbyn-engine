@@ -1,16 +1,17 @@
 //! Which devices this device trusts, checked by itself rather than taken from
 //! the server.
 //!
-//! The device keeps a pinned set of devices with their public keys. It starts
-//! with itself. A device that was approved also pins, the first time it sees
-//! the device list, every device on its approval chain up to the account's
-//! first device (the trust root, the device with no approver), checking each
-//! signature on the way. That first step is trust on first use: the person
-//! typed the code their trusted device showed moments before. From then on a device in the server's list
-//! counts as trusted only when a chain of `orbyn/device-approval/v1` signatures
-//! links it to a pinned device; each newly verified device is pinned, so the
-//! chain still holds after its approver is removed. A pinned device whose keys
-//! the server reports differently is not trusted.
+//! The device pins devices with their public keys. Anchors are pinned
+//! directly: the device itself, the device that approved it (learned through
+//! the two-way code comparison in `pairing`, never from the server's list),
+//! the devices that approver endorsed in its signed list, and any device the
+//! person pinned by hand. Every other device counts only when a chain of
+//! `orbyn/device-approval/v1` signatures links it to a pinned device that the
+//! server lists as trusted with the same keys; it is pinned under that
+//! approver.
+//!
+//! A signed removal from a pinned device revokes the removed device and every
+//! device pinned under it, and a revoked device is never pinned again.
 
 use crate::{ClientError, Result, unb64};
 use orbyn_auth_client as auth;
@@ -46,96 +47,152 @@ pub fn uuid_bytes(text: &str) -> Result<[u8; 16]> {
     Ok(out)
 }
 
-fn key32(text: &str) -> Option<[u8; 32]> {
+pub(crate) fn key32(text: &str) -> Option<[u8; 32]> {
     unb64(text).ok()?.try_into().ok()
 }
 
-fn public_of(device: &wire::Device) -> Option<DevicePublic> {
+pub(crate) fn public_of(device: &wire::Device) -> Option<DevicePublic> {
     Some(DevicePublic {
         signing: key32(&device.signing_key)?,
         agreement: key32(&device.agreement_key)?,
     })
 }
 
-/// A pinned device's keys, base64url, for the snapshot.
+/// A pinned device's keys, base64url, and the pinned device it was verified
+/// through (`None` for an anchor), for the snapshot.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PinnedKeys {
     pub signing_key: String,
     pub agreement_key: String,
+    #[serde(default)]
+    pub parent: Option<String>,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct Trust {
     pub account: [u8; 16],
     pub device_id: String,
-    pinned: BTreeMap<String, DevicePublic>,
+    pinned: BTreeMap<String, (DevicePublic, Option<String>)>,
+    revoked: BTreeMap<String, DevicePublic>,
 }
 
 impl Trust {
     pub fn new(account: [u8; 16], device_id: String, me: DevicePublic) -> Self {
         Self {
             account,
-            pinned: BTreeMap::from([(device_id.clone(), me)]),
+            pinned: BTreeMap::from([(device_id.clone(), (me, None))]),
+            revoked: BTreeMap::new(),
             device_id,
         }
     }
 
-    pub fn pin(&mut self, device_id: &str, public: DevicePublic) -> Result<()> {
+    /// Pins an anchor: a device trusted directly, not through a chain.
+    pub fn pin_anchor(&mut self, device_id: &str, public: DevicePublic) -> Result<()> {
         uuid_bytes(device_id)?;
+        if self.revoked.contains_key(device_id) {
+            return Err(ClientError::InvalidInput);
+        }
         match self.pinned.get(device_id) {
-            Some(existing) if *existing != public => Err(ClientError::InvalidInput),
+            Some((existing, _)) if *existing != public => Err(ClientError::InvalidInput),
             _ => {
-                self.pinned.insert(device_id.to_owned(), public);
+                self.pinned.insert(device_id.to_owned(), (public, None));
                 Ok(())
             }
         }
     }
 
+    /// The keys of a pinned, not revoked device.
     pub fn pinned(&self, device_id: &str) -> Option<&DevicePublic> {
-        self.pinned.get(device_id)
+        self.pinned.get(device_id).map(|(p, _)| p)
     }
 
-    pub fn export(&self) -> BTreeMap<String, PinnedKeys> {
-        self.pinned
-            .iter()
-            .map(|(id, p)| {
-                (
-                    id.clone(),
-                    PinnedKeys {
-                        signing_key: crate::b64(&p.signing),
-                        agreement_key: crate::b64(&p.agreement),
-                    },
-                )
+    pub fn export(&self) -> (BTreeMap<String, PinnedKeys>, BTreeMap<String, PinnedKeys>) {
+        let keys = |p: &DevicePublic, parent: Option<String>| PinnedKeys {
+            signing_key: crate::b64(&p.signing),
+            agreement_key: crate::b64(&p.agreement),
+            parent,
+        };
+        (
+            self.pinned
+                .iter()
+                .map(|(id, (p, parent))| (id.clone(), keys(p, parent.clone())))
+                .collect(),
+            self.revoked
+                .iter()
+                .map(|(id, p)| (id.clone(), keys(p, None)))
+                .collect(),
+        )
+    }
+
+    pub fn import(
+        &mut self,
+        pinned: &BTreeMap<String, PinnedKeys>,
+        revoked: &BTreeMap<String, PinnedKeys>,
+    ) -> Result<()> {
+        let parse = |k: &PinnedKeys| -> Result<DevicePublic> {
+            Ok(DevicePublic {
+                signing: key32(&k.signing_key).ok_or(ClientError::InvalidInput)?,
+                agreement: key32(&k.agreement_key).ok_or(ClientError::InvalidInput)?,
             })
-            .collect()
-    }
-
-    pub fn import(&mut self, pinned: &BTreeMap<String, PinnedKeys>) -> Result<()> {
-        for (id, keys) in pinned {
-            let public = DevicePublic {
-                signing: key32(&keys.signing_key).ok_or(ClientError::InvalidInput)?,
-                agreement: key32(&keys.agreement_key).ok_or(ClientError::InvalidInput)?,
-            };
-            self.pin(id, public)?;
+        };
+        for (id, k) in pinned {
+            uuid_bytes(id)?;
+            let public = parse(k)?;
+            if let Some((existing, _)) = self.pinned.get(id)
+                && *existing != public
+            {
+                return Err(ClientError::InvalidInput);
+            }
+            self.pinned.insert(id.clone(), (public, k.parent.clone()));
+        }
+        for (id, k) in revoked {
+            self.revoked.insert(id.clone(), parse(k)?);
         }
         Ok(())
     }
 
-    fn approval_verifies(&self, device: &wire::Device, approver: &DevicePublic) -> bool {
-        let (Some(public), Ok(id), Some(signature)) = (
+    /// Checks `device`'s approval signature by `approver` (`approver_id`).
+    pub fn approval_verifies(
+        &self,
+        device: &wire::Device,
+        approver_id: &str,
+        approver: &DevicePublic,
+    ) -> bool {
+        let parts = (
             public_of(device),
-            uuid_bytes(&device.id),
+            uuid_bytes(&device.id).ok(),
+            uuid_bytes(approver_id).ok(),
+            device
+                .approval_id
+                .as_deref()
+                .and_then(|a| uuid_bytes(a).ok()),
+            device.approval_created_at,
             device
                 .approval_signature
                 .as_deref()
-                .and_then(|s| unb64(s).ok()),
-        ) else {
+                .and_then(|s| unb64(s).ok())
+                .and_then(|s| <[u8; 64]>::try_from(s).ok()),
+        );
+        let (
+            Some(public),
+            Some(id),
+            Some(approver_bytes),
+            Some(approval_id),
+            Some(created_at),
+            Some(signature),
+        ) = parts
+        else {
             return false;
         };
-        let Ok(signature) = <[u8; 64]>::try_from(signature) else {
-            return false;
-        };
-        let message = auth::approval_message(&self.account, &id, &public);
+        let message = auth::approval_message(&auth::Pairing {
+            account_id: &self.account,
+            approval_id: &approval_id,
+            created_at,
+            approver_id: &approver_bytes,
+            approver,
+            device_id: &id,
+            device: &public,
+        });
         orbyn_crypto::verify(
             approver,
             auth::DEVICE_APPROVAL_CONTEXT,
@@ -145,65 +202,114 @@ impl Trust {
         .is_ok()
     }
 
-    /// The devices of `list` this device trusts: trusted on the server and
-    /// linked to a pinned device by approval signatures. Pins each one found.
-    pub fn verify(&mut self, list: &wire::DeviceList) -> Vec<Peer> {
-        let by_id: BTreeMap<&str, &wire::Device> =
-            list.devices.iter().map(|d| (d.id.as_str(), d)).collect();
-        let matches_pin = |pinned: &BTreeMap<String, DevicePublic>, d: &wire::Device| {
-            pinned
-                .get(&d.id)
-                .is_some_and(|p| public_of(d).as_ref() == Some(p))
-        };
-        // First sight: walk from this device up its approvals to the account's
-        // first device, checking each signature, and pin every device on the
-        // way (trust on first use; see the module docs).
-        if self.pinned.len() == 1
-            && by_id
-                .get(self.device_id.as_str())
-                .is_some_and(|me| matches_pin(&self.pinned, me))
-        {
-            let mut chain = Vec::new();
-            let mut at = self.device_id.as_str();
-            while let Some(device) = by_id.get(at)
-                && let Some(approver_id) = device.approved_by.as_deref()
-                && let Some(approver) = by_id.get(approver_id)
-                && let Some(approver_public) = public_of(approver)
-                && self.approval_verifies(device, &approver_public)
-                && chain.len() < list.devices.len()
-                && approver_id != self.device_id
-            {
-                chain.push((approver_id.to_owned(), approver_public));
-                at = approver_id;
+    /// Drops `device_id` and every device pinned under it, and never pins it again.
+    fn revoke(&mut self, device_id: &str, public: DevicePublic) {
+        if device_id == self.device_id {
+            return;
+        }
+        self.revoked.insert(device_id.to_owned(), public);
+        let mut gone = vec![device_id.to_owned()];
+        while let Some(id) = gone.pop() {
+            self.pinned.remove(&id);
+            let children: Vec<String> = self
+                .pinned
+                .iter()
+                .filter(|(_, (_, parent))| parent.as_deref() == Some(id.as_str()))
+                .map(|(child, _)| child.clone())
+                .collect();
+            gone.extend(children);
+        }
+    }
+
+    fn apply_removals(&mut self, removals: &[wire::DeviceRemoval]) {
+        loop {
+            let mut changed = false;
+            for r in removals {
+                if self.revoked.contains_key(&r.device_id) {
+                    continue;
+                }
+                let Some(remover) = self.pinned.get(&r.removed_by).map(|(p, _)| *p) else {
+                    continue;
+                };
+                let (Some(signing), Some(agreement), Ok(id), Some(signature)) = (
+                    key32(&r.signing_key),
+                    key32(&r.agreement_key),
+                    uuid_bytes(&r.device_id),
+                    unb64(&r.signature)
+                        .ok()
+                        .and_then(|s| <[u8; 64]>::try_from(s).ok()),
+                ) else {
+                    continue;
+                };
+                let removed = DevicePublic { signing, agreement };
+                // The removal names the keys it removes; a pinned device with
+                // other keys is a different device.
+                if self
+                    .pinned
+                    .get(&r.device_id)
+                    .is_some_and(|(p, _)| *p != removed)
+                {
+                    continue;
+                }
+                let message = auth::removal_message(&self.account, &id, &removed);
+                if orbyn_crypto::verify(
+                    &remover,
+                    auth::DEVICE_REMOVAL_CONTEXT,
+                    &message,
+                    &signature,
+                )
+                .is_ok()
+                {
+                    self.revoke(&r.device_id, removed);
+                    changed = true;
+                }
             }
-            // Only a chain that ends at the first device counts.
-            let rooted = by_id.get(at).is_some_and(|d| d.approved_by.is_none());
-            if rooted {
-                self.pinned.extend(chain);
+            if !changed {
+                break;
             }
         }
+    }
+
+    /// The devices of `list` this device trusts: trusted on the server with
+    /// the keys pinned here. Applies signed removals first, then pins every
+    /// device a chain of approvals links to a pinned one.
+    pub fn verify(&mut self, list: &wire::DeviceList) -> Vec<Peer> {
+        self.apply_removals(&list.removals);
+        let listed = |pinned: &BTreeMap<String, (DevicePublic, Option<String>)>,
+                      d: &wire::Device| {
+            d.state == wire::DeviceState::Trusted
+                && pinned
+                    .get(&d.id)
+                    .is_some_and(|(p, _)| public_of(d).as_ref() == Some(p))
+        };
         loop {
             let mut grew = false;
             for device in &list.devices {
-                if self.pinned.contains_key(&device.id)
-                    || device.state != wire::DeviceState::Trusted
+                if device.state != wire::DeviceState::Trusted
+                    || self.pinned.contains_key(&device.id)
+                    || self.revoked.contains_key(&device.id)
                 {
                     continue;
                 }
                 let Some(approver_id) = device.approved_by.as_deref() else {
                     continue;
                 };
-                let approver_ok = by_id
-                    .get(approver_id)
-                    .is_none_or(|a| matches_pin(&self.pinned, a));
-                let Some(approver) = self.pinned.get(approver_id).copied() else {
+                // The approver must be pinned and listed as trusted with the
+                // same keys now; an absent approver links nothing new.
+                let approver_listed = list
+                    .devices
+                    .iter()
+                    .find(|d| d.id == approver_id)
+                    .is_some_and(|a| listed(&self.pinned, a));
+                let Some(approver) = self.pinned.get(approver_id).map(|(p, _)| *p) else {
                     continue;
                 };
-                if approver_ok
-                    && self.approval_verifies(device, &approver)
+                if approver_listed
+                    && self.approval_verifies(device, approver_id, &approver)
                     && let Some(public) = public_of(device)
                 {
-                    self.pinned.insert(device.id.clone(), public);
+                    self.pinned
+                        .insert(device.id.clone(), (public, Some(approver_id.to_owned())));
                     grew = true;
                 }
             }
@@ -213,7 +319,7 @@ impl Trust {
         }
         list.devices
             .iter()
-            .filter(|d| d.state == wire::DeviceState::Trusted && matches_pin(&self.pinned, d))
+            .filter(|d| listed(&self.pinned, d))
             .filter_map(|d| {
                 Some(Peer {
                     device_id: d.id.clone(),

@@ -178,6 +178,29 @@ impl FakeStore {
         wire::ZoneList { zones, next }
     }
 
+    /// Tombstones every live record with the deleting device's proof.
+    pub fn delete_zone(&mut self, zone: &str, device: &str, proof: Option<String>) {
+        let z = self.zones.get_mut(zone).expect("zone");
+        let mut live: Vec<String> = z
+            .records
+            .values()
+            .filter(|r| !r.deleted)
+            .map(|r| r.record_id.clone())
+            .collect();
+        live.sort_by_key(|id| z.records[id].version);
+        for id in live {
+            z.seq += 1;
+            let r = z.records.get_mut(&id).expect("record");
+            r.version = z.seq;
+            r.deleted = true;
+            r.ciphertext = None;
+            r.wrapped_key = None;
+            r.author_device_id = device.into();
+            r.delete_proof = proof.clone();
+        }
+        z.seq += 1;
+    }
+
     pub fn token(&self, zone: &str) -> String {
         token(self.zones[zone].seq)
     }

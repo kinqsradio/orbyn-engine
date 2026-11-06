@@ -34,6 +34,9 @@ pub const RECORD_KEY_CONTEXT: &str = "orbyn/record-key/v1";
 pub const ZONE_KEY_LABEL: &str = "orbyn/zone-key/v1";
 pub const DELETE_CONTEXT: &str = "orbyn/record-delete/v1";
 pub const ROTATION_CONTEXT: &str = "orbyn/zone-key-rotation/v1";
+pub const ZONE_DELETE_CONTEXT: &str = "orbyn/zone-delete/v1";
+const ZONE_PROOF_FORMAT: u8 = 2;
+const ZONE_PROOF_LEN: usize = 1 + 8 + 64;
 /// The first byte of every wrapped record key.
 const WRAPPED_FORMAT: u8 = 2;
 const WRAPPED_HEADER: usize = 1 + 16 + 8;
@@ -243,30 +246,76 @@ pub fn sign_delete(
     out
 }
 
-/// Checks a tombstone's proof against the device that wrote it. The deleted
-/// version must be below the tombstone's version.
+fn zone_delete_message(account: &[u8; 16], zone: &str, through: i64) -> Vec<u8> {
+    let mut out = Vec::new();
+    push(&mut out, account);
+    push(&mut out, zone.as_bytes());
+    out.extend_from_slice(&through.to_be_bytes());
+    out
+}
+
+/// The proof a zone deletion carries: every record up to version `through`
+/// is deleted. Format byte 2, the version and the signature.
+pub fn sign_zone_delete(
+    device: &DeviceKeys,
+    account: &[u8; 16],
+    zone: &str,
+    through: i64,
+) -> Vec<u8> {
+    let signature = device.sign(
+        ZONE_DELETE_CONTEXT,
+        &zone_delete_message(account, zone, through),
+    );
+    let mut out = Vec::with_capacity(ZONE_PROOF_LEN);
+    out.push(ZONE_PROOF_FORMAT);
+    out.extend_from_slice(&through.to_be_bytes());
+    out.extend_from_slice(&signature);
+    out
+}
+
+/// Checks a tombstone's proof against the device that wrote it: a record
+/// delete (format 1) or a zone deletion (format 2). The deleted version must
+/// be at least `known`, the version this device has, and below the
+/// tombstone's, so an old tombstone cannot be replayed over a newer record.
 pub fn verify_delete(
     author: &DevicePublic,
     place: Place<'_>,
     tombstone_version: i64,
+    known: i64,
     proof: &[u8],
 ) -> Result<(), ClientError> {
-    if proof.len() != PROOF_LEN || proof[0] != PROOF_FORMAT {
+    let (deleted_version, context, message, signature) = match proof.first() {
+        Some(&PROOF_FORMAT) if proof.len() == PROOF_LEN => {
+            let key_id: KeyId = proof[1..17].try_into().map_err(|_| ClientError::Open)?;
+            let version: [u8; 8] = proof[17..25].try_into().map_err(|_| ClientError::Open)?;
+            let deleted = i64::from_be_bytes(version);
+            (
+                deleted,
+                DELETE_CONTEXT,
+                delete_message(place, deleted, &key_id),
+                &proof[25..],
+            )
+        }
+        Some(&ZONE_PROOF_FORMAT) if proof.len() == ZONE_PROOF_LEN => {
+            let version: [u8; 8] = proof[1..9].try_into().map_err(|_| ClientError::Open)?;
+            let through = i64::from_be_bytes(version);
+            (
+                through,
+                ZONE_DELETE_CONTEXT,
+                zone_delete_message(place.account, place.zone, through),
+                &proof[9..],
+            )
+        }
+        _ => return Err(ClientError::Open),
+    };
+    let signature: [u8; 64] = signature.try_into().map_err(|_| ClientError::Open)?;
+    if deleted_version < known || deleted_version >= tombstone_version {
         return Err(ClientError::Open);
     }
-    let key_id: KeyId = proof[1..17].try_into().map_err(|_| ClientError::Open)?;
-    let version: [u8; 8] = proof[17..25].try_into().map_err(|_| ClientError::Open)?;
-    let deleted_version = i64::from_be_bytes(version);
-    let signature: [u8; 64] = proof[25..].try_into().map_err(|_| ClientError::Open)?;
-    if deleted_version <= 0 || deleted_version >= tombstone_version {
+    if context == DELETE_CONTEXT && deleted_version <= 0 {
         return Err(ClientError::Open);
     }
-    Ok(orbyn_crypto::verify(
-        author,
-        DELETE_CONTEXT,
-        &delete_message(place, deleted_version, &key_id),
-        &signature,
-    )?)
+    Ok(orbyn_crypto::verify(author, context, &message, &signature)?)
 }
 
 fn rotation_message(account: &[u8; 16], zone: &str, new: &KeyId, previous: &KeyId) -> Vec<u8> {
@@ -415,14 +464,23 @@ mod tests {
         let stranger = DeviceKeys::generate()?;
         let here = place("inbox", "t1");
         let proof = sign_delete(&laptop, here, 4, &[3; 16]);
-        verify_delete(&laptop.public(), here, 5, &proof)?;
-        assert!(verify_delete(&stranger.public(), here, 5, &proof).is_err());
-        assert!(verify_delete(&laptop.public(), place("inbox", "t2"), 5, &proof).is_err());
-        // The proof names the version it deleted; a tombstone cannot be older.
-        assert!(verify_delete(&laptop.public(), here, 4, &proof).is_err());
+        verify_delete(&laptop.public(), here, 5, 4, &proof)?;
+        assert!(verify_delete(&stranger.public(), here, 5, 4, &proof).is_err());
+        assert!(verify_delete(&laptop.public(), place("inbox", "t2"), 5, 4, &proof).is_err());
+        // The proof names the version it deleted; a tombstone cannot be older,
+        // and a device that has a newer version refuses it (a replay).
+        assert!(verify_delete(&laptop.public(), here, 4, 0, &proof).is_err());
+        assert!(verify_delete(&laptop.public(), here, 9, 5, &proof).is_err());
         let mut changed = proof.clone();
         changed[20] ^= 1;
-        assert!(verify_delete(&laptop.public(), here, 1 << 40, &changed).is_err());
+        assert!(verify_delete(&laptop.public(), here, 1 << 40, 0, &changed).is_err());
+
+        // A zone deletion covers every record up to its version.
+        let zone = sign_zone_delete(&laptop, &ACCOUNT, "inbox", 7);
+        verify_delete(&laptop.public(), here, 9, 7, &zone)?;
+        verify_delete(&laptop.public(), place("inbox", "t9"), 9, 0, &zone)?;
+        assert!(verify_delete(&laptop.public(), here, 9, 8, &zone).is_err());
+        assert!(verify_delete(&laptop.public(), place("work", "t1"), 9, 0, &zone).is_err());
 
         let (new, old) = ([5u8; 16], [6u8; 16]);
         let signature = sign_rotation(&laptop, &ACCOUNT, "inbox", &new, &old);

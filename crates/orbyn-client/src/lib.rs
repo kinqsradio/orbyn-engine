@@ -24,10 +24,12 @@
 //!   tombstone removes anything.
 
 pub mod crypt;
+mod pairing;
 mod planner;
 mod trust;
 
 pub use crypt::KeyId;
+pub use pairing::{ApproverPairing, DevicePairing, ENDORSEMENT_CONTEXT, MAX_ENDORSED};
 pub use planner::{ITEM_TYPE, item_fields, item_from_fields};
 pub use trust::{Peer, PinnedKeys, uuid_bytes};
 
@@ -50,6 +52,9 @@ pub const MAX_CIPHERTEXT: usize = 256 * 1024;
 /// How long a record deleted by another device while it had local edits stays
 /// in the trash.
 pub const TRASH_MILLIS: u64 = 30 * 24 * 60 * 60 * 1000;
+/// The most records a zone keeps in quarantine, and their bytes.
+pub const MAX_QUARANTINE: usize = 1000;
+pub const MAX_QUARANTINE_BYTES: usize = 16 * 1024 * 1024;
 
 /// What went wrong. Messages never include record content or keys.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -205,6 +210,32 @@ impl ZoneState {
         self.keys.get(&id).map(|k| (id, k))
     }
 
+    /// Drops the oldest quarantined records (lowest versions) until the
+    /// quarantine fits its limits; returns their ids.
+    fn trim_quarantine(&mut self) -> Vec<String> {
+        let size = |q: &Quarantined| {
+            q.record.ciphertext.as_ref().map_or(0, String::len)
+                + q.record.wrapped_key.as_ref().map_or(0, String::len)
+        };
+        let mut bytes: usize = self.quarantine.values().map(size).sum();
+        let mut evicted = Vec::new();
+        while self.quarantine.len() > MAX_QUARANTINE || bytes > MAX_QUARANTINE_BYTES {
+            let Some(oldest) = self
+                .quarantine
+                .iter()
+                .min_by_key(|(_, q)| q.record.version)
+                .map(|(id, _)| id.clone())
+            else {
+                break;
+            };
+            if let Some(q) = self.quarantine.remove(&oldest) {
+                bytes -= size(&q);
+            }
+            evicted.push(oldest);
+        }
+        evicted
+    }
+
     /// Follows accepted rotations from the current key as far as they go.
     fn advance(&mut self) {
         let mut steps = 0;
@@ -244,6 +275,9 @@ pub struct Applied {
     /// Tombstones without a valid signature from a trusted device. They were
     /// ignored; the local copy is uploaded again.
     pub unverified_deletes: Vec<String>,
+    /// Quarantined records dropped, oldest first, to keep the quarantine
+    /// within [`MAX_QUARANTINE`] records and [`MAX_QUARANTINE_BYTES`].
+    pub evicted: Vec<String>,
     /// Fields left out because their stamp was too far ahead of this clock.
     pub rejected: Vec<RejectedFields>,
     /// More changes wait on the server; fetch again with [`Engine::token`].
@@ -289,6 +323,8 @@ pub struct Snapshot {
     pub account_id: String,
     pub device_id: String,
     pub pinned: BTreeMap<String, PinnedKeys>,
+    #[serde(default)]
+    pub revoked: BTreeMap<String, PinnedKeys>,
     pub zones: BTreeMap<String, ZoneSnapshot>,
 }
 
@@ -347,7 +383,7 @@ impl Engine {
     /// clock past every stamp in the cache.
     pub fn restore(keys: DeviceKeys, snapshot: Snapshot, now_millis: u64) -> Result<Self> {
         let mut engine = Self::new(keys, &snapshot.account_id, &snapshot.device_id)?;
-        engine.trust.import(&snapshot.pinned)?;
+        engine.trust.import(&snapshot.pinned, &snapshot.revoked)?;
         for (name, z) in snapshot.zones {
             let mut keys = BTreeMap::new();
             for (id, key) in &z.keys {
@@ -408,10 +444,12 @@ impl Engine {
                 (name.clone(), snapshot)
             })
             .collect();
+        let (pinned, revoked) = self.trust.export();
         Snapshot {
             account_id: format_uuid(&self.trust.account),
             device_id: self.trust.device_id.clone(),
-            pinned: self.trust.export(),
+            pinned,
+            revoked,
             zones,
         }
     }
@@ -434,7 +472,41 @@ impl Engine {
     /// Trusts a device the person checked another way, such as by comparing
     /// keys on both screens.
     pub fn pin_device(&mut self, device_id: &str, public: DevicePublic) -> Result<()> {
-        self.trust.pin(device_id, public)
+        self.trust.pin_anchor(device_id, public)
+    }
+
+    /// The `DELETE /v1/devices/{id}` body that removes `device` (from
+    /// `GET /v1/devices`), signed by this device.
+    pub fn sign_removal(&self, device: &wire::Device) -> Result<wire::RemoveDevice> {
+        let keys = trust::public_of(device).ok_or(ClientError::InvalidInput)?;
+        let message = orbyn_auth_client::removal_message(
+            &self.trust.account,
+            &uuid_bytes(&device.id)?,
+            &keys,
+        );
+        Ok(wire::RemoveDevice {
+            signature: b64(&self
+                .keys
+                .sign(orbyn_auth_client::DEVICE_REMOVAL_CONTEXT, &message)),
+        })
+    }
+
+    /// The `DELETE /v1/zones/{zone}` body: this device's signature that every
+    /// record of the zone up to the newest version it has seen is deleted.
+    /// Records written after that keep a tombstone devices do not accept.
+    pub fn delete_zone_proof(&self, zone: &str) -> Result<wire::DeleteZone> {
+        let z = self.zones.get(zone).ok_or(ClientError::InvalidZone)?;
+        let through = z
+            .records
+            .values()
+            .filter_map(|l| l.version)
+            .chain(z.quarantine.values().map(|q| q.record.version))
+            .max()
+            .unwrap_or(0);
+        let proof = crypt::sign_zone_delete(&self.keys, &self.trust.account, zone, through);
+        Ok(wire::DeleteZone {
+            proof: Some(b64(&proof)),
+        })
     }
 
     /// The stamp for a new local edit at wall time `now_millis`.
@@ -500,10 +572,9 @@ impl Engine {
     /// True when the zone has local changes the server does not have yet.
     pub fn has_pending(&self, zone: &str) -> bool {
         self.zones.get(zone).is_some_and(|z| {
-            z.in_flight.is_some()
-                || z.records
-                    .iter()
-                    .any(|(id, l)| l.dirty && !z.quarantine.contains_key(id))
+            // A record waiting behind a quarantined server copy still has
+            // edits the server lacks.
+            z.in_flight.is_some() || z.records.values().any(|l| l.dirty)
         })
     }
 
@@ -778,7 +849,8 @@ impl Engine {
                 .and_then(|p| unb64(p).ok())
                 .zip(self.trust.pinned(&r.author_device_id))
                 .is_some_and(|(proof, author)| {
-                    crypt::verify_delete(author, place, r.version, &proof).is_ok()
+                    crypt::verify_delete(author, place, r.version, known.unwrap_or(0), &proof)
+                        .is_ok()
                 });
             return Some(Copy::Tombstone {
                 verified,
@@ -843,6 +915,7 @@ impl Engine {
                         );
                     }
                     applied.quarantined.push(id);
+                    applied.evicted.extend(z.trim_quarantine());
                 }
                 Copy::Tombstone {
                     verified: false, ..
@@ -1094,11 +1167,11 @@ impl Engine {
                     .ok()
                     .and_then(|s| s.try_into().ok())
                     .ok_or("invalid_rotation")?;
+                // Only a device verified and listed as trusted right now.
                 let signer = peers
                     .iter()
                     .find(|p| p.device_id == r.signer_device_id)
                     .map(|p| p.public)
-                    .or_else(|| self.trust.pinned(&r.signer_device_id).copied())
                     .ok_or("invalid_rotation")?;
                 crypt::verify_rotation(
                     &signer,
