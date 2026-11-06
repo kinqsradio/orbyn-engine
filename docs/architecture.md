@@ -19,12 +19,13 @@ The plan lives in the [Orbyn platform plan](https://claude.ai/artifact/BBhxZSmXR
 | `orbyn-contracts` | Wire types; generates TypeScript into `bindings/` | Everywhere |
 | `orbyn-crypto` | Symmetric sealing, device keys, key wrapping, signatures, recovery keys | Devices (native and WebAssembly) |
 | `orbyn-sync` | Hybrid logical clocks and field-by-field merge | Devices |
+| `orbyn-planner` | Tasks, events, lists, repeat rules and their record fields | Devices |
 | `orbyn-core` | Configuration, Postgres, migrations, job queue | Server |
 | `orbyn-server` | HTTP API | Server |
 | `orbyn-worker` | Job runner | Server |
 | `orbyn-cli` | The `orbyn` binary with every role | Server |
 
-Later phases add `orbyn-planner` (planner rules), `orbyn-client` (the device engine with SQLite), `orbyn-keychain`, `orbyn-store` (the CloudKit-style record store) and `orbyn-keyservice` (HSM-held keys), as the plan describes.
+Later phases add `orbyn-client` (the device engine with SQLite), `orbyn-keychain`, `orbyn-store` (the CloudKit-style record store) and `orbyn-keyservice` (HSM-held keys), as the plan describes.
 
 ## Cryptography
 
@@ -56,3 +57,25 @@ Delivery is at least once: a crash or a lost lease runs a job again. Handlers mu
 `docker compose up -d` starts Postgres, runs `orbyn migrate`, then `orbyn serve` on `127.0.0.1:8080` and one `orbyn worker`. The image is distroless and runs as a non-root user; `orbyn health` is its health check. Logs are JSON in the image and never include request bodies.
 
 The compose Postgres trusts every connection without a password, and any container on the compose network can reach it. That is for local development only: no deployment may use `compose.yaml` or trust auth.
+
+## Repeat rules
+
+Daily, weekly (on chosen weekdays), monthly and yearly, every N periods, ending never, on an inclusive date, or after a count. The full rules a port must match are at the top of `crates/orbyn-planner/src/repeat.rs`. In short:
+- repeats work on dates, and a timed item keeps its local wall time on each date;
+- weeks start on Monday;
+- the start is the first date a series may fall on, and is not an occurrence unless it matches the rule;
+- a monthly rule on a missing day skips that month, and 29 February repeats only in leap years;
+- one query returns at most 1000 dates, and a walk looks at most 200,000 periods from the start.
+
+"This one only" skips a date; changing a single occurrence is not supported yet. "This and following" ends the series the day before and starts a new one, sharing a count so the total stays the same; it is refused at the first occurrence, where the whole series should be edited instead.
+
+## Records
+
+A task or event is stored as fields, each stamped for merging: `kind`, `title`, `notes`, `list_id`, `due`, `priority`, `done_at`, `deleted_at` and `repeat` (the rule without its skips). Each checklist step has its own `checklist.<id>.title`, `.done` and `.order` fields, plus `.removed` once deleted. Each skipped date is a `repeat.skip.<date>` field, `false` once unskipped. So two devices that each add a step, tick a step, reorder or skip a date keep both changes. Step orders are fractional keys (base-62 strings, `orbyn_planner::order`), so inserting a step anywhere changes only that step. Steps sort by key, then by id, so two devices that pick the same key still agree. The key algorithm is written out in `order.rs` for ports; keys are at most 1024 characters and grow about one character per six inserts in one spot or appends at the end. Restoring a deleted step writes `.removed: false`. Edits are sent with `Item::changed_fields`, which includes the removals.
+
+Reading a record checks it fully: the repeat rule, unique step ids and valid order keys. A rule that carries skips inline is refused, because skips live only in their own fields. A missing or malformed field is refused, never guessed. Unknown fields are ignored. One merge result is repaired instead of refused: a repeating item's due date that is before its series start, or on a date the rule no longer falls on (one device moved the series while another completed an occurrence), moves to the next occurrence, keeping its time of day.
+
+Known limits, to revisit with compaction:
+- Removal markers (`.removed`, `false` skips) are never cleaned up yet.
+- A skip that reaches a record after another device split the series lands on the old part, so the date still shows in the new part.
+- A skip made while another device turned repeat off returns if repeat is turned on again.
