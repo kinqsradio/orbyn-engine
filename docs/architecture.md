@@ -21,11 +21,12 @@ The plan lives in the [Orbyn platform plan](https://claude.ai/artifact/BBhxZSmXR
 | `orbyn-auth-client` | The OPAQUE ciphersuite, the device side of sign-in, the messages devices sign | Devices (native and WebAssembly); the server uses its ciphersuite |
 | `orbyn-sync` | Hybrid logical clocks and field-by-field merge | Devices |
 | `orbyn-core` | Configuration, Postgres, migrations, job queue, accounts and devices | Server |
-| `orbyn-server` | HTTP API | Server |
+| `orbyn-store` | The CloudKit-style record store: zones, encrypted records, change tokens, uploads, live notices | Server |
+| `orbyn-server` | HTTP API and the `/v1/sync` WebSocket | Server |
 | `orbyn-worker` | Job runner | Server |
 | `orbyn-cli` | The `orbyn` binary with every role | Server |
 
-Later phases add `orbyn-planner` (planner rules), `orbyn-client` (the device engine with SQLite), `orbyn-keychain`, `orbyn-store` (the CloudKit-style record store) and `orbyn-keyservice` (HSM-held keys), as the plan describes.
+Later phases add `orbyn-planner` (planner rules), `orbyn-client` (the device engine with SQLite), `orbyn-keychain` and `orbyn-keyservice` (HSM-held keys), as the plan describes.
 
 ## Cryptography
 
@@ -62,6 +63,22 @@ Later phases add `orbyn-planner` (planner rules), `orbyn-client` (the device eng
 - **Brute force.** Password guesses need a full OPAQUE exchange each and are limited per email and per address, with no difference between known and unknown emails. Codes are limited per approval, pending device and address.
 
 Next: passkeys (WebAuthn) as a second sign-in method, TOTP as a second factor, email verification so sign-up stops revealing taken emails, and recovery-key sign-in for Advanced protection.
+
+## Record store
+
+Modelled on CloudKit's private database. `orbyn-store` owns the behaviour; the routes only parse and map.
+
+- **Zones.** Each account has a private database of zones, one per list, project or calendar. The client names a zone (1 to 64 characters, no control characters); the name is unique per account. A zone has an owner, and a `zone_participants` table waits for sharing; until then only the owner reaches a zone, and another account's request answers `zone_not_found` as if it did not exist. At most 1000 live zones per account (`too_many_zones`).
+- **Records.** A record has a zone, an id (1 to 128 characters), a type (1 to 64), a version, ciphertext (1 byte to 256 KiB), a wrapped record key (at most 1 KiB), the author device and a time. A tombstone keeps the id, type and version and drops both byte fields. At most 100,000 live records per zone (`too_many_records`); tombstones do not count.
+- **What the server sees.** Zone names, record ids and types, versions, sizes, times and which device wrote what. Never the content: the ciphertext and the wrapped key are opaque bytes it never parses. Notices and jobs carry a zone and a token, never record data.
+- **Authorization.** Every store operation checks in its own transaction that the session's device belongs to the account and is trusted right now. Writes hold the device row (`FOR SHARE`), so a removal waits for an upload in flight and the next request is refused. Pending and removed devices get `device_not_trusted`.
+- **Versions and change tokens.** Each zone has a sequence. A write locks the zone row and takes the next values, so writes in a zone commit one after another, in sequence order. A record's version is the sequence of the write that produced it, and a change token is 16 bytes of zone id and 8 of sequence, base64url. `GET /v1/zones/{zone}/changes?since=` returns the latest state of each record changed after the token, oldest first, at most 200 records or about 4 MiB (always at least one), with the next token and `more`. Without `since` it starts at the beginning. A token from another zone, past the zone's sequence or malformed is `invalid_change_token`. A record changed twice appears once, at its last position.
+- **Uploads are atomic.** `POST /v1/zones/{zone}/changes` takes up to 200 saves and deletes for distinct records, at most 4 MiB of bytes. Each names the version it replaces (`null` to create; a delete names one). If any record's version differs, nothing is written and the answer is 409 `record_changed` with every conflicting record and the server's copy (a tombstone included, `null` if it never existed), like CloudKit's `serverRecordChanged`. We chose all or nothing over per-record results because a batch is usually one user action spanning records (a task and its list order), and a half-applied batch would leave other devices with a state no device ever had; the client merges the conflicts with `orbyn-sync` and uploads again. A save over a tombstone names the tombstone's version.
+- **Idempotency.** Every upload carries a client-made `operation_id` (a UUID). The applied result is stored with a SHA-256 of the batch for seven days; the same id and batch again returns that result with `replayed: true` and writes nothing. The same id with a different batch is `operation_reused`. The zone lock makes concurrent retries wait for the first. A failed upload stores nothing, so it can be retried as is.
+- **Deleting a zone** turns every live record into a tombstone, each with a new version, takes one more step for the deletion itself, and marks the zone deleted. Changes still list the tombstones with `zone_deleted: true`; uploads answer `zone_deleted`. `PUT` brings the zone back empty with its sequence moved on, so old tokens keep working.
+- **Live notices.** After each committed change, `pg_notify` on `orbyn_zone_changes` inside the writing transaction carries the account, author device, zone and token. Postgres delivers it only on commit, to every replica. Each replica runs one listener and forwards notices to the account's other devices on `/v1/sync`. The socket's first message is `{"type":"auth","token":…}` within ten seconds, so the token never appears in a URL or header; then the server sends `ready`, `zone_changed` and `resync`. Notices are a hint: on `ready`, on `resync` (sent after the listener reconnects or when a device falls behind), and after any gap, a device compares every zone's token from `GET /v1/zones`. The socket checks its session again every five minutes and closes when it ends.
+- **Silent push.** A device that subscribed to a zone (`subscriptions`, all zones when `zone_id` is null) gets a `zone_changed` job enqueued in the writing transaction, with the idempotency key `<zone id>:<sequence>`, unless it wrote the change itself. The worker's handler is the hook for APNs and FCM; until those exist it does nothing.
+- **Request limits.** The upload route accepts bodies up to 6 MiB; every other route 64 KiB. A WebSocket message from a device is at most 16 KiB.
 
 ## Merging
 

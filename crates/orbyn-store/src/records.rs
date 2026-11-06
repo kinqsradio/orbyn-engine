@@ -1,0 +1,464 @@
+//! Uploading and fetching records.
+
+use crate::zones::find;
+use crate::{
+    Change, ChangeToken, Changes, Conflict, Record, Result, Saved, Store, StoreError, Upload,
+    UploadResult, announce, check_zone_name, require_trusted, valid_name,
+};
+use chrono::{DateTime, Utc};
+use orbyn_core::accounts::Session;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
+use uuid::Uuid;
+
+/// How long an operation id is remembered.
+pub const OPERATION_TTL_DAYS: i32 = 7;
+const UPLOAD_DIGEST_CONTEXT: &[u8] = b"orbyn/upload/v1";
+
+/// What an applied upload stored for its replays.
+#[derive(Serialize, Deserialize)]
+struct Stored {
+    seq: i64,
+    modified_at_micros: i64,
+    records: Vec<(String, String, i64, bool)>,
+}
+
+#[derive(sqlx::FromRow)]
+struct RecordRow {
+    record_id: String,
+    record_type: String,
+    version: i64,
+    ciphertext: Option<Vec<u8>>,
+    wrapped_key: Option<Vec<u8>>,
+    author_device_id: Uuid,
+    modified_at: DateTime<Utc>,
+    deleted: bool,
+}
+
+/// A record and the bytes of the page up to and including it.
+#[derive(sqlx::FromRow)]
+struct PageRow {
+    #[sqlx(flatten)]
+    record: RecordRow,
+    running: i64,
+}
+
+fn record(row: RecordRow) -> Record {
+    Record {
+        record_id: row.record_id,
+        record_type: row.record_type,
+        version: row.version,
+        ciphertext: row.ciphertext,
+        wrapped_key: row.wrapped_key,
+        author_device_id: row.author_device_id,
+        modified_at: row.modified_at,
+        deleted: row.deleted,
+    }
+}
+
+/// A SHA-256 over every field of the batch, each length-prefixed, so a reused
+/// operation id with different content is caught.
+fn digest(upload: &Upload) -> [u8; 32] {
+    fn field(hash: &mut Sha256, bytes: &[u8]) {
+        hash.update((bytes.len() as u64).to_be_bytes());
+        hash.update(bytes);
+    }
+    let mut hash = Sha256::new();
+    field(&mut hash, UPLOAD_DIGEST_CONTEXT);
+    for change in &upload.changes {
+        match change {
+            Change::Save {
+                record_id,
+                record_type,
+                expected_version,
+                ciphertext,
+                wrapped_key,
+            } => {
+                field(&mut hash, b"save");
+                field(&mut hash, record_id.as_bytes());
+                field(&mut hash, record_type.as_bytes());
+                match expected_version {
+                    Some(v) => field(&mut hash, &v.to_be_bytes()),
+                    None => field(&mut hash, b""),
+                }
+                field(&mut hash, ciphertext);
+                field(&mut hash, wrapped_key);
+            }
+            Change::Delete {
+                record_id,
+                expected_version,
+            } => {
+                field(&mut hash, b"delete");
+                field(&mut hash, record_id.as_bytes());
+                field(&mut hash, &expected_version.to_be_bytes());
+            }
+        }
+    }
+    hash.finalize().into()
+}
+
+impl Store {
+    fn check_upload(&self, upload: &Upload) -> Result<()> {
+        let limits = &self.limits;
+        if upload.changes.is_empty() || upload.changes.len() > limits.max_batch {
+            return Err(StoreError::BatchTooLarge);
+        }
+        let mut seen = HashSet::new();
+        let mut bytes = 0usize;
+        for change in &upload.changes {
+            if !valid_name(change.record_id(), 128) {
+                return Err(StoreError::InvalidRecord);
+            }
+            if !seen.insert(change.record_id()) {
+                return Err(StoreError::DuplicateRecord);
+            }
+            if let Some(v) = change.expected_version()
+                && v < 0
+            {
+                return Err(StoreError::InvalidRecord);
+            }
+            if let Change::Save {
+                record_type,
+                ciphertext,
+                wrapped_key,
+                ..
+            } = change
+            {
+                if !valid_name(record_type, 64) || ciphertext.is_empty() {
+                    return Err(StoreError::InvalidRecord);
+                }
+                if ciphertext.len() > limits.max_ciphertext
+                    || wrapped_key.len() > limits.max_wrapped_key
+                {
+                    return Err(StoreError::RecordTooLarge);
+                }
+                bytes += ciphertext.len() + wrapped_key.len();
+            }
+        }
+        if bytes > limits.max_batch_bytes {
+            return Err(StoreError::BatchTooLarge);
+        }
+        Ok(())
+    }
+
+    /// Applies the batch atomically. Every change names the version it
+    /// replaces (`None` to create); if any record's version differs, nothing is
+    /// written and [`StoreError::RecordChanged`] lists every such record with
+    /// the server's copy. The same operation id again returns the first result.
+    pub async fn upload(
+        &self,
+        session: &Session,
+        zone: &str,
+        upload: &Upload,
+    ) -> Result<UploadResult> {
+        check_zone_name(zone)?;
+        self.check_upload(upload)?;
+        let request_digest = digest(upload);
+
+        let mut tx = self.pool.begin().await?;
+        require_trusted(&mut *tx, session, true).await?;
+        let row = find(&mut *tx, session, zone, true).await?;
+
+        // The zone lock is held, so a concurrent retry of the same operation
+        // waits here and then finds this one's result.
+        let previous: Option<(Vec<u8>, serde_json::Value)> = sqlx::query_as(
+            "SELECT request_digest, result FROM zone_operations
+             WHERE zone_id = $1 AND operation_id = $2
+               AND created_at > now() - make_interval(days => $3)",
+        )
+        .bind(row.id)
+        .bind(upload.operation_id)
+        .bind(OPERATION_TTL_DAYS)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((stored_digest, result)) = previous {
+            if stored_digest != request_digest {
+                return Err(StoreError::OperationReused);
+            }
+            let stored: Stored =
+                serde_json::from_value(result).map_err(|_| StoreError::Internal)?;
+            tx.commit().await?;
+            return replay(row.id, stored);
+        }
+        if row.deleted {
+            return Err(StoreError::ZoneDeleted);
+        }
+
+        let ids: Vec<&str> = upload.changes.iter().map(Change::record_id).collect();
+        let current: HashMap<String, Record> = sqlx::query_as::<_, RecordRow>(
+            "SELECT record_id, record_type, version, ciphertext, wrapped_key, author_device_id,
+                    modified_at, deleted
+             FROM records WHERE zone_id = $1 AND record_id = ANY($2)",
+        )
+        .bind(row.id)
+        .bind(&ids)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(|r| (r.record_id.clone(), record(r)))
+        .collect();
+
+        let mut conflicts = Vec::new();
+        let mut live_delta: i64 = 0;
+        for change in &upload.changes {
+            let server = current.get(change.record_id());
+            let matches = match (change.expected_version(), server) {
+                (None, None) => true,
+                (Some(expected), Some(record)) => record.version == expected,
+                _ => false,
+            };
+            if !matches {
+                conflicts.push(Conflict {
+                    record_id: change.record_id().to_owned(),
+                    server_record: server.cloned(),
+                });
+                continue;
+            }
+            let was_live = server.is_some_and(|r| !r.deleted);
+            live_delta += match (change, was_live) {
+                (Change::Save { .. }, false) => 1,
+                (Change::Delete { .. }, true) => -1,
+                _ => 0,
+            };
+        }
+        if !conflicts.is_empty() {
+            return Err(StoreError::RecordChanged(conflicts));
+        }
+        let live = i64::from(row.live_records) + live_delta;
+        if live > i64::from(self.limits.max_records_per_zone) {
+            return Err(StoreError::TooManyRecords);
+        }
+
+        let modified_at: DateTime<Utc> = sqlx::query_scalar("SELECT now()")
+            .fetch_one(&mut *tx)
+            .await?;
+        let mut saved = Vec::with_capacity(upload.changes.len());
+        let mut seq = row.seq;
+        for change in &upload.changes {
+            seq += 1;
+            let (record_type, ciphertext, wrapped_key, deleted) = match change {
+                Change::Save {
+                    record_type,
+                    ciphertext,
+                    wrapped_key,
+                    ..
+                } => (
+                    record_type.clone(),
+                    Some(ciphertext.as_slice()),
+                    Some(wrapped_key.as_slice()),
+                    false,
+                ),
+                Change::Delete { record_id, .. } => {
+                    // The conflict check found the record, so it has a type.
+                    let kept = current
+                        .get(record_id)
+                        .map(|r| r.record_type.clone())
+                        .ok_or(StoreError::Internal)?;
+                    (kept, None, None, true)
+                }
+            };
+            sqlx::query(
+                "INSERT INTO records (zone_id, record_id, record_type, version, ciphertext,
+                                      wrapped_key, author_device_id, modified_at, deleted)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                 ON CONFLICT (zone_id, record_id) DO UPDATE SET
+                     record_type = EXCLUDED.record_type, version = EXCLUDED.version,
+                     ciphertext = EXCLUDED.ciphertext, wrapped_key = EXCLUDED.wrapped_key,
+                     author_device_id = EXCLUDED.author_device_id,
+                     modified_at = EXCLUDED.modified_at, deleted = EXCLUDED.deleted",
+            )
+            .bind(row.id)
+            .bind(change.record_id())
+            .bind(&record_type)
+            .bind(seq)
+            .bind(ciphertext)
+            .bind(wrapped_key)
+            .bind(session.device_id)
+            .bind(modified_at)
+            .bind(deleted)
+            .execute(&mut *tx)
+            .await?;
+            saved.push(Saved {
+                record_id: change.record_id().to_owned(),
+                record_type,
+                version: seq,
+                deleted,
+            });
+        }
+        sqlx::query("UPDATE zones SET seq = $2, live_records = $3 WHERE id = $1")
+            .bind(row.id)
+            .bind(seq)
+            .bind(i32::try_from(live).map_err(|_| StoreError::Internal)?)
+            .execute(&mut *tx)
+            .await?;
+
+        let stored = Stored {
+            seq,
+            modified_at_micros: modified_at.timestamp_micros(),
+            records: saved
+                .iter()
+                .map(|s| {
+                    (
+                        s.record_id.clone(),
+                        s.record_type.clone(),
+                        s.version,
+                        s.deleted,
+                    )
+                })
+                .collect(),
+        };
+        sqlx::query(
+            "DELETE FROM zone_operations
+             WHERE zone_id = $1 AND created_at < now() - make_interval(days => $2)",
+        )
+        .bind(row.id)
+        .bind(OPERATION_TTL_DAYS)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO zone_operations (zone_id, operation_id, request_digest, result)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (zone_id, operation_id) DO UPDATE SET
+                 request_digest = EXCLUDED.request_digest, result = EXCLUDED.result,
+                 created_at = now()",
+        )
+        .bind(row.id)
+        .bind(upload.operation_id)
+        .bind(request_digest.as_slice())
+        .bind(serde_json::to_value(&stored).map_err(|_| StoreError::Internal)?)
+        .execute(&mut *tx)
+        .await?;
+
+        let token = ChangeToken::new(row.id, seq);
+        announce(&mut tx, session, row.id, zone, &token).await?;
+        tx.commit().await?;
+        Ok(UploadResult {
+            token,
+            modified_at,
+            records: saved,
+            replayed: false,
+        })
+    }
+
+    /// The changes after `since` (the start of the zone when `None`), oldest
+    /// first, with the latest state of each record. A token from another zone
+    /// or past the zone's sequence is refused.
+    pub async fn fetch_changes(
+        &self,
+        session: &Session,
+        zone: &str,
+        since: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Changes> {
+        check_zone_name(zone)?;
+        let limit = match limit {
+            None => self.limits.max_fetch,
+            Some(n) if (1..=self.limits.max_fetch).contains(&n) => n,
+            Some(_) => return Err(StoreError::BatchTooLarge),
+        };
+        require_trusted(&self.pool, session, false).await?;
+        // The zone's sequence is read first: every write up to it has
+        // committed, because writes hold the zone row until they commit.
+        let row = find(&self.pool, session, zone, false).await?;
+        let from = match since {
+            None => 0,
+            Some(text) => {
+                let token = ChangeToken::parse(text).ok_or(StoreError::InvalidToken)?;
+                if !token.fits(row.id, row.seq) {
+                    return Err(StoreError::InvalidToken);
+                }
+                token.seq()
+            }
+        };
+        let fetch = i64::try_from(limit + 1).map_err(|_| StoreError::Internal)?;
+        let rows: Vec<PageRow> =
+            sqlx::query_as(
+                "SELECT record_id, record_type, version, ciphertext, wrapped_key, author_device_id,
+                        modified_at, deleted,
+                        (sum(coalesce(octet_length(ciphertext), 0) + coalesce(octet_length(wrapped_key), 0))
+                            OVER (ORDER BY version))::bigint AS running
+                 FROM records WHERE zone_id = $1 AND version > $2 AND version <= $3
+                 ORDER BY version LIMIT $4",
+            )
+            .bind(row.id)
+            .bind(from)
+            .bind(row.seq)
+            .bind(fetch)
+            .fetch_all(&self.pool)
+            .await?;
+        let mut records = Vec::new();
+        let mut more = false;
+        for (i, row) in rows.into_iter().enumerate() {
+            if i >= limit || (i > 0 && row.running > self.limits.fetch_bytes) {
+                more = true;
+                break;
+            }
+            records.push(record(row.record));
+        }
+        let seq = match (more, records.last()) {
+            (true, Some(last)) => last.version,
+            _ => row.seq,
+        };
+        Ok(Changes {
+            records,
+            token: ChangeToken::new(row.id, seq),
+            more,
+            zone_deleted: row.deleted,
+        })
+    }
+}
+
+fn replay(zone: Uuid, stored: Stored) -> Result<UploadResult> {
+    Ok(UploadResult {
+        token: ChangeToken::new(zone, stored.seq),
+        modified_at: DateTime::from_timestamp_micros(stored.modified_at_micros)
+            .ok_or(StoreError::Internal)?,
+        records: stored
+            .records
+            .into_iter()
+            .map(|(record_id, record_type, version, deleted)| Saved {
+                record_id,
+                record_type,
+                version,
+                deleted,
+            })
+            .collect(),
+        replayed: true,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn save(id: &str, bytes: &[u8]) -> Change {
+        Change::Save {
+            record_id: id.into(),
+            record_type: "task".into(),
+            expected_version: None,
+            ciphertext: bytes.to_vec(),
+            wrapped_key: vec![1; 8],
+        }
+    }
+
+    #[test]
+    fn the_digest_covers_every_field() {
+        let op = Uuid::new_v4();
+        let a = Upload {
+            operation_id: op,
+            changes: vec![save("a", b"one")],
+        };
+        let b = Upload {
+            operation_id: op,
+            changes: vec![save("a", b"two")],
+        };
+        let c = Upload {
+            operation_id: op,
+            changes: vec![save("ab", b"")],
+        };
+        assert_eq!(digest(&a), digest(&a.clone()));
+        assert_ne!(digest(&a), digest(&b));
+        assert_ne!(digest(&a), digest(&c));
+    }
+}
