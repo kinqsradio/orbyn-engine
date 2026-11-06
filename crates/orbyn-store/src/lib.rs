@@ -21,12 +21,14 @@
 mod inflight;
 mod keychain;
 mod live;
+mod purge;
 mod records;
 mod token;
 mod zones;
 
 pub use keychain::{Envelope, KEY_ID_LEN, NewEnvelope, Rotation};
 pub use live::{Feed, Hub, Notice};
+pub use purge::{Purged, purge};
 pub use token::ChangeToken;
 
 use chrono::{DateTime, Utc};
@@ -126,8 +128,16 @@ pub enum StoreError {
     ZoneNotFound,
     #[error("the zone was deleted")]
     ZoneDeleted,
+    /// A deleted zone is being purged and cannot be brought back; its name is free once the purge ends.
+    #[error("the zone is being purged and cannot be restored yet")]
+    ZonePurging,
     #[error("the change token is not valid for this zone")]
     InvalidToken,
+    /// Tombstones the device has not seen were purged; fetch the zone from the start.
+    #[error(
+        "the change token is older than the zone's purged history; fetch the zone from the start"
+    )]
+    TokenExpired,
     /// The atomic upload wrote nothing. Each conflict carries the server's record.
     #[error("records changed on the server")]
     RecordChanged(Vec<Conflict>),
@@ -277,6 +287,23 @@ pub struct Store {
     hub: Hub,
     limits: Limits,
     in_flight: Arc<inflight::InFlight>,
+    /// Tests only: runs between a fetch reading the zone and reading its
+    /// records, to make a purge land in that gap.
+    #[cfg(test)]
+    gap: Option<Gap>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct Gap(
+    Arc<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>,
+);
+
+#[cfg(test)]
+impl std::fmt::Debug for Gap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Gap")
+    }
 }
 
 impl Store {
@@ -286,6 +313,8 @@ impl Store {
             hub,
             limits: Limits::default(),
             in_flight: Arc::default(),
+            #[cfg(test)]
+            gap: None,
         }
     }
 
@@ -386,6 +415,9 @@ async fn announce(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod race_tests;
 
 #[cfg(test)]
 mod tests {

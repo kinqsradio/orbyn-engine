@@ -62,6 +62,7 @@ impl From<ClientError> for Error {
             ClientError::Mismatch => "mismatch",
             ClientError::InvalidInput => "invalid_input",
             ClientError::Random => "random_failed",
+            ClientError::ExpiredAgain => "expired_again",
         };
         error(code, err)
     }
@@ -563,11 +564,37 @@ impl SyncEngine {
         Ok(self.engine.abandon_upload(zone)?)
     }
 
+    /// Call on a `token_expired` answer to a fetch or an upload: the token is
+    /// forgotten, so `token(zone)` is empty and the zone is fetched from the start.
+    #[wasm_bindgen(js_name = tokenExpired)]
+    pub fn token_expired(&mut self, zone: &str) -> Result<()> {
+        Ok(self.engine.token_expired(zone)?)
+    }
+
     /// Applies one `ZoneChanges` page; returns what changed (`Applied`).
     #[wasm_bindgen(js_name = applyChanges)]
     pub fn apply_changes(&mut self, zone: &str, page_json: &str, now: f64) -> Result<String> {
         let page: wire::ZoneChanges = parse(page_json)?;
         to_json(&self.engine.apply_changes(zone, &page, millis(now))?)
+    }
+
+    /// Like `applyChanges`, for a page fetched with `since` (empty for a fetch
+    /// from the start). Required while a zone is fetched again after
+    /// `tokenExpired`; a page fetched with another token is refused.
+    #[wasm_bindgen(js_name = applyChangesFrom)]
+    pub fn apply_changes_from(
+        &mut self,
+        zone: &str,
+        since: Option<String>,
+        page_json: &str,
+        now: f64,
+    ) -> Result<String> {
+        let page: wire::ZoneChanges = parse(page_json)?;
+        to_json(
+            &self
+                .engine
+                .apply_changes_from(zone, since.as_deref(), &page, millis(now))?,
+        )
     }
 
     /// Compares one `ZoneList` page with this device; returns `{stale, next}`.

@@ -14,6 +14,10 @@ pub(crate) struct ZoneRow {
     pub live_records: i32,
     pub total_records: i64,
     pub deleted: bool,
+    /// The highest tombstone version purged; tokens below it have expired.
+    pub purge_floor: i64,
+    /// The purge has started removing this deleted zone.
+    pub purging: bool,
 }
 
 /// The session account's zone named `name`. Only the owner can reach a zone
@@ -26,24 +30,27 @@ pub(crate) async fn find<'e, E: sqlx::PgExecutor<'e>>(
     lock: bool,
 ) -> Result<ZoneRow> {
     let sql = if lock {
-        "SELECT id, seq, live_records, total_records::bigint, deleted_at IS NOT NULL FROM zones
+        "SELECT id, seq, live_records, total_records::bigint, deleted_at IS NOT NULL, purge_floor, purging FROM zones
          WHERE owner_id = $1 AND name = $2 FOR UPDATE"
     } else {
-        "SELECT id, seq, live_records, total_records::bigint, deleted_at IS NOT NULL FROM zones
+        "SELECT id, seq, live_records, total_records::bigint, deleted_at IS NOT NULL, purge_floor, purging FROM zones
          WHERE owner_id = $1 AND name = $2"
     };
-    let row: Option<(Uuid, i64, i32, i64, bool)> = sqlx::query_as(sql)
+    let row: Option<(Uuid, i64, i32, i64, bool, i64, bool)> = sqlx::query_as(sql)
         .bind(session.account_id)
         .bind(name)
         .fetch_optional(executor)
         .await?;
-    let (id, seq, live_records, total_records, deleted) = row.ok_or(StoreError::ZoneNotFound)?;
+    let (id, seq, live_records, total_records, deleted, purge_floor, purging) =
+        row.ok_or(StoreError::ZoneNotFound)?;
     Ok(ZoneRow {
         id,
         seq,
         live_records,
         total_records,
         deleted,
+        purge_floor,
+        purging,
     })
 }
 
@@ -77,6 +84,11 @@ impl Store {
             let zone = zone_by_id(&mut tx, row.id, name).await?;
             tx.commit().await?;
             return Ok((zone, false));
+        }
+        // Once the purge has started on a deleted zone, some of its records are
+        // gone; bringing it back would hide those deletes from devices.
+        if existing.as_ref().is_some_and(|row| row.purging) {
+            return Err(StoreError::ZonePurging);
         }
         // Deleted zones count too, until a purge removes them, so creating and
         // deleting new names cannot grow without limit.

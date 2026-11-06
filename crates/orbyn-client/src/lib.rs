@@ -41,7 +41,7 @@ use orbyn_contracts as wire;
 use orbyn_crypto::{CryptoError, DeviceKeys, DevicePublic, SymmetricKey};
 use orbyn_sync::{Clock, Fields, Stamp, merge, merge_remote};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use trust::Trust;
 
 /// Saves and deletes in one upload, as the store accepts.
@@ -56,6 +56,9 @@ pub const TRASH_MILLIS: u64 = 30 * 24 * 60 * 60 * 1000;
 /// The most records a zone keeps in quarantine, and their bytes.
 pub const MAX_QUARANTINE: usize = 1000;
 pub const MAX_QUARANTINE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Restarts of one refetch before the host is told to stop.
+pub const MAX_REFETCH_RESTARTS: u8 = 3;
 
 /// What went wrong. Messages never include record content or keys.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -86,6 +89,8 @@ pub enum ClientError {
     InvalidInput,
     #[error("the system random source failed")]
     Random,
+    #[error("the zone expired again before it was fetched from the start; try again later")]
+    ExpiredAgain,
 }
 
 impl From<CryptoError> for ClientError {
@@ -203,6 +208,11 @@ struct ZoneState {
     in_flight: Option<InFlight>,
     quarantine: BTreeMap<String, Quarantined>,
     trash: BTreeMap<String, Trashed>,
+    /// Records this device held at the server's version when the zone expired,
+    /// not yet seen again. `None` outside a refetch.
+    refetch: Option<BTreeSet<String>>,
+    /// Restarts of the running refetch, because the zone expired again.
+    refetch_restarts: u8,
 }
 
 impl ZoneState {
@@ -344,6 +354,12 @@ pub struct ZoneSnapshot {
     pub trash: BTreeMap<String, Trashed>,
     #[serde(default)]
     in_flight: Option<InFlight>,
+    /// Set while the zone is fetched again from the start after
+    /// `token_expired`; see [`Engine::token_expired`].
+    #[serde(default)]
+    refetch: Option<BTreeSet<String>>,
+    #[serde(default)]
+    refetch_restarts: u8,
 }
 
 /// One device's sync engine.
@@ -419,6 +435,8 @@ impl Engine {
                     in_flight: z.in_flight,
                     quarantine: z.quarantine,
                     trash: z.trash,
+                    refetch: z.refetch,
+                    refetch_restarts: z.refetch_restarts,
                 },
             );
         }
@@ -447,6 +465,8 @@ impl Engine {
                     quarantine: z.quarantine.clone(),
                     trash: z.trash.clone(),
                     in_flight: z.in_flight.clone(),
+                    refetch: z.refetch.clone(),
+                    refetch_restarts: z.refetch_restarts,
                 };
                 (name.clone(), snapshot)
             })
@@ -800,13 +820,47 @@ impl Engine {
 
     /// Opens and merges one page of `GET /v1/zones/{zone}/changes` and moves
     /// the token on. Records that do not open are quarantined.
+    ///
+    /// While a zone is being fetched again after [`Engine::token_expired`] this
+    /// returns [`ClientError::Mismatch`]: use [`Engine::apply_changes_from`],
+    /// which can tell the refetch's own pages from any other.
     pub fn apply_changes(
         &mut self,
         zone: &str,
         page: &wire::ZoneChanges,
         now_millis: u64,
     ) -> Result<Applied> {
-        self.zone_mut(zone)?;
+        if self.zone_mut(zone)?.refetch.is_some() {
+            return Err(ClientError::Mismatch);
+        }
+        self.apply_page(zone, page, now_millis)
+    }
+
+    /// Like [`Engine::apply_changes`], for a page fetched with `since` (the
+    /// `since` query of the request, `None` for a fetch from the start). A page
+    /// fetched with any other token than the engine's current one is stale, for
+    /// example an answer that arrived after [`Engine::token_expired`], and is
+    /// refused with [`ClientError::Mismatch`] without changing anything. A
+    /// refetch ends only on the last page of its own fetch.
+    pub fn apply_changes_from(
+        &mut self,
+        zone: &str,
+        since: Option<&str>,
+        page: &wire::ZoneChanges,
+        now_millis: u64,
+    ) -> Result<Applied> {
+        if self.zone_mut(zone)?.token.as_deref() != since {
+            return Err(ClientError::Mismatch);
+        }
+        self.apply_page(zone, page, now_millis)
+    }
+
+    fn apply_page(
+        &mut self,
+        zone: &str,
+        page: &wire::ZoneChanges,
+        now_millis: u64,
+    ) -> Result<Applied> {
         let records: Vec<(String, Option<wire::Record>)> = page
             .records
             .iter()
@@ -815,9 +869,96 @@ impl Engine {
         let mut applied = self.merge_server_records(zone, records, now_millis);
         if let Some(z) = self.zones.get_mut(zone) {
             z.token = Some(page.token.clone());
+            if let Some(unseen) = z.refetch.as_mut() {
+                for record in &page.records {
+                    unseen.remove(&record.record_id);
+                }
+            }
+            if !page.more {
+                Self::finish_refetch(z, &mut applied, now_millis);
+            }
         }
         applied.more = page.more;
         Ok(applied)
+    }
+
+    /// Call when the server answers `token_expired` to a fetch or an upload of
+    /// the zone: tombstones this device has not seen were purged. It forgets
+    /// the zone's token and any upload waiting for an answer, so
+    /// [`Engine::token`] is `None` and the host fetches the zone from the start
+    /// (without `since`), page by page as usual. Local edits are kept.
+    ///
+    /// Once the last page is applied, a record this device held at a server
+    /// version that the full listing no longer has was deleted and purged. As
+    /// with any delete, it wins over local edits: the copy, edits included, goes
+    /// to the trash for 30 days (listed in `trashed`) and is not uploaded again.
+    /// No tombstone is left to verify, so the trash is what keeps a wrong
+    /// answer from losing data.
+    ///
+    /// If the zone expires again while a refetch is running (the server purged
+    /// more before it ended, so its page tokens expired), the refetch starts
+    /// over from the beginning with the records it still has to check kept, so
+    /// none is trashed early. After [`MAX_REFETCH_RESTARTS`] restarts in a row
+    /// this returns [`ClientError::ExpiredAgain`] with the state already reset
+    /// to a clean start, so the host can stop and the next sync begins afresh
+    /// instead of getting stuck on a token the server no longer accepts.
+    pub fn token_expired(&mut self, zone: &str) -> Result<()> {
+        let z = self.zone_mut(zone)?;
+        z.token = None;
+        z.in_flight = None;
+        let held = z
+            .records
+            .iter()
+            .filter(|(_, local)| local.version.is_some())
+            .map(|(id, _)| id.clone());
+        let again = z.refetch.is_some();
+        // Records already seen in the abandoned run stay to be checked: the
+        // restart lists them again, and one deleted and purged meanwhile is
+        // then caught like the rest.
+        let mut unseen = z.refetch.take().unwrap_or_default();
+        unseen.extend(held);
+        z.refetch = Some(unseen);
+        if !again {
+            z.refetch_restarts = 0;
+            return Ok(());
+        }
+        if z.refetch_restarts >= MAX_REFETCH_RESTARTS {
+            z.refetch_restarts = 0;
+            return Err(ClientError::ExpiredAgain);
+        }
+        z.refetch_restarts += 1;
+        Ok(())
+    }
+
+    /// Ends a refetch after its last page, settling the records it did not list.
+    fn finish_refetch(z: &mut ZoneState, applied: &mut Applied, now_millis: u64) {
+        z.refetch_restarts = 0;
+        let Some(unseen) = z.refetch.take() else {
+            return;
+        };
+        for id in unseen {
+            let Some(local) = z.records.get_mut(&id) else {
+                continue;
+            };
+            if local.deleted {
+                // Already deleted here and the server has nothing left to delete.
+                z.records.remove(&id);
+            } else if let Some(local) = z.records.remove(&id) {
+                // Clean or edited alike: a delete wins over edits everywhere, so
+                // the edits are in the trash, not uploaded as a new record.
+                z.trash.insert(
+                    id.clone(),
+                    Trashed {
+                        record_type: local.record_type,
+                        fields: local.fields,
+                        deleted_by: "purge".to_owned(),
+                        deleted_at_millis: now_millis,
+                    },
+                );
+                applied.trashed.push(id.clone());
+                applied.removed.push(id);
+            }
+        }
     }
 
     /// Tries every quarantined record of the zone again, after new keys or

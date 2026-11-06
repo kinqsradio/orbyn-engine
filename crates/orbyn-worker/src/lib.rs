@@ -9,6 +9,12 @@ const LEASE: Duration = Duration::from_secs(60);
 /// How often expired sign-in data is removed.
 const PRUNE_EVERY: Duration = Duration::from_secs(5 * 60);
 const IDLE: Duration = Duration::from_secs(2);
+/// How often tombstones and deleted zones past their retention are purged.
+const PURGE_EVERY: Duration = Duration::from_secs(10 * 60);
+/// Rows removed per purge step, and steps per run, so a run is bounded and a
+/// backlog drains over several runs instead of holding the database.
+const PURGE_BATCH: i64 = 1000;
+const PURGE_STEPS: usize = 50;
 
 /// What a handler decided about a job.
 #[derive(Debug, PartialEq, Eq)]
@@ -59,9 +65,18 @@ where
 }
 
 /// Claims and runs jobs until `stop` turns true.
-pub async fn run(db: Database, worker_id: String, mut stop: watch::Receiver<bool>) {
+///
+/// `retention` is how long tombstones and deleted zones are kept before the
+/// scheduled purge removes them.
+pub async fn run(
+    db: Database,
+    worker_id: String,
+    retention: Duration,
+    mut stop: watch::Receiver<bool>,
+) {
     tracing::info!(worker = %worker_id, "worker started");
     let mut next_prune = tokio::time::Instant::now();
+    let mut next_purge = tokio::time::Instant::now();
     while !*stop.borrow() {
         // Housekeeping on a schedule, not on requests, so a flood of refused
         // requests can never stop it. Every replica may run it; deletes are batched.
@@ -72,6 +87,26 @@ pub async fn run(db: Database, worker_id: String, mut stop: watch::Receiver<bool
                 Err(err) => tracing::warn!(error = %err, "could not prune sign-in data"),
             }
             next_prune = tokio::time::Instant::now() + PRUNE_EVERY;
+        }
+        if tokio::time::Instant::now() >= next_purge {
+            match orbyn_store::purge(db.pool(), retention, PURGE_BATCH, PURGE_STEPS).await {
+                Ok(p) if p.records > 0 || p.zones > 0 => {
+                    tracing::info!(
+                        tombstones = p.records,
+                        zones = p.zones,
+                        "purged expired records"
+                    );
+                    // A full run may have left more; come back soon, not in ten minutes.
+                    let full = p.records >= (PURGE_BATCH as u64) * (PURGE_STEPS as u64) / 2;
+                    next_purge =
+                        tokio::time::Instant::now() + if full { IDLE } else { PURGE_EVERY };
+                }
+                Ok(_) => next_purge = tokio::time::Instant::now() + PURGE_EVERY,
+                Err(err) => {
+                    tracing::warn!(error = %err, "could not purge expired records");
+                    next_purge = tokio::time::Instant::now() + PURGE_EVERY;
+                }
+            }
         }
         match jobs::claim(db.pool(), &worker_id, LEASE).await {
             Ok(Some(job)) => {

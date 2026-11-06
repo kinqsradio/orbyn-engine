@@ -122,7 +122,7 @@ async fn worker(config: Config) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let (tx, rx) = watch::channel(false);
     let id = format!("worker-{}", uuid::Uuid::new_v4());
-    let mut task = tokio::spawn(orbyn_worker::run(db, id, rx));
+    let mut task = tokio::spawn(orbyn_worker::run(db, id, config.purge_after, rx));
     tokio::select! {
         () = shutdown_signal() => {
             let _ = tx.send(true);
