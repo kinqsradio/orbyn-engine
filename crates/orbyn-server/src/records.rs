@@ -27,7 +27,7 @@ use uuid::Uuid;
 /// the JSON around them.
 pub const UPLOAD_BODY_LIMIT: usize = 6 * 1024 * 1024;
 /// How long a new `/v1/sync` connection may take to send its token.
-const AUTH_WAIT: Duration = Duration::from_secs(10);
+const AUTH_WAIT: Duration = Duration::from_secs(3);
 /// How often an open `/v1/sync` connection checks its session again.
 /// How often a socket checks that its session and device are still valid, so
 /// a removed device stops hearing notices within this time.
@@ -35,7 +35,56 @@ const RECHECK: Duration = Duration::from_secs(30);
 /// How long one send may take before the peer is treated as gone.
 const SEND_WAIT: Duration = Duration::from_secs(10);
 /// Sockets still waiting for their auth message, across this replica.
-static UNAUTHENTICATED: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(512);
+static UNAUTHENTICATED: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4096);
+/// Sockets one address (an IPv6 /64) may have waiting for their auth message,
+/// so one client cannot take the shared slots from everyone else.
+const WAITING_PER_ADDRESS: u32 = 8;
+static WAITING: std::sync::Mutex<Option<std::collections::HashMap<[u8; 16], u32>>> =
+    std::sync::Mutex::new(None);
+
+/// One address's waiting slot, given back when dropped.
+struct AddressSlot([u8; 16]);
+
+impl AddressSlot {
+    fn take(ip: Option<std::net::IpAddr>) -> Option<Self> {
+        let key = address_key(ip);
+        let mut guard = WAITING.lock().ok()?;
+        let map = guard.get_or_insert_with(Default::default);
+        let count = map.entry(key).or_insert(0);
+        if *count >= WAITING_PER_ADDRESS {
+            return None;
+        }
+        *count += 1;
+        Some(Self(key))
+    }
+}
+
+impl Drop for AddressSlot {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = WAITING.lock()
+            && let Some(map) = guard.as_mut()
+            && let Some(count) = map.get_mut(&self.0)
+        {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                map.remove(&self.0);
+            }
+        }
+    }
+}
+
+/// An IPv4 address as is; an IPv6 address by its /64, as the sign-in limits count it.
+fn address_key(ip: Option<std::net::IpAddr>) -> [u8; 16] {
+    match ip {
+        Some(std::net::IpAddr::V4(v4)) => v4.to_ipv6_mapped().octets(),
+        Some(std::net::IpAddr::V6(v6)) => {
+            let mut o = v6.octets();
+            o[8..].fill(0);
+            o
+        }
+        None => [0; 16],
+    }
+}
 
 pub(crate) fn routes() -> Router<AppState> {
     Router::new()
@@ -334,6 +383,7 @@ async fn fetch_changes(
 /// WebSocket, and a page on another site cannot read the token to send it.
 async fn sync(
     State(state): State<AppState>,
+    crate::accounts::Caller(client): crate::accounts::Caller,
     upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Response {
     let (Ok(accounts), Ok(store)) = (service(&state), store(&state)) else {
@@ -344,7 +394,9 @@ async fn sync(
     };
     // A bounded number of sockets may wait for their auth message, so opening
     // many without signing in cannot use up the server.
-    let Ok(waiting) = UNAUTHENTICATED.try_acquire() else {
+    let (Some(address), Ok(waiting)) =
+        (AddressSlot::take(client.ip), UNAUTHENTICATED.try_acquire())
+    else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(wire::ApiError {
@@ -357,7 +409,7 @@ async fn sync(
     let (accounts, store) = (accounts.clone(), store.clone());
     upgrade
         .max_message_size(16 * 1024)
-        .on_upgrade(move |socket| run_sync(socket, accounts, store, waiting))
+        .on_upgrade(move |socket| run_sync(socket, accounts, store, (waiting, address)))
 }
 
 /// Sends one message, giving up after [`SEND_WAIT`] so a peer that stops
@@ -394,7 +446,7 @@ async fn run_sync(
     mut socket: WebSocket,
     accounts: Accounts,
     store: Store,
-    waiting: tokio::sync::SemaphorePermit<'static>,
+    waiting: (tokio::sync::SemaphorePermit<'static>, AddressSlot),
 ) {
     let token = match tokio::time::timeout(AUTH_WAIT, socket.recv()).await {
         Ok(Some(Ok(Message::Text(text)))) => {
@@ -454,7 +506,7 @@ async fn run_sync(
                 // Pings are answered by the WebSocket layer; other messages are ignored.
                 Some(Ok(_)) => {}
             },
-            _ = recheck.tick() => match accounts.authenticate(&token).await {
+            _ = recheck.tick() => match accounts.check_session(&token).await {
                 Ok(now) if now.device_id == session.device_id
                     && now.device_state == DeviceState::Trusted => {}
                 Ok(_) | Err(AccountError::Unauthorized) => {
@@ -464,5 +516,42 @@ async fn run_sync(
                 Err(_) => {}
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod waiting_tests {
+    use super::{AddressSlot, WAITING_PER_ADDRESS, address_key};
+    use std::net::IpAddr;
+
+    #[test]
+    fn one_address_gets_a_bounded_number_of_waiting_slots() {
+        let ip: IpAddr = "203.0.113.9".parse().expect("ip");
+        let mut slots: Vec<AddressSlot> = (0..WAITING_PER_ADDRESS)
+            .map(|_| AddressSlot::take(Some(ip)).expect("slot"))
+            .collect();
+        assert!(
+            AddressSlot::take(Some(ip)).is_none(),
+            "the next one is refused"
+        );
+        let other: IpAddr = "203.0.113.10".parse().expect("ip");
+        assert!(
+            AddressSlot::take(Some(other)).is_some(),
+            "another address is unaffected"
+        );
+        slots.pop();
+        assert!(
+            AddressSlot::take(Some(ip)).is_some(),
+            "a slot comes back when dropped"
+        );
+    }
+
+    #[test]
+    fn ipv6_addresses_count_by_their_slash_64() {
+        let a: IpAddr = "2001:db8:1:2::1".parse().expect("ip");
+        let b: IpAddr = "2001:db8:1:2:ffff::9".parse().expect("ip");
+        let c: IpAddr = "2001:db8:1:3::1".parse().expect("ip");
+        assert_eq!(address_key(Some(a)), address_key(Some(b)));
+        assert_ne!(address_key(Some(a)), address_key(Some(c)));
     }
 }

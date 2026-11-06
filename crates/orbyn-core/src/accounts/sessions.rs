@@ -89,6 +89,35 @@ impl Accounts {
         })
     }
 
+    /// Like [`Accounts::authenticate`] but read-only: it neither extends the
+    /// session nor writes anything, for checks repeated on an open connection.
+    pub async fn check_session(&self, token: &str) -> Result<Session> {
+        let bytes = Zeroizing::new(
+            URL_SAFE_NO_PAD
+                .decode(token.trim())
+                .map_err(|_| AccountError::Unauthorized)?,
+        );
+        if bytes.len() != 32 {
+            return Err(AccountError::Unauthorized);
+        }
+        let row: Option<(Uuid, Uuid, Uuid, String)> = sqlx::query_as(
+            "SELECT s.id, s.account_id, s.device_id, d.state
+             FROM sessions s JOIN devices d ON d.id = s.device_id
+             WHERE s.token_digest = $1 AND s.revoked_at IS NULL AND s.expires_at > now()
+               AND d.state <> 'removed'",
+        )
+        .bind(digest(&bytes).as_slice())
+        .fetch_optional(&self.pool)
+        .await?;
+        let (id, account_id, device_id, state) = row.ok_or(AccountError::Unauthorized)?;
+        Ok(Session {
+            id,
+            account_id,
+            device_id,
+            device_state: DeviceState::parse(&state)?,
+        })
+    }
+
     /// Signs this session out.
     pub async fn revoke_session(&self, client: &Client, session: &Session) -> Result<()> {
         let mut tx = self.pool.begin().await?;

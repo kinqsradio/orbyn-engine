@@ -154,7 +154,7 @@ pub(crate) fn service(state: &AppState) -> Answer<&Accounts> {
 
 /// The caller's address, from the trusted proxy's header when one is set,
 /// otherwise from the connection.
-pub(crate) struct Caller(Client);
+pub(crate) struct Caller(pub(crate) Client);
 
 impl FromRequestParts<AppState> for Caller {
     type Rejection = Failure;
