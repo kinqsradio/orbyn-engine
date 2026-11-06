@@ -490,22 +490,26 @@ impl Accounts {
         } else {
             ("login-email", self.limits.login_per_email)
         };
-        let by_email = limits::allow(&self.pool, email_action, &email_subject, email_limit).await?
+        // Narrowest first: the address, then this email from this address, and
+        // the per-email bucket last. A start refused by an earlier limit never
+        // uses up a slot of the shared per-email bucket, so it cannot help
+        // anyone lock the owner out.
+        let allowed = limits::allow(
+            &self.pool,
+            "login-ip",
+            &ip_subject,
+            self.limits.login_per_ip,
+        )
+        .await?
             && limits::allow(
                 &self.pool,
                 "login",
                 &pair_subject,
                 self.limits.login_per_email_and_ip,
             )
-            .await?;
-        let by_ip = limits::allow(
-            &self.pool,
-            "login-ip",
-            &ip_subject,
-            self.limits.login_per_ip,
-        )
-        .await?;
-        if !(by_email && by_ip) {
+            .await?
+            && limits::allow(&self.pool, email_action, &email_subject, email_limit).await?;
+        if !allowed {
             return Err(AccountError::TooManyAttempts);
         }
         let request = CredentialRequest::<Suite>::deserialize(request)
