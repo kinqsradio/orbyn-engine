@@ -18,9 +18,11 @@ pub struct Job {
 }
 
 /// Adds a job. With an idempotency key, adding the same key for the same kind
-/// again returns the existing job's id and adds nothing.
-pub async fn enqueue(
-    pool: &PgPool,
+/// again returns the existing job's id and adds nothing. `executor` is a pool or
+/// a transaction: enqueued inside a transaction, the job exists only if that
+/// transaction commits, so a change and the work it causes cannot part.
+pub async fn enqueue<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
     kind: &str,
     payload: Value,
     idempotency_key: Option<&str>,
@@ -35,7 +37,7 @@ pub async fn enqueue(
     .bind(kind)
     .bind(payload)
     .bind(idempotency_key)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await?;
     Ok(row.0)
 }

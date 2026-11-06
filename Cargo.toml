@@ -16,6 +16,7 @@ orbyn-sync = { path = "crates/orbyn-sync" }
 orbyn-core = { path = "crates/orbyn-core" }
 orbyn-planner = { path = "crates/orbyn-planner" }
 orbyn-server = { path = "crates/orbyn-server" }
+orbyn-store = { path = "crates/orbyn-store" }
 orbyn-worker = { path = "crates/orbyn-worker" }
 
 argon2 = { version = "0.6", default-features = false, features = ["alloc"] }

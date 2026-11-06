@@ -88,8 +88,12 @@ async fn serve(config: Config) -> Result<(), String> {
             let secrets = orbyn_core::accounts::AuthSecrets::from_encoded(setup)
                 .map_err(|e| e.to_string())?;
             state = state.with_accounts(orbyn_core::Accounts::new(db.pool().clone(), secrets));
+            let hub = orbyn_store::Hub::start(db.pool().clone());
+            state = state.with_store(orbyn_store::Store::new(db.pool().clone(), hub));
         }
-        None => tracing::warn!("ORBYN_AUTH_SETUP is not set: sign-up and sign-in answer 503"),
+        None => {
+            tracing::warn!("ORBYN_AUTH_SETUP is not set: sign-up, sign-in and records answer 503")
+        }
     }
     if let Some(name) = &config.client_ip_header {
         let header = name

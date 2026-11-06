@@ -2,6 +2,7 @@
 //! domain crates.
 
 mod accounts;
+mod records;
 
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderName, HeaderValue, Method, StatusCode, header};
@@ -10,6 +11,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use orbyn_contracts::{ApiError, Health, ServiceState};
 use orbyn_core::Accounts;
+use orbyn_store::Store;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -34,6 +36,7 @@ pub const BODY_LIMIT: usize = 64 * 1024;
 pub struct AppState {
     readiness: Arc<dyn Readiness>,
     accounts: Option<Accounts>,
+    store: Option<Store>,
     client_ip_header: Option<HeaderName>,
 }
 
@@ -43,12 +46,19 @@ impl AppState {
         Self {
             readiness,
             accounts: None,
+            store: None,
             client_ip_header: None,
         }
     }
 
     pub fn with_accounts(mut self, accounts: Accounts) -> Self {
         self.accounts = Some(accounts);
+        self
+    }
+
+    /// Enables the record store routes and `/v1/sync`. They also need accounts.
+    pub fn with_store(mut self, store: Store) -> Self {
+        self.store = Some(store);
         self
     }
 
@@ -76,6 +86,7 @@ pub fn router(state: AppState, allowed_origins: &[String]) -> Router {
         .route("/health", get(health))
         .route("/ready", get(ready))
         .merge(accounts::routes())
+        .merge(records::routes())
         .fallback(not_found)
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .layer(cors)
