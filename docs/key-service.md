@@ -215,7 +215,8 @@ A cancel is a statement signed by a device (`orbyn/recovery-cancel/v1`: account,
   - a verifiable map from map key (below) to that account's own hash chain of entries.
 
   Devices ask for their account's lookup proof. It proves the full chain for the account, or proves there is none, so "nothing for your account" can be checked, not just asserted.
-- **The map key.** It is `SHA-256(orbyn/log-account/v1 ‖ the account's certified service public key)`. The key service computes it from the service key it holds for the account id, so neither the record server nor anyone else chooses where an entry is filed. A device computes the same value from the service key it verified. The map does not list accounts by id, but anyone who holds an account's service public key can look it up, and that key is given only to the account's own sessions. - **Rotating an account's service key.**
+- **The map key.** It is `SHA-256(orbyn/log-account/v1 ‖ the account's certified service public key)`. The key service computes it from the service key it holds for the account id, so neither the record server nor anyone else chooses where an entry is filed. A device computes the same value from the service key it verified. The map does not list accounts by id, but anyone who holds an account's service public key can look it up, and that key is given only to the account's own sessions.
+- **Rotating an account's service key.**
   - **Who can start it.** Only a request signed by a trusted device of the account (`orbyn/service-key-rotate/v1`), for example after a suspected leak. Identity and KEK rotations keep the X25519 key, so they do not move the map key.
   - **The link between chains.** The old chain's last entry names the new key, and the new chain's first entry links back to the old one.
   - **Devices follow the link.** They watch both chains, and alert on any rotation they did not ask for.
