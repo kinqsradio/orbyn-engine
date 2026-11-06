@@ -148,7 +148,7 @@ impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for Body<T> {
     }
 }
 
-fn service(state: &AppState) -> Answer<&Accounts> {
+pub(crate) fn service(state: &AppState) -> Answer<&Accounts> {
     state.accounts.as_ref().ok_or(Failure::Unavailable)
 }
 
@@ -175,7 +175,7 @@ impl FromRequestParts<AppState> for Caller {
 }
 
 /// A valid `Authorization: Bearer` session.
-pub(crate) struct Authed(Session);
+pub(crate) struct Authed(pub(crate) Session);
 
 impl FromRequestParts<AppState> for Authed {
     type Rejection = Failure;
@@ -205,7 +205,7 @@ fn fixed<const N: usize>(text: &str) -> Answer<[u8; N]> {
     bytes(text)?.try_into().map_err(|_| Failure::BadRequest)
 }
 
-fn encode(bytes: &[u8]) -> String {
+pub(crate) fn encode(bytes: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
@@ -213,7 +213,7 @@ fn id(text: &str) -> Answer<Uuid> {
     Uuid::parse_str(text).map_err(|_| Failure::BadRequest)
 }
 
-fn time(at: DateTime<Utc>) -> String {
+pub(crate) fn time(at: DateTime<Utc>) -> String {
     at.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
