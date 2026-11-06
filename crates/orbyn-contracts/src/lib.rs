@@ -256,7 +256,11 @@ pub struct Zone {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct ZoneList {
+    /// Up to 500 zones by name, deleted ones included.
     pub zones: Vec<Zone>,
+    /// When there are more, pass this as `after` to `GET /v1/zones` for the next page.
+    #[ts(optional)]
+    pub next: Option<String>,
 }
 
 /// `DELETE /v1/zones/{zone}`: the token after every record became a tombstone.

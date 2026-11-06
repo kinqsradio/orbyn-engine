@@ -29,7 +29,13 @@ pub const UPLOAD_BODY_LIMIT: usize = 6 * 1024 * 1024;
 /// How long a new `/v1/sync` connection may take to send its token.
 const AUTH_WAIT: Duration = Duration::from_secs(10);
 /// How often an open `/v1/sync` connection checks its session again.
-const RECHECK: Duration = Duration::from_secs(5 * 60);
+/// How often a socket checks that its session and device are still valid, so
+/// a removed device stops hearing notices within this time.
+const RECHECK: Duration = Duration::from_secs(30);
+/// How long one send may take before the peer is treated as gone.
+const SEND_WAIT: Duration = Duration::from_secs(10);
+/// Sockets still waiting for their auth message, across this replica.
+static UNAUTHENTICATED: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(512);
 
 pub(crate) fn routes() -> Router<AppState> {
     Router::new()
@@ -102,6 +108,7 @@ impl IntoResponse for Refusal {
                 (StatusCode::UNPROCESSABLE_ENTITY, "recipient_not_trusted")
             }
             StoreError::TooManyEnvelopes => (StatusCode::UNPROCESSABLE_ENTITY, "too_many_envelopes"),
+            StoreError::QuotaExceeded => (StatusCode::UNPROCESSABLE_ENTITY, "quota_exceeded"),
             StoreError::RecordChanged(conflicts) => {
                 let body = wire::RecordChanged {
                     code: "record_changed".to_owned(),
@@ -240,12 +247,22 @@ async fn create_zone(
     Ok((status, Json(wire_zone(zone))))
 }
 
+#[derive(Deserialize)]
+struct ZonesQuery {
+    after: Option<String>,
+}
+
 async fn list_zones(
     State(state): State<AppState>,
     Authed(session): Authed,
+    query: Result<Query<ZonesQuery>, QueryRejection>,
 ) -> Answer<Json<wire::ZoneList>> {
-    let zones = store(&state)?.list_zones(&session).await?;
+    let Query(query) = query.map_err(|_| Refusal::BadRequest)?;
+    let (zones, next) = store(&state)?
+        .list_zones(&session, query.after.as_deref())
+        .await?;
     Ok(Json(wire::ZoneList {
+        next,
         zones: zones.into_iter().map(wire_zone).collect(),
     }))
 }
@@ -330,17 +347,34 @@ async fn sync(
     let Ok(upgrade) = upgrade else {
         return Refusal::BadRequest.into_response();
     };
+    // A bounded number of sockets may wait for their auth message, so opening
+    // many without signing in cannot use up the server.
+    let Ok(waiting) = UNAUTHENTICATED.try_acquire() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(wire::ApiError {
+                code: "too_many_attempts".to_owned(),
+                message: "Too many connections are waiting; try again shortly.".to_owned(),
+            }),
+        )
+            .into_response();
+    };
     let (accounts, store) = (accounts.clone(), store.clone());
     upgrade
         .max_message_size(16 * 1024)
-        .on_upgrade(move |socket| run_sync(socket, accounts, store))
+        .on_upgrade(move |socket| run_sync(socket, accounts, store, waiting))
 }
 
+/// Sends one message, giving up after [`SEND_WAIT`] so a peer that stops
+/// reading cannot hold the connection's task.
 async fn send(socket: &mut WebSocket, message: &wire::SyncServerMessage) -> bool {
-    match serde_json::to_string(message) {
-        Ok(text) => socket.send(Message::Text(text.into())).await.is_ok(),
-        Err(_) => false,
-    }
+    let Ok(text) = serde_json::to_string(message) else {
+        return false;
+    };
+    matches!(
+        tokio::time::timeout(SEND_WAIT, socket.send(Message::Text(text.into()))).await,
+        Ok(Ok(()))
+    )
 }
 
 /// Sends an error and closes with 1008 (policy violation).
@@ -361,7 +395,12 @@ async fn refuse(mut socket: WebSocket, code: &str, message: &str) {
         .await;
 }
 
-async fn run_sync(mut socket: WebSocket, accounts: Accounts, store: Store) {
+async fn run_sync(
+    mut socket: WebSocket,
+    accounts: Accounts,
+    store: Store,
+    waiting: tokio::sync::SemaphorePermit<'static>,
+) {
     let token = match tokio::time::timeout(AUTH_WAIT, socket.recv()).await {
         Ok(Some(Ok(Message::Text(text)))) => {
             match serde_json::from_str::<wire::SyncClientMessage>(&text) {
@@ -381,6 +420,7 @@ async fn run_sync(mut socket: WebSocket, accounts: Accounts, store: Store) {
         Ok(session) => session,
         Err(_) => return refuse(socket, "unauthorized", "The session is not valid.").await,
     };
+    drop(waiting);
     let mut feed = match store.feed(&session).await {
         Ok(feed) => feed,
         Err(StoreError::DeviceNotTrusted) => {

@@ -12,6 +12,7 @@ pub(crate) struct ZoneRow {
     pub id: Uuid,
     pub seq: i64,
     pub live_records: i32,
+    pub total_records: i64,
     pub deleted: bool,
 }
 
@@ -25,25 +26,29 @@ pub(crate) async fn find<'e, E: sqlx::PgExecutor<'e>>(
     lock: bool,
 ) -> Result<ZoneRow> {
     let sql = if lock {
-        "SELECT id, seq, live_records, deleted_at IS NOT NULL FROM zones
+        "SELECT id, seq, live_records, total_records::bigint, deleted_at IS NOT NULL FROM zones
          WHERE owner_id = $1 AND name = $2 FOR UPDATE"
     } else {
-        "SELECT id, seq, live_records, deleted_at IS NOT NULL FROM zones
+        "SELECT id, seq, live_records, total_records::bigint, deleted_at IS NOT NULL FROM zones
          WHERE owner_id = $1 AND name = $2"
     };
-    let row: Option<(Uuid, i64, i32, bool)> = sqlx::query_as(sql)
+    let row: Option<(Uuid, i64, i32, i64, bool)> = sqlx::query_as(sql)
         .bind(session.account_id)
         .bind(name)
         .fetch_optional(executor)
         .await?;
-    let (id, seq, live_records, deleted) = row.ok_or(StoreError::ZoneNotFound)?;
+    let (id, seq, live_records, total_records, deleted) = row.ok_or(StoreError::ZoneNotFound)?;
     Ok(ZoneRow {
         id,
         seq,
         live_records,
+        total_records,
         deleted,
     })
 }
+
+/// Zones per page of `list_zones`.
+const ZONE_PAGE: i64 = 500;
 
 impl Store {
     /// Creates the zone, or returns it if it exists. A deleted zone comes back
@@ -52,13 +57,15 @@ impl Store {
     pub async fn create_zone(&self, session: &Session, name: &str) -> Result<(Zone, bool)> {
         check_zone_name(name)?;
         let mut tx = self.pool.begin().await?;
-        require_trusted(&mut *tx, session, true).await?;
         // Serializes zone creation per account, so two creations cannot both
         // pass the zone limit. NO KEY UPDATE does not block foreign-key checks.
+        // The account is locked before the device, the same order removing a
+        // device uses, so the two can never deadlock.
         sqlx::query("SELECT 1 FROM accounts WHERE id = $1 FOR NO KEY UPDATE")
             .bind(session.account_id)
             .execute(&mut *tx)
             .await?;
+        require_trusted(&mut *tx, session, true).await?;
         let existing = match find(&mut *tx, session, name, true).await {
             Ok(row) => Some(row),
             Err(StoreError::ZoneNotFound) => None,
@@ -71,13 +78,13 @@ impl Store {
             tx.commit().await?;
             return Ok((zone, false));
         }
-        let live: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM zones WHERE owner_id = $1 AND deleted_at IS NULL",
-        )
-        .bind(session.account_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        if live >= self.limits.max_zones {
+        // Deleted zones count too, until a purge removes them, so creating and
+        // deleting new names cannot grow without limit.
+        let live: i64 = sqlx::query_scalar("SELECT count(*) FROM zones WHERE owner_id = $1")
+            .bind(session.account_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if existing.is_none() && live >= self.limits.max_zones {
             return Err(StoreError::TooManyZones);
         }
         let id = match existing {
@@ -109,16 +116,27 @@ impl Store {
 
     /// Every zone of the account, deleted ones included, by name. A device
     /// compares each token with its own to find what to fetch.
-    pub async fn list_zones(&self, session: &Session) -> Result<Vec<Zone>> {
+    /// One page of zones by name, starting after `after`. The second value is
+    /// the cursor for the next page, when there is one.
+    pub async fn list_zones(
+        &self,
+        session: &Session,
+        after: Option<&str>,
+    ) -> Result<(Vec<Zone>, Option<String>)> {
         require_trusted(&self.pool, session, false).await?;
+        let page = ZONE_PAGE;
         let rows: Vec<(Uuid, String, i64, bool, DateTime<Utc>)> = sqlx::query_as(
             "SELECT id, name, seq, deleted_at IS NOT NULL, created_at FROM zones
-             WHERE owner_id = $1 ORDER BY name",
+             WHERE owner_id = $1 AND ($2::text IS NULL OR name > $2)
+             ORDER BY name LIMIT $3",
         )
         .bind(session.account_id)
+        .bind(after)
+        .bind(page + 1)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
+        let more = rows.len() as i64 > page;
+        let zones: Vec<Zone> = rows
             .into_iter()
             .map(|(id, name, seq, deleted, created_at)| Zone {
                 name,
@@ -126,7 +144,14 @@ impl Store {
                 deleted,
                 created_at,
             })
-            .collect())
+            .take(page as usize)
+            .collect();
+        let next = if more {
+            zones.last().map(|z| z.name.clone())
+        } else {
+            None
+        };
+        Ok((zones, next))
     }
 
     /// Turns every live record of the zone into a tombstone, each with its own
@@ -159,7 +184,7 @@ impl Store {
         // everything still sees the token move.
         let seq = zone.seq + tombstoned + 1;
         sqlx::query(
-            "UPDATE zones SET seq = $2, live_records = 0, deleted_at = now() WHERE id = $1",
+            "UPDATE zones SET seq = $2, live_records = 0, stored_bytes = 0, deleted_at = now() WHERE id = $1",
         )
         .bind(zone.id)
         .bind(seq)

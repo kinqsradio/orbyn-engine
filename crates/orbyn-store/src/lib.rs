@@ -45,6 +45,8 @@ pub struct Limits {
     pub max_zones: i64,
     /// Live (not deleted) records per zone.
     pub max_records_per_zone: i32,
+    /// Bytes of ciphertext and wrapped keys one account may store.
+    pub max_account_bytes: i64,
     /// Saves and deletes in one upload.
     pub max_batch: usize,
     /// Ciphertext and wrapped keys in one upload, in bytes.
@@ -69,6 +71,7 @@ impl Default for Limits {
         Self {
             max_zones: 1000,
             max_records_per_zone: 100_000,
+            max_account_bytes: 1024 * 1024 * 1024,
             max_batch: 200,
             max_batch_bytes: 4 * 1024 * 1024,
             max_ciphertext: 256 * 1024,
@@ -118,6 +121,8 @@ pub enum StoreError {
     RecipientNotTrusted,
     #[error("the device has too many key envelopes")]
     TooManyEnvelopes,
+    #[error("the account stores as many bytes as it may")]
+    QuotaExceeded,
     #[error("the database failed")]
     Database(#[from] sqlx::Error),
     #[error("an internal step failed")]

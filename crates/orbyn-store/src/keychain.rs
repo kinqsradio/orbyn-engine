@@ -52,14 +52,19 @@ impl Store {
             }
         }
         let mut tx = self.pool.begin().await?;
+        // The account first, then devices: the order removing a device uses, so
+        // the two never deadlock. It also serializes envelope uploads per
+        // account, which makes the per-recipient count exact.
+        sqlx::query("SELECT 1 FROM accounts WHERE id = $1 FOR NO KEY UPDATE")
+            .bind(session.account_id)
+            .execute(&mut *tx)
+            .await?;
         require_trusted(&mut *tx, session, true).await?;
-        // Locked in id order, so two senders never wait on each other in a cycle.
-        // The lock also makes the per-recipient count exact.
         let recipients: BTreeSet<Uuid> = envelopes.iter().map(|e| e.recipient_device_id).collect();
         for recipient in &recipients {
             let found: Option<i32> = sqlx::query_scalar(
                 "SELECT 1 FROM devices WHERE id = $1 AND account_id = $2 AND state = 'trusted'
-                 FOR NO KEY UPDATE",
+                 FOR SHARE",
             )
             .bind(recipient)
             .bind(session.account_id)
