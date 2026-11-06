@@ -4,5 +4,8 @@
 pub mod item;
 pub mod repeat;
 
-pub use item::{ChecklistEntry, Colour, Due, Item, ItemError, ItemKind, List, Priority};
+pub use item::{
+    ChecklistEntry, Colour, Due, Item, ItemError, ItemKind, List, ORDER_GAP, Priority,
+    order_between,
+};
 pub use repeat::{Day, End, Frequency, Repeat, RepeatError, Series};

@@ -51,6 +51,23 @@ pub struct ChecklistEntry {
     pub id: String,
     pub title: String,
     pub done: bool,
+    /// Position among the steps, smallest first. New steps go between their
+    /// neighbours ([`order_between`]), so inserting one changes only that step.
+    #[serde(default)]
+    pub order: i64,
+}
+
+/// The gap left between steps, so many inserts fit before orders run out.
+pub const ORDER_GAP: i64 = 1 << 20;
+
+/// An order between two neighbouring steps (`None` for the ends of the list).
+pub fn order_between(before: Option<i64>, after: Option<i64>) -> i64 {
+    match (before, after) {
+        (None, None) => 0,
+        (Some(b), None) => b.saturating_add(ORDER_GAP),
+        (None, Some(a)) => a.saturating_sub(ORDER_GAP),
+        (Some(b), Some(a)) => b + (a - b) / 2,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,11 +166,10 @@ impl Item {
             series
                 .validate()
                 .map_err(|_| ItemError::Invalid("repeat"))?;
-            // A repeating item's due date is its current occurrence.
-            match self.due {
-                Some(due) if due.date() >= series.start => {}
-                _ => return Err(ItemError::Invalid("due")),
-            }
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        if !self.checklist.iter().all(|e| ids.insert(e.id.as_str())) {
+            return Err(ItemError::Invalid("checklist"));
         }
         Ok(())
     }
@@ -200,12 +216,23 @@ impl Item {
             }
         }
         for name in old.keys().filter(|n| !new.contains_key(*n)) {
-            let gone = if name.starts_with(SKIP_PREFIX) {
-                serde_json::Value::Bool(false)
+            if let Some(step) = name
+                .strip_prefix(CHECKLIST_PREFIX)
+                .and_then(|rest| rest.strip_suffix(".title"))
+            {
+                // A removed step is one tombstone; its other fields stay as they were.
+                fields.set(
+                    &format!("{CHECKLIST_PREFIX}{step}.removed"),
+                    serde_json::Value::Bool(true),
+                    stamp,
+                );
+            } else if name.starts_with(CHECKLIST_PREFIX) {
+                continue;
+            } else if name.starts_with(SKIP_PREFIX) {
+                fields.set(name, serde_json::Value::Bool(false), stamp);
             } else {
-                serde_json::Value::Null
-            };
-            fields.set(name, gone, stamp);
+                fields.set(name, serde_json::Value::Null, stamp);
+            }
         }
         fields
     }
@@ -221,11 +248,11 @@ impl Item {
             ("done_at".to_owned(), json(&self.done_at)),
             ("deleted_at".to_owned(), json(&self.deleted_at)),
         ];
-        for (order, entry) in self.checklist.iter().enumerate() {
-            out.push((
-                format!("{CHECKLIST_PREFIX}{}", entry.id),
-                serde_json::json!({ "title": entry.title, "done": entry.done, "order": order }),
-            ));
+        for entry in &self.checklist {
+            let base = format!("{CHECKLIST_PREFIX}{}", entry.id);
+            out.push((format!("{base}.title"), json(&entry.title)));
+            out.push((format!("{base}.done"), json(&entry.done)));
+            out.push((format!("{base}.order"), json(&entry.order)));
         }
         match &self.repeat {
             Some(series) => {
@@ -250,53 +277,88 @@ impl Item {
     /// empty; unknown fields are ignored; a malformed or inconsistent field is
     /// refused.
     pub fn from_fields(id: &str, fields: &Fields) -> Result<Self, ItemError> {
-        let mut checklist: Vec<(u64, ChecklistEntry)> = Vec::new();
-        let mut skipped = std::collections::BTreeSet::new();
+        let mut steps: std::collections::BTreeMap<&str, StepFields> =
+            std::collections::BTreeMap::new();
+        let mut skips: std::collections::BTreeMap<Date, bool> = std::collections::BTreeMap::new();
         for (name, field) in &fields.0 {
-            if let Some(entry_id) = name.strip_prefix(CHECKLIST_PREFIX) {
-                if field.value.is_null() {
+            if let Some(rest) = name.strip_prefix(CHECKLIST_PREFIX) {
+                let Some((id, part)) = rest.rsplit_once('.') else {
                     continue;
+                };
+                let step = steps.entry(id).or_default();
+                let bad = || ItemError::Invalid("checklist");
+                match part {
+                    "title" => {
+                        step.title =
+                            Some(serde_json::from_value(field.value.clone()).map_err(|_| bad())?)
+                    }
+                    "done" => {
+                        step.done =
+                            serde_json::from_value(field.value.clone()).map_err(|_| bad())?
+                    }
+                    "order" => {
+                        step.order =
+                            serde_json::from_value(field.value.clone()).map_err(|_| bad())?
+                    }
+                    "removed" => {
+                        step.removed =
+                            serde_json::from_value(field.value.clone()).map_err(|_| bad())?
+                    }
+                    _ => {}
                 }
-                let entry: StoredEntry = serde_json::from_value(field.value.clone())
-                    .map_err(|_| ItemError::Invalid("checklist"))?;
-                checklist.push((
-                    entry.order,
-                    ChecklistEntry {
-                        id: entry_id.to_owned(),
-                        title: entry.title,
-                        done: entry.done,
-                    },
-                ));
             } else if let Some(day) = name.strip_prefix(SKIP_PREFIX) {
                 let skip: bool = serde_json::from_value(field.value.clone())
                     .map_err(|_| ItemError::Invalid("repeat"))?;
-                if skip {
-                    skipped.insert(
-                        day.parse::<Date>()
-                            .map_err(|_| ItemError::Invalid("repeat"))?,
-                    );
-                }
+                skips.insert(
+                    day.parse::<Date>()
+                        .map_err(|_| ItemError::Invalid("repeat"))?,
+                    skip,
+                );
             }
         }
-        checklist.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.id.cmp(&b.1.id)));
+        let mut checklist: Vec<ChecklistEntry> = steps
+            .into_iter()
+            .filter(|(_, s)| !s.removed)
+            .filter_map(|(id, s)| {
+                s.title.map(|title| ChecklistEntry {
+                    id: id.to_owned(),
+                    title,
+                    done: s.done,
+                    order: s.order,
+                })
+            })
+            .collect();
+        checklist.sort_by(|a, b| a.order.cmp(&b.order).then_with(|| a.id.cmp(&b.id)));
         let repeat: Option<Series> =
             optional::<Option<Series>>(fields, "repeat")?
                 .flatten()
                 .map(|mut series| {
-                    series.skipped = skipped;
+                    // Skips live in their own fields; a skip written inside the rule by
+                    // an older writer still counts unless a field unskipped it.
+                    for (day, skip) in &skips {
+                        if *skip {
+                            series.skipped.insert(*day);
+                        } else {
+                            series.skipped.remove(day);
+                        }
+                    }
                     series
                 });
+        let mut due: Option<Due> = optional(fields, "due")?.flatten();
+        if let Some(series) = &repeat {
+            due = roll_into_series(due, series);
+        }
         let item = Self {
             id: id.to_owned(),
             kind: required(fields, "kind")?,
             title: required(fields, "title")?,
             notes: optional(fields, "notes")?.unwrap_or_default(),
             list_id: required(fields, "list_id")?,
-            due: optional(fields, "due")?.flatten(),
+            due,
             priority: optional(fields, "priority")?.unwrap_or_default(),
             done_at: optional(fields, "done_at")?.flatten(),
             deleted_at: optional(fields, "deleted_at")?.flatten(),
-            checklist: checklist.into_iter().map(|(_, e)| e).collect(),
+            checklist,
             repeat,
         };
         item.validate()?;
@@ -307,11 +369,30 @@ impl Item {
 const CHECKLIST_PREFIX: &str = "checklist.";
 const SKIP_PREFIX: &str = "repeat.skip.";
 
-#[derive(Deserialize)]
-struct StoredEntry {
-    title: String,
+#[derive(Default)]
+struct StepFields {
+    title: Option<String>,
     done: bool,
-    order: u64,
+    order: i64,
+    removed: bool,
+}
+
+/// A repeating item's due date is its current occurrence. When merged edits
+/// leave it before the series start (one device moved the series while another
+/// completed an occurrence), it moves to the first occurrence instead of making
+/// the record unreadable. The time of day is kept.
+fn roll_into_series(due: Option<Due>, series: &Series) -> Option<Due> {
+    let needs_roll = due.is_none_or(|d| d.date() < series.start);
+    if !needs_roll {
+        return due;
+    }
+    let Some(first) = series.next_on_or_after(series.start) else {
+        return due;
+    };
+    Some(match due {
+        Some(Due::At(at)) => Due::At(first.to_datetime(at.time())),
+        _ => Due::Date(first),
+    })
 }
 
 fn json<T: Serialize>(value: &T) -> serde_json::Value {
@@ -385,6 +466,7 @@ mod tests {
             id: "c1".into(),
             title: "Call".into(),
             done: false,
+            order: 0,
         });
         let fields = task.to_fields(stamp(1, 1));
         assert_eq!(Item::from_fields("t1", &fields)?, task);
@@ -463,6 +545,7 @@ mod tests {
             id: "a".into(),
             title: "Passports".into(),
             done: false,
+            order: 0,
         });
         let fields = base.to_fields(stamp(1, 1));
         let mut on_phone = base.clone();
@@ -470,6 +553,7 @@ mod tests {
             id: "b".into(),
             title: "Tickets".into(),
             done: false,
+            order: ORDER_GAP,
         });
         let mut on_laptop = base.clone();
         on_laptop.checklist.clear();
@@ -477,6 +561,7 @@ mod tests {
             id: "c".into(),
             title: "Charger".into(),
             done: false,
+            order: 0,
         });
         let phone = merge(&fields, &on_phone.changed_fields(&base, stamp(2, 1)));
         let laptop = merge(&fields, &on_laptop.changed_fields(&base, stamp(3, 2)));
@@ -498,9 +583,10 @@ mod tests {
         );
         let mut fields = weekly_task().to_fields(stamp(1, 1));
         fields.set("due", serde_json::Value::Null, stamp(2, 9));
+        // A repeating item with no due date gets its first occurrence.
         assert_eq!(
-            Item::from_fields("t1", &fields).err(),
-            Some(ItemError::Invalid("due"))
+            Item::from_fields("t1", &fields)?.due,
+            Some(Due::Date(date(2026, 11, 9)))
         );
         Ok(())
     }
@@ -511,5 +597,88 @@ mod tests {
         fields.set("colour_from_a_newer_app", json(&"blue"), stamp(2, 1));
         assert_eq!(Item::from_fields("t1", &fields)?, weekly_task());
         Ok(())
+    }
+
+    #[test]
+    fn moving_a_series_while_another_device_completes_one_stays_readable() -> Result<(), ItemError>
+    {
+        let base = weekly_task(); // weekly Monday from 11-09, due 11-09
+        let fields = base.to_fields(stamp(1, 1));
+        let mut moved = base.clone();
+        let mut rule = crate::Repeat::every(crate::Frequency::Weekly);
+        rule.weekdays = vec![crate::Day::Tue];
+        moved.repeat = Some(Series::new(date(2026, 11, 17), rule).expect("series"));
+        moved.due = Some(Due::Date(date(2026, 11, 17)));
+        let mut completed = base.clone();
+        completed.due = Some(Due::Date(date(2026, 11, 16)));
+        let a = merge(&fields, &moved.changed_fields(&base, stamp(2, 1)));
+        let b = merge(&fields, &completed.changed_fields(&base, stamp(3, 2)));
+        let merged = Item::from_fields("t1", &merge(&a, &b))?;
+        assert_eq!(merged.due, Some(Due::Date(date(2026, 11, 17))));
+        Ok(())
+    }
+
+    #[test]
+    fn a_tick_survives_another_device_inserting_a_step_above_it() -> Result<(), ItemError> {
+        let mut base = Item::task("t1", "Trip", "home")?;
+        base.checklist.push(ChecklistEntry {
+            id: "a".into(),
+            title: "Passports".into(),
+            done: false,
+            order: 0,
+        });
+        base.checklist.push(ChecklistEntry {
+            id: "b".into(),
+            title: "Tickets".into(),
+            done: false,
+            order: ORDER_GAP,
+        });
+        let fields = base.to_fields(stamp(1, 1));
+        let mut ticked = base.clone();
+        ticked.checklist[1].done = true;
+        let mut inserted = base.clone();
+        let top = order_between(None, Some(0));
+        inserted.checklist.insert(
+            0,
+            ChecklistEntry {
+                id: "z".into(),
+                title: "Visa".into(),
+                done: false,
+                order: top,
+            },
+        );
+        let a = merge(&fields, &ticked.changed_fields(&base, stamp(2, 1)));
+        let b = merge(&fields, &inserted.changed_fields(&base, stamp(3, 2)));
+        let merged = Item::from_fields("t1", &merge(&a, &b))?;
+        let view: Vec<(&str, bool)> = merged
+            .checklist
+            .iter()
+            .map(|e| (e.id.as_str(), e.done))
+            .collect();
+        assert_eq!(view, vec![("z", false), ("a", false), ("b", true)]);
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_step_ids_are_refused() -> Result<(), ItemError> {
+        let mut task = Item::task("t1", "Trip", "home")?;
+        for _ in 0..2 {
+            task.checklist.push(ChecklistEntry {
+                id: "a".into(),
+                title: "x".into(),
+                done: false,
+                order: 0,
+            });
+        }
+        assert_eq!(task.validate(), Err(ItemError::Invalid("checklist")));
+        Ok(())
+    }
+
+    #[test]
+    fn orders_fit_between_neighbours() {
+        assert_eq!(order_between(None, None), 0);
+        assert!(order_between(Some(0), Some(ORDER_GAP)) > 0);
+        assert!(order_between(None, Some(0)) < 0);
+        assert!(order_between(Some(5), None) > 5);
     }
 }

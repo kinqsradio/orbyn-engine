@@ -71,6 +71,11 @@ Daily, weekly (on chosen weekdays), monthly and yearly, every N periods, ending 
 
 ## Records
 
-A task or event is stored as fields, each stamped for merging: `kind`, `title`, `notes`, `list_id`, `due`, `priority`, `done_at`, `deleted_at` and `repeat` (the rule without its skips), plus one field per checklist entry (`checklist.<id>`, `null` once removed) and one per skipped date (`repeat.skip.<date>`, `false` once unskipped). Two devices that each add a step or skip a date therefore both keep their change. Edits are sent with `Item::changed_fields`, which includes the removals.
+A task or event is stored as fields, each stamped for merging: `kind`, `title`, `notes`, `list_id`, `due`, `priority`, `done_at`, `deleted_at` and `repeat` (the rule without its skips). Each checklist step has its own `checklist.<id>.title`, `.done` and `.order` fields, plus `.removed` once deleted. Each skipped date is a `repeat.skip.<date>` field, `false` once unskipped. So two devices that each add a step, tick a step, reorder or skip a date keep both changes. Step orders leave gaps (`order_between`), so inserting a step changes only that step. Edits are sent with `Item::changed_fields`, which includes the removals.
 
-Reading a record checks it fully, repeat rule included; a repeating item's due date must be on or after the series start. A missing or malformed field is refused, never guessed. Unknown fields are ignored on read.
+Reading a record checks it fully, repeat rule included, and refuses duplicate step ids. A missing or malformed field is refused, never guessed. Unknown fields are ignored. One merge result is repaired instead of refused: a repeating item's due date before its series start (one device moved the series while another completed an occurrence) moves to the first occurrence, keeping its time of day.
+
+Known limits, to revisit with compaction:
+- Removal markers (`.removed`, `false` skips) are never cleaned up yet.
+- A skip that reaches a record after another device split the series lands on the old part, so the date still shows in the new part.
+- A skip made while another device turned repeat off returns if repeat is turned on again.

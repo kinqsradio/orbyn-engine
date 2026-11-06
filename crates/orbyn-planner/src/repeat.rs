@@ -657,6 +657,16 @@ mod tests {
             let mut joined = first.occurrences(from, to);
             joined.extend(second.occurrences(from, to));
             assert_eq!(joined, kept, "split of {original:?} at {at}");
+            if let End::Count(total) = original.repeat.end {
+                let wide = (start, date(9999, 12, 31));
+                let all_first = first.occurrences(wide.0, wide.1).len() + first.skipped.len();
+                let all_second = second.occurrences(wide.0, wide.1).len() + second.skipped.len();
+                assert_eq!(
+                    all_first + all_second,
+                    total as usize,
+                    "count shared out for {original:?}"
+                );
+            }
             checked += 1;
         }
         assert!(checked > 1000, "only {checked} cases had a split point");
