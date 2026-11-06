@@ -118,6 +118,12 @@ impl Store {
     /// its devices' budgets. Only a trusted device is counted: a pending device
     /// of the account must not use up what the real devices may upload.
     async fn admit_upload(&self, session: &Session) -> Result<inflight::Slot> {
+        // Refused in memory before taking a slot, so a pending device of the
+        // account cannot hold the account's slots while its trust is checked.
+        // The database check below still decides for a session that says trusted.
+        if session.device_state != orbyn_core::accounts::DeviceState::Trusted {
+            return Err(StoreError::DeviceNotTrusted);
+        }
         let slot = self
             .in_flight
             .enter(session.account_id, self.limits.max_uploads_in_flight)

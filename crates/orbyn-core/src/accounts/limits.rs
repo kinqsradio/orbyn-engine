@@ -270,7 +270,13 @@ mod tests {
             .await
             .expect("lock");
         let started = std::time::Instant::now();
-        let answer = allow_queued(&pool, "test-busy", &subject, limit).await;
+        // Bounded here too: without the lock timeout the call would wait forever.
+        let answer = tokio::time::timeout(
+            LOCK_WAIT * 3,
+            allow_queued(&pool, "test-busy", &subject, limit),
+        )
+        .await
+        .expect("the wait gives up instead of hanging");
         assert_eq!(answer.expect("answer"), Queued::Busy);
         assert!(started.elapsed() < LOCK_WAIT * 3, "{:?}", started.elapsed());
         // Without the holder it is allowed again.

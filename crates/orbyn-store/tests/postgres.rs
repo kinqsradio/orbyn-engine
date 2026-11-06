@@ -1323,6 +1323,57 @@ async fn a_device_refused_by_its_account_keeps_its_own_budget() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs DATABASE_URL"]
+async fn a_pending_device_cannot_take_the_accounts_upload_slots() {
+    let (store, db) = store_with(Limits {
+        uploads_per_device: limit(100_000),
+        uploads_per_account: limit(100_000),
+        ..Limits::default()
+    })
+    .await;
+    let owner = trusted(&db).await;
+    store.create_zone(&owner, "inbox").await.expect("zone");
+    let pending = device(&db, owner.account_id, "pending").await;
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flood: Vec<_> = (0..64)
+        .map(|n| {
+            let (store, stop) = (store.clone(), stop.clone());
+            tokio::spawn(async move {
+                let mut i = 0;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let err = store
+                        .upload(
+                            &pending,
+                            "inbox",
+                            &batch(vec![save(&format!("p{n}-{i}"), None, b"x")]),
+                        )
+                        .await
+                        .expect_err("pending");
+                    assert!(matches!(err, StoreError::DeviceNotTrusted), "{err:?}");
+                    i += 1;
+                    tokio::task::yield_now().await;
+                }
+            })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    for n in 0..20 {
+        store
+            .upload(
+                &owner,
+                "inbox",
+                &batch(vec![save(&format!("o{n}"), None, b"x")]),
+            )
+            .await
+            .expect("the owner's uploads are not blocked by a pending device");
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for task in flood {
+        task.await.expect("task");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs DATABASE_URL"]
 async fn a_flood_from_one_account_leaves_the_pool_to_others() {
     // Rate limits out of the way: this tests the pool, not the limiter.
     let (store, db) = store_with(Limits {
