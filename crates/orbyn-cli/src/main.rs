@@ -90,6 +90,9 @@ async fn serve(config: Config) -> Result<(), String> {
             state = state.with_accounts(orbyn_core::Accounts::new(db.pool().clone(), secrets));
             let hub = orbyn_store::Hub::start(db.pool().clone());
             state = state.with_store(orbyn_store::Store::new(db.pool().clone(), hub));
+            state = state.with_feeds(
+                orbyn_core::feeds::Feeds::new(db.pool().clone()).map_err(|e| e.to_string())?,
+            );
         }
         None => {
             tracing::warn!("ORBYN_AUTH_SETUP is not set: sign-up, sign-in and records answer 503")

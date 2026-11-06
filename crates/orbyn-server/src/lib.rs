@@ -2,6 +2,7 @@
 //! domain crates.
 
 mod accounts;
+mod feeds;
 mod records;
 
 use axum::extract::{DefaultBodyLimit, State};
@@ -37,6 +38,7 @@ pub struct AppState {
     readiness: Arc<dyn Readiness>,
     accounts: Option<Accounts>,
     store: Option<Store>,
+    feeds: Option<orbyn_core::feeds::Feeds>,
     client_ip_header: Option<HeaderName>,
 }
 
@@ -47,6 +49,7 @@ impl AppState {
             readiness,
             accounts: None,
             store: None,
+            feeds: None,
             client_ip_header: None,
         }
     }
@@ -59,6 +62,12 @@ impl AppState {
     /// Enables the record store routes and `/v1/sync`. They also need accounts.
     pub fn with_store(mut self, store: Store) -> Self {
         self.store = Some(store);
+        self
+    }
+
+    /// Enables `POST /v1/feeds/fetch`. It also needs accounts.
+    pub fn with_feeds(mut self, feeds: orbyn_core::feeds::Feeds) -> Self {
+        self.feeds = Some(feeds);
         self
     }
 
@@ -87,6 +96,7 @@ pub fn router(state: AppState, allowed_origins: &[String]) -> Router {
         .route("/ready", get(ready))
         .merge(accounts::routes())
         .merge(records::routes())
+        .merge(feeds::routes())
         .fallback(not_found)
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .layer(cors)
@@ -134,7 +144,7 @@ async fn not_found() -> Response {
     )
 }
 
-fn error(status: StatusCode, code: &str, message: &str) -> Response {
+pub(crate) fn error(status: StatusCode, code: &str, message: &str) -> Response {
     (
         status,
         Json(ApiError {

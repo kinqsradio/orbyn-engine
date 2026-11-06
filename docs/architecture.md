@@ -125,3 +125,16 @@ Known limits, to revisit with compaction:
 - Removal markers (`.removed`, `false` skips) are never cleaned up yet.
 - A skip that reaches a record after another device split the series lands on the old part, so the date still shows in the new part.
 - A skip made while another device turned repeat off returns if repeat is turned on again.
+
+## Calendar feeds
+
+`POST /v1/feeds/fetch` with `{"url": "https://…"}` fetches a public calendar feed for a trusted device and answers `{"status", "body"}`. Browsers often cannot read a feed themselves (CORS), and the desktop app's content policy forbids it, so the planner asks the engine. Because that makes the engine fetch URLs people choose, every request is guarded (`orbyn_core::feeds`):
+
+- `https` only, on the default port, with no user name or password; `localhost` and single-label names are refused before any lookup.
+- Every address a name resolves to is checked when the connection is made, and only public ones are used, so a name that resolves to a private address, now or after a change (DNS rebinding), is refused. Addresses written in the URL are checked the same way.
+- Refused ranges: loopback, private, link-local (including the 169.254.169.254 metadata service), shared (100.64/10), documentation, benchmarking, reserved, multicast and unspecified; IPv6 unique-local, link-local, site-local, documentation, NAT64, 6to4 and Teredo; and IPv4 addresses mapped into IPv6.
+- No proxy is used. Redirects are followed by hand, at most three, each checked like the first.
+- At most 5 MiB of raw bytes (nothing is decompressed) and one 10-second deadline per feed, redirects included, and 60 fetches an hour per account. The body is returned and never stored or logged.
+- IPv6 counts only global unicast (2000::/3) minus its special ranges, so forms that embed an IPv4 address are refused.
+- What it still reveals: `blocked_address` versus `upstream_error` tells a caller whether a name resolves to an internal address, and it is a general HTTPS GET for public pages (no Content-Type check), limited to 60 an hour.
+- Errors: `invalid_url`, `blocked_address`, `too_large`, `timeout`, `upstream_error`, `too_many_attempts`, and `device_not_trusted` for a pending device.

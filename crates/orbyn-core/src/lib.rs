@@ -3,6 +3,7 @@
 pub mod accounts;
 pub mod config;
 pub mod db;
+pub mod feeds;
 pub mod jobs;
 
 pub use accounts::Accounts;
