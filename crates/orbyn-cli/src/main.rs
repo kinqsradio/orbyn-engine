@@ -24,6 +24,10 @@ enum Command {
     Worker,
     /// Apply database migrations and exit.
     Migrate,
+    /// Print a new value for ORBYN_AUTH_SETUP, the sign-in secret. Generate it
+    /// once per deployment and keep it in the secret store: every replica needs
+    /// the same value, and a new one makes every existing password unusable.
+    AuthSetup,
     /// Exit 0 if the API at ADDRESS answers /health, for container health checks.
     Health {
         #[arg(default_value = "127.0.0.1:8080")]
@@ -49,6 +53,10 @@ async fn main() -> ExitCode {
     if let Command::Health { address } = &cli.command {
         return health(address).await;
     }
+    if let Command::AuthSetup = &cli.command {
+        println!("{}", orbyn_core::accounts::AuthSecrets::generate().as_str());
+        return ExitCode::SUCCESS;
+    }
     init_tracing();
     let config = match Config::from_env() {
         Ok(config) => config,
@@ -61,7 +69,7 @@ async fn main() -> ExitCode {
         Command::Serve => serve(config).await,
         Command::Worker => worker(config).await,
         Command::Migrate => migrate(config).await,
-        Command::Health { .. } => Ok(()),
+        Command::Health { .. } | Command::AuthSetup => Ok(()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -74,8 +82,23 @@ async fn main() -> ExitCode {
 
 async fn serve(config: Config) -> Result<(), String> {
     let db = Database::connect_lazy(&config.database_url).map_err(|e| e.to_string())?;
-    let state = orbyn_server::AppState::new(Arc::new(db));
-    let app = orbyn_server::router(state, &config.allowed_origins);
+    let mut state = orbyn_server::AppState::new(Arc::new(db.clone()));
+    match &config.auth_setup {
+        Some(setup) => {
+            let secrets = orbyn_core::accounts::AuthSecrets::from_encoded(setup)
+                .map_err(|e| e.to_string())?;
+            state = state.with_accounts(orbyn_core::Accounts::new(db.pool().clone(), secrets));
+        }
+        None => tracing::warn!("ORBYN_AUTH_SETUP is not set: sign-up and sign-in answer 503"),
+    }
+    if let Some(name) = &config.client_ip_header {
+        let header = name
+            .parse()
+            .map_err(|_| "ORBYN_CLIENT_IP_HEADER is not a header name".to_owned())?;
+        state = state.with_client_ip_header(header);
+    }
+    let app = orbyn_server::router(state, &config.allowed_origins)
+        .into_make_service_with_connect_info::<std::net::SocketAddr>();
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .map_err(|e| e.to_string())?;
