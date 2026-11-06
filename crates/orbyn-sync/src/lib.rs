@@ -84,6 +84,25 @@ impl Clock {
         self.last
     }
 
+    /// Restores the clock from a stamp already in storage, without moving it to
+    /// the wall clock: the next [`Clock::tick`] is stamped at the time it is
+    /// given, which may be earlier than now (an edit made while the app was
+    /// closed). Refused like [`Clock::observe`] when the stamp is more than
+    /// [`MAX_SKEW_MILLIS`] ahead of `now_millis`.
+    pub fn resume(&mut self, seen: Stamp, now_millis: u64) -> Result<(), ClockError> {
+        if seen.millis > now_millis.saturating_add(MAX_SKEW_MILLIS) {
+            return Err(ClockError::TooFarAhead);
+        }
+        if (seen.millis, seen.counter) > (self.last.millis, self.last.counter) {
+            self.last = Stamp {
+                millis: seen.millis,
+                counter: seen.counter,
+                device: self.device,
+            };
+        }
+        Ok(())
+    }
+
     /// Moves the clock past a stamp seen from another device. A stamp more than
     /// [`MAX_SKEW_MILLIS`] ahead of `now_millis` is refused and the clock is unchanged.
     pub fn observe(&mut self, seen: Stamp, now_millis: u64) -> Result<(), ClockError> {
@@ -211,6 +230,34 @@ mod tests {
             counter: 0,
             device,
         }
+    }
+
+    #[test]
+    fn a_resumed_clock_stays_at_the_stored_stamp_not_the_wall_clock() {
+        let mut clock = Clock::new(1);
+        clock.resume(stamp(5_000, 2), 90_000).expect("resume");
+        // The next edit at an earlier wall time follows the stored stamp...
+        let a = clock.tick(4_000);
+        assert_eq!((a.millis, a.counter), (5_000, 1));
+        // ...and one at a later time takes its own, not the resume time.
+        let b = clock.tick(6_000);
+        assert_eq!((b.millis, b.counter), (6_000, 0));
+        // A lower stored stamp never moves the clock back.
+        clock.resume(stamp(1_000, 2), 90_000).expect("resume");
+        assert!(clock.tick(0) > b);
+    }
+
+    #[test]
+    fn a_stored_stamp_too_far_ahead_is_not_resumed() {
+        let mut clock = Clock::new(1);
+        let ahead = stamp(10_000 + MAX_SKEW_MILLIS + 1, 2);
+        assert_eq!(clock.resume(ahead, 10_000), Err(ClockError::TooFarAhead));
+        assert_eq!(clock.tick(0).millis, 0, "unchanged");
+        assert!(
+            clock
+                .resume(stamp(10_000 + MAX_SKEW_MILLIS, 2), 10_000)
+                .is_ok()
+        );
     }
 
     #[test]

@@ -1896,3 +1896,196 @@ fn after_three_restarts_in_a_row_the_state_is_reset_and_the_next_sync_converges(
     assert_eq!(b.engine.token(ZONE), Some(store.token(ZONE).as_str()));
     Ok(())
 }
+
+#[test]
+fn an_edit_time_is_clamped_by_the_clock_and_a_future_one_is_taken_as_now() -> R {
+    let keys = DeviceKeys::generate().expect("keys");
+    let mut engine = Engine::new(keys, ACCOUNT, A)?;
+    let first = engine.tick_at(5_000, 9_000);
+    assert_eq!((first.millis, first.counter), (5_000, 0));
+    // Not backwards past the last stamp issued.
+    let second = engine.tick_at(4_000, 9_000);
+    assert_eq!((second.millis, second.counter), (5_000, 1));
+    // A future edit time is silently taken as now...
+    let future = engine.tick_at(9_000 + MAX_SKEW_MILLIS, 9_000);
+    assert_eq!((future.millis, future.counter), (9_000, 0));
+    // ...and the clock did not move past now: the next edit at now follows it.
+    let next = engine.tick(9_000);
+    assert_eq!((next.millis, next.counter), (9_000, 1));
+    Ok(())
+}
+
+#[test]
+fn an_edit_stamped_in_the_future_does_not_get_a_later_edit_dropped_by_another_device() -> R {
+    let mut store = FakeStore::new(10);
+    let (mut a, mut b, _) = pair(&mut store);
+    // A's edit is dated an hour ahead by mistake; then A makes an ordinary edit.
+    let stamp = a.engine.tick_at(a.now + MAX_SKEW_MILLIS, a.now);
+    assert_eq!(stamp.millis, a.now, "taken as now");
+    let mut fields = Fields::default();
+    fields.set("title", json!("first"), stamp);
+    a.engine.stage(ZONE, "note", "n1", &fields)?;
+    a.now += 5;
+    a.edit("n1", "notes", json!("second"));
+    a.sync(&mut store);
+    // B's clock is a second behind A's. It must take both edits.
+    b.now = a.now - 1_000;
+    let applied = b.fetch_all(&store);
+    assert!(applied.rejected.is_empty(), "{:?}", applied.rejected);
+    let record = b.engine.record(ZONE, "n1").expect("n1");
+    assert_eq!(record.get("title").cloned(), Some(json!("first")));
+    assert_eq!(record.get("notes").cloned(), Some(json!("second")));
+    Ok(())
+}
+
+#[test]
+fn a_restore_counts_a_record_stamped_far_ahead_and_keeps_it() -> R {
+    let keys = DeviceKeys::generate().expect("keys");
+    let mut engine = Engine::new(copy(&keys), ACCOUNT, A)?;
+    let mut ahead = Fields::default();
+    ahead.set(
+        "title",
+        json!("from a fast clock"),
+        Stamp {
+            millis: 1_000 + MAX_SKEW_MILLIS + 1,
+            counter: 0,
+            device: 7,
+        },
+    );
+    engine.stage(ZONE, "note", "far", &ahead)?;
+    let mut fine = Fields::default();
+    fine.set(
+        "title",
+        json!("fine"),
+        Stamp {
+            millis: 900,
+            counter: 0,
+            device: 7,
+        },
+    );
+    engine.stage(ZONE, "note", "fine", &fine)?;
+    let snapshot = engine.snapshot();
+
+    let restored = Engine::restore(copy(&keys), snapshot, 1_000)?;
+    assert_eq!(restored.skipped_future_stamps(), 1, "only the far one");
+    // Both records are kept; the far stamp did not drag the clock to it.
+    assert!(restored.record(ZONE, "far").is_some() && restored.record(ZONE, "fine").is_some());
+    let mut restored = restored;
+    assert_eq!(restored.tick(1_000).millis, 1_000);
+    Ok(())
+}
+#[test]
+fn a_record_reports_its_stored_type_and_a_deleted_one_has_none() -> R {
+    let mut store = FakeStore::new(10);
+    let (mut a, _b, _) = pair(&mut store);
+    a.edit("note-1", "title", json!("x"));
+    assert_eq!(a.engine.record_type(ZONE, "note-1"), Some("note"));
+    assert_eq!(a.engine.record_type(ZONE, "missing"), None);
+    a.engine.delete(ZONE, "note-1")?;
+    assert_eq!(a.engine.record_type(ZONE, "note-1"), None);
+    Ok(())
+}
+
+#[test]
+fn the_restart_count_starts_over_when_a_refetch_finishes() -> R {
+    let mut store = FakeStore::new(10);
+    let (mut a, mut b, _) = pair(&mut store);
+    a.edit("r1", "title", json!("r1"));
+    settle(&mut a, &mut b, &mut store);
+
+    // A refetch that restarts twice, then finishes.
+    b.engine.token_expired(ZONE)?;
+    b.engine.token_expired(ZONE)?;
+    b.engine.token_expired(ZONE)?;
+    let (_, expiries) = fetch_all_restarting(&mut b, &store).expect("finishes");
+    assert_eq!(expiries, 0);
+
+    // The next refetch gets its full three restarts; the fourth expiry is the error.
+    b.engine.token_expired(ZONE)?;
+    for restart in 1..=3 {
+        assert_eq!(b.engine.token_expired(ZONE), Ok(()), "restart {restart}");
+    }
+    assert_eq!(b.engine.token_expired(ZONE), Err(ClientError::ExpiredAgain));
+    Ok(())
+}
+
+#[test]
+fn what_a_restarted_refetch_has_to_check_is_the_original_set_and_not_only_what_it_saw() -> R {
+    let mut store = FakeStore::new(1);
+    let (mut a, mut b, _) = pair(&mut store);
+    for id in ["r1", "r2", "r3"] {
+        a.edit(id, "title", json!(id));
+    }
+    settle(&mut a, &mut b, &mut store);
+
+    // B's refetch starts and sees the first record, so that one is checked off.
+    b.engine.token_expired(ZONE)?;
+    let page = store.try_changes(ZONE, None).expect("start");
+    assert!(page.more);
+    let seen = page.records[0].record_id.clone();
+    b.engine.apply_changes_from(ZONE, None, &page, b.now)?;
+
+    // That record is deleted on the server and the tombstone purged before the
+    // refetch can finish. The restart must check it again, not trust that it
+    // was seen in the abandoned run.
+    a.engine.delete(ZONE, &seen)?;
+    a.sync(&mut store);
+    store.purge_tombstones(ZONE);
+    b.engine.token_expired(ZONE)?;
+    let (applied, _) = fetch_all_restarting(&mut b, &store).expect("converges");
+    assert_eq!(applied.trashed, vec![seen.clone()]);
+    assert!(b.engine.record(ZONE, &seen).is_none());
+    Ok(())
+}
+
+#[test]
+fn a_record_the_server_refused_during_a_refetch_is_still_checked_after_a_restart() -> R {
+    let mut store = FakeStore::new(10);
+    let (mut a, mut b, _) = pair(&mut store);
+    for id in ["r1", "r2"] {
+        a.edit(id, "title", json!(id));
+    }
+    settle(&mut a, &mut b, &mut store);
+    // r2 is gone from the server for good.
+    a.engine.delete(ZONE, "r2")?;
+    a.sync(&mut store);
+    store.purge_tombstones(ZONE);
+
+    // B edits r2, the refetch starts, and an upload in between is answered
+    // "no such record": r2 now has no server version.
+    b.edit("r2", "title", json!("edited"));
+    b.engine.token_expired(ZONE)?;
+    let upload = b.engine.build_upload(ZONE)?.expect("r2 is pending");
+    let conflict = wire::RecordChanged {
+        code: "record_changed".into(),
+        message: String::new(),
+        conflicts: upload
+            .changes
+            .iter()
+            .map(|change| wire::RecordConflict {
+                record_id: match change {
+                    wire::RecordChange::Save { record_id, .. }
+                    | wire::RecordChange::Delete { record_id, .. } => record_id.clone(),
+                },
+                server_record: None,
+            })
+            .collect(),
+    };
+    b.engine.upload_conflicted(ZONE, &conflict, b.now)?;
+    assert_eq!(
+        b.engine
+            .records(ZONE)
+            .find(|(id, _)| *id == "r2")
+            .map(|(_, l)| l.version),
+        Some(None)
+    );
+
+    // The refetch restarts; r2 was in the original set, though it no longer
+    // has a version, so it is still settled at the end: edits to the trash.
+    b.engine.token_expired(ZONE)?;
+    let (applied, _) = fetch_all_restarting(&mut b, &store).expect("converges");
+    assert_eq!(applied.trashed, vec!["r2".to_owned()]);
+    assert!(b.engine.record(ZONE, "r2").is_none());
+    assert!(!b.engine.has_pending(ZONE));
+    Ok(())
+}
