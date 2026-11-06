@@ -81,7 +81,8 @@ async fn main() -> ExitCode {
 }
 
 async fn serve(config: Config) -> Result<(), String> {
-    let db = Database::connect_lazy(&config.database_url).map_err(|e| e.to_string())?;
+    let db = Database::connect_lazy_with_pool(&config.database_url, config.database_pool_size)
+        .map_err(|e| e.to_string())?;
     let mut state = orbyn_server::AppState::new(Arc::new(db.clone()));
     match &config.auth_setup {
         Some(setup) => {
@@ -93,15 +94,16 @@ async fn serve(config: Config) -> Result<(), String> {
             let pool_size = db.pool().options().get_max_connections() as usize;
             let mut limits = *store.limits();
             if let Some(cap) = config.max_uploads_in_flight {
-                // Uploads hold a connection for their whole run: leave two for
-                // reads, sign-in and the worker, or the cap stops protecting the pool.
-                let most = pool_size.saturating_sub(2).max(1);
+                // Uploads hold a connection for their whole run: leave one for the
+                // live listener and two for reads and sign-in, or the cap stops
+                // protecting the pool.
+                let most = pool_size.saturating_sub(3).max(1);
                 if cap > most {
                     tracing::warn!(
                         cap,
                         pool_size,
                         used = most,
-                        "ORBYN_MAX_UPLOADS_IN_FLIGHT is above the pool size less two; using the lower value"
+                        "ORBYN_MAX_UPLOADS_IN_FLIGHT is above the pool size less three (the live listener and two spare); using the lower value"
                     );
                 }
                 limits.max_uploads_in_flight_global = cap.min(most);
@@ -138,7 +140,7 @@ async fn serve(config: Config) -> Result<(), String> {
 }
 
 async fn worker(config: Config) -> Result<(), String> {
-    let db = Database::connect(&config.database_url)
+    let db = Database::connect_with_pool(&config.database_url, config.database_pool_size)
         .await
         .map_err(|e| e.to_string())?;
     let (tx, rx) = watch::channel(false);

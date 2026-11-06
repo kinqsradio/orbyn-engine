@@ -732,7 +732,10 @@ async fn a_silent_client_is_closed_normally_after_two_intervals() {
 #[tokio::test]
 #[ignore = "needs DATABASE_URL"]
 async fn a_socket_closed_for_silence_gives_its_place_back() {
-    let a = server_with(Some(INTERVAL)).await;
+    // The 16 sockets are silent from the moment they connect, so the interval must
+    // outlast filling all of them, or the first are closed before the 17th tries.
+    let interval = Duration::from_secs(1);
+    let a = server_with(Some(interval)).await;
     let (_, token) = a.sign_up().await;
     // Fill the account's 16 places with clients that then go silent.
     let mut silent = Vec::new();
@@ -749,9 +752,22 @@ async fn a_socket_closed_for_silence_gives_its_place_back() {
         "too_many_connections"
     );
 
-    // After the silence is noticed, the places are free again.
-    tokio::time::sleep(INTERVAL * 5).await;
-    let mut again = connect(&a).await;
-    auth(&mut again, &token).await;
-    assert_eq!(next_json(&mut again).await["type"], "ready");
+    // After the silence is noticed (two to three intervals), the places are free
+    // again. Retried rather than timed, so a loaded machine does not fail it.
+    let deadline = tokio::time::Instant::now() + interval * 10;
+    loop {
+        tokio::time::sleep(interval / 2).await;
+        let mut again = connect(&a).await;
+        auth(&mut again, &token).await;
+        let answer = next_json(&mut again).await;
+        if answer["type"] == "ready" {
+            break;
+        }
+        assert_eq!(answer["code"], "too_many_connections", "{answer}");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the silent sockets never gave their places back"
+        );
+    }
+    drop(silent);
 }

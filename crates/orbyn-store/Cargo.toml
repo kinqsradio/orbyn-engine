@@ -19,8 +19,16 @@ tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
+[features]
+# Test hooks that must not exist in a build the server uses: a purge scoped to some accounts, so
+# tests that share a database do not purge each other's rows. Only this crate's own tests enable it.
+test-support = []
+
 [dev-dependencies]
 tokio = { workspace = true }
+# The crate's own integration tests need the hooks above; enabling the feature here keeps it out of
+# every normal build.
+orbyn-store = { path = ".", features = ["test-support"] }
 
 [lints]
 workspace = true
