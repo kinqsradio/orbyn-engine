@@ -92,10 +92,21 @@ async fn worker(config: Config) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let (tx, rx) = watch::channel(false);
     let id = format!("worker-{}", uuid::Uuid::new_v4());
-    let task = tokio::spawn(orbyn_worker::run(db, id, rx));
-    shutdown_signal().await;
-    let _ = tx.send(true);
-    task.await.map_err(|e| e.to_string())
+    let mut task = tokio::spawn(orbyn_worker::run(db, id, rx));
+    tokio::select! {
+        () = shutdown_signal() => {
+            let _ = tx.send(true);
+            task.await.map_err(|e| e.to_string())
+        }
+        ended = &mut task => {
+            let reason = match ended {
+                Ok(()) => "the worker stopped before a shutdown signal".to_owned(),
+                Err(err) => format!("the worker task failed: {err}"),
+            };
+            tracing::error!(reason = %reason, "worker ended unexpectedly");
+            Err(reason)
+        }
+    }
 }
 
 async fn migrate(config: Config) -> Result<(), String> {
