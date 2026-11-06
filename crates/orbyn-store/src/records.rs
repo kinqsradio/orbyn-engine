@@ -130,7 +130,14 @@ impl Store {
         }
         let caps = inflight::Caps {
             account: self.limits.max_uploads_in_flight,
-            address: self.limits.max_uploads_in_flight_per_address,
+            // One address never takes every replica slot, so another address
+            // can always get in, however small the pool.
+            address: self.limits.max_uploads_in_flight_per_address.min(
+                self.limits
+                    .max_uploads_in_flight_global
+                    .saturating_sub(1)
+                    .max(1),
+            ),
             global: self.limits.max_uploads_in_flight_global,
         };
         let slot = self

@@ -90,13 +90,26 @@ async fn serve(config: Config) -> Result<(), String> {
             state = state.with_accounts(orbyn_core::Accounts::new(db.pool().clone(), secrets));
             let hub = orbyn_store::Hub::start(db.pool().clone());
             let mut store = orbyn_store::Store::new(db.pool().clone(), hub);
+            let pool_size = db.pool().options().get_max_connections() as usize;
+            let mut limits = *store.limits();
             if let Some(cap) = config.max_uploads_in_flight {
-                let limits = orbyn_store::Limits {
-                    max_uploads_in_flight_global: cap,
-                    ..*store.limits()
-                };
-                store = store.with_limits(limits);
+                // Uploads hold a connection for their whole run: leave two for
+                // reads, sign-in and the worker, or the cap stops protecting the pool.
+                let most = pool_size.saturating_sub(2).max(1);
+                if cap > most {
+                    tracing::warn!(
+                        cap,
+                        pool_size,
+                        used = most,
+                        "ORBYN_MAX_UPLOADS_IN_FLIGHT is above the pool size less two; using the lower value"
+                    );
+                }
+                limits.max_uploads_in_flight_global = cap.min(most);
             }
+            if let Some(cap) = config.max_uploads_per_address {
+                limits.max_uploads_in_flight_per_address = cap;
+            }
+            store = store.with_limits(limits);
             state = state.with_store(store);
             state = state.with_feeds(
                 orbyn_core::feeds::Feeds::new(db.pool().clone()).map_err(|e| e.to_string())?,

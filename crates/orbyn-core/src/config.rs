@@ -26,6 +26,9 @@ pub struct Config {
     /// Uploads that may run at once on this replica; `None` keeps half the
     /// database pool.
     pub max_uploads_in_flight: Option<usize>,
+    /// Uploads one client address may run at once on this replica; `None`
+    /// keeps the store's default.
+    pub max_uploads_per_address: Option<usize>,
 }
 
 impl std::fmt::Debug for Config {
@@ -38,6 +41,7 @@ impl std::fmt::Debug for Config {
             .field("client_ip_header", &self.client_ip_header)
             .field("purge_after", &self.purge_after)
             .field("max_uploads_in_flight", &self.max_uploads_in_flight)
+            .field("max_uploads_per_address", &self.max_uploads_per_address)
             .finish()
     }
 }
@@ -52,6 +56,8 @@ pub enum ConfigError {
     InvalidRetention,
     #[error("ORBYN_MAX_UPLOADS_IN_FLIGHT is not a whole number from 1 to 1000")]
     InvalidUploadCap,
+    #[error("ORBYN_MAX_UPLOADS_PER_ADDRESS is not a whole number from 1 to 1000")]
+    InvalidAddressUploadCap,
 }
 
 impl Config {
@@ -102,6 +108,16 @@ impl Config {
                     .ok_or(ConfigError::InvalidUploadCap)?,
             ),
         };
+        let max_uploads_per_address = match get("ORBYN_MAX_UPLOADS_PER_ADDRESS") {
+            None => None,
+            Some(text) => Some(
+                text.trim()
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| (1..=1000).contains(n))
+                    .ok_or(ConfigError::InvalidAddressUploadCap)?,
+            ),
+        };
         Ok(Self {
             database_url,
             bind,
@@ -110,6 +126,7 @@ impl Config {
             client_ip_header: optional("ORBYN_CLIENT_IP_HEADER").map(|v| v.to_lowercase()),
             purge_after: Duration::from_secs(purge_days * 24 * 60 * 60),
             max_uploads_in_flight,
+            max_uploads_per_address,
         })
     }
 }
@@ -156,6 +173,27 @@ mod tests {
         }
         let unset = Config::from_lookup(lookup(&[("DATABASE_URL", "postgres://x")]))?;
         assert_eq!(unset.max_uploads_in_flight, None);
+        Ok(())
+    }
+
+    #[test]
+    fn the_address_upload_cap_is_optional_and_bounded() -> Result<(), ConfigError> {
+        let with = |value: &str| {
+            Config::from_lookup(lookup(&[
+                ("DATABASE_URL", "postgres://x"),
+                ("ORBYN_MAX_UPLOADS_PER_ADDRESS", value),
+            ]))
+        };
+        assert_eq!(with("32")?.max_uploads_per_address, Some(32));
+        for bad in ["0", "1001", "many", ""] {
+            assert_eq!(
+                with(bad).err(),
+                Some(ConfigError::InvalidAddressUploadCap),
+                "{bad}"
+            );
+        }
+        let unset = Config::from_lookup(lookup(&[("DATABASE_URL", "postgres://x")]))?;
+        assert_eq!(unset.max_uploads_per_address, None);
         Ok(())
     }
 

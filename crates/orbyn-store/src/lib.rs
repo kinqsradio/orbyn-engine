@@ -82,10 +82,13 @@ pub struct Limits {
     /// the pool while others wait.
     pub max_uploads_in_flight: usize,
     /// Uploads from one client address (an IPv6 /64) running at once on a
-    /// replica, so many accounts made in one place cannot hold the pool.
+    /// replica, so many accounts made in one place cannot hold the pool. It is
+    /// higher than the account cap because carrier NAT, offices and VPNs put
+    /// many honest people behind one IPv4 address; the global cap bounds the pool.
     pub max_uploads_in_flight_per_address: usize,
     /// Uploads running at once across the replica. `Store::new` sets it to half
-    /// the pool; `with_limits` replaces it.
+    /// the pool; `with_limits` replaces it, so a caller that builds `Limits`
+    /// itself sets this too (the default of 5 suits a pool of 10).
     pub max_uploads_in_flight_global: usize,
     /// `/v1/sync` sockets one account may have open on a replica.
     pub max_sockets_per_account: usize,
@@ -110,7 +113,7 @@ impl Default for Limits {
             uploads_per_device: Limit::new(30, Duration::from_secs(60)),
             uploads_per_account: Limit::new(60, Duration::from_secs(60)),
             max_uploads_in_flight: 4,
-            max_uploads_in_flight_per_address: 4,
+            max_uploads_in_flight_per_address: 16,
             max_uploads_in_flight_global: 5,
             max_sockets_per_account: 16,
         }
