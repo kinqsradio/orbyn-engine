@@ -63,6 +63,8 @@ Next: passkeys (WebAuthn) as a second sign-in method, TOTP as a second factor, e
 
 ## Merging
 
+Anything received from another device or the server goes through `merge_remote`, which leaves out any field stamped more than an hour ahead of this device's clock and reports it, so one bad clock cannot win a field forever.
+
 Each field carries a hybrid-logical-clock stamp (milliseconds, counter, device). A merge keeps the larger stamp per field, so merging is commutative, associative and idempotent. If two edits carry exactly the same stamp but different values, the one with the greater canonical JSON string wins, so even a reused stamp merges the same way everywhere. A delete is the `_deleted` field and merges like any other edit.
 
 A clock refuses a received stamp more than one hour ahead of its own wall clock (`ClockError::TooFarAhead`) and stays unchanged, so one bad device cannot push every later edit into the future. When the counter of a millisecond is full, the clock moves to the next millisecond instead of repeating a stamp.
