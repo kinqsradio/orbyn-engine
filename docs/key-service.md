@@ -55,7 +55,8 @@ The key service runs as its own container with:
 
 - its own Postgres instance, whose credentials neither the record server nor its database operators hold;
 - its own HSM credentials;
-- one internal API reachable only from `orbyn-server`, authenticated with mutual TLS.
+- an internal API reachable only from `orbyn-server`, authenticated with mutual TLS, for starts, finishes and escrow;
+- a small public API that clients reach directly, on its own hostname, for log heads, lookup proofs and cancels. The record server therefore cannot hide the log from a device or drop a device's cancel.
 
 It does not trust its own rows for time. A recovery's 72 hours are measured from the time in the first witness-cosigned log head that includes the start (see *Transparency log*). Neither a back-dated row nor a host clock set forward can shorten the wait: the witness signs its own time, and an entry without such a head has no start time at all.
 
@@ -118,10 +119,12 @@ It does not trust its own rows for time. A recovery's 72 hours are measured from
 ## Recovery
 
 ```
-none ─start→ waiting_for_email ─code→ waiting (72 h) ─time→ ready ─finish→ finishing → done
-                │ code expires (30 min)     │ cancel              │ cancel
-                └→ expired                  └────────→ cancelled ←┘
+none ─start→ waiting_for_email ─code→ waiting (72 h) ─time→ ready ─finish→ finishing ─seal→ sealed ─commit→ done
+                │ code expires (30 min)     │ cancel          │ cancel     │ 24 h stuck       │ step 4 refuses
+                └→ expired                  └──────→ cancelled ←┘           └→ ready           └→ cancelled
 ```
+
+Cancel is accepted in `waiting_for_email`, `waiting` and `ready`. It is refused in `finishing` and `sealed`, because those end in `done` or, when sealing gets stuck or step 4 refuses, return to `ready` or end `cancelled` on their own. Sealed results are deleted on any cancel, and are never returned to the device before step 4 commits.
 
 ### Start
 
@@ -137,7 +140,7 @@ none ─start→ waiting_for_email ─code→ waiting (72 h) ─time→ ready �
 `POST /v1/recovery/{id}/email {code}`.
 
 - `orbyn-core` asks the key service to start the recovery. The key service:
-  - appends a log entry (`orbyn/recovery-start/v1`: account digest, recovery id, device id and keys);
+  - appends a log entry (`orbyn/recovery-start/v1`: map key, recovery id, device id and keys);
   - waits for the next head the witnesses cosign;
   - returns that head with the inclusion proof.
 
@@ -147,19 +150,21 @@ none ─start→ waiting_for_email ─code→ waiting (72 h) ─time→ ready �
 
 ### Cancel
 
-`POST /v1/recovery/{id}/cancel` from any trusted device of the account, or from the starting device.
+A cancel is a statement signed by a device (`orbyn/recovery-cancel/v1`: account, recovery id, time). The device sends it straight to the key service's public API (`POST /cancel`), not through the record server.
 
-- It is passed to the key service, which appends a cancel entry.
-- Cancelled is final.
+- **Whose cancel counts.** The key service accepts it from the starting device, or from any device key that has signed a service envelope for that account. Envelope senders are the account's trusted devices, and the key service has verified their signatures. It needs no device list from the record server. The record server could add a device of its own and so gain the right to cancel. That only lets it block recoveries, which it can do anyway.
+- **What it records.** The key service appends a cancel entry, and cancelled is final.
+- **Checks on the device.** The device checks that the cancel appears in its account's chain within an hour. If it does not, the device shows a takeover alert and keeps retrying.
+- **From the planner.** The planner's Cancel button, the recovery notice and the email link all lead to this signed cancel on a trusted device. The email itself carries no cancel right.
 
 ### Finish
 
 `POST /v1/recovery/{id}/finish` from the starting device.
 
-1. **The key service decides.** It refuses unless both hold:
+1. **The key service decides.** It refuses when no witness is configured, and otherwise unless both hold:
    - the start's first cosigned head is at least 72 hours older than the newest cosigned head;
    - its log has no cancel for that start.
-2. **The claim is atomic.** `ready` → `finishing` is a compare-and-set in the key service's store, and cancel refuses `finishing`. A cancel that arrives first wins; one that arrives after the claim is refused with `recovery_finishing`.
+2. **The claim is atomic.** `ready` → `finishing` is a compare-and-set in the key service's store. A cancel that arrives first wins; one that arrives after the claim is refused with `recovery_finishing`.
 3. **The key service seals first and changes no account.** `orbyn-core` gives it the account's trusted devices under the account lock, and the key service then:
    - opens the account's service envelopes one at a time (see *Opening one*) and seals each to the device, signed by the current service identity;
    - signs a recovery approval (`orbyn/service-recovery/v1`: account, recovery id, device id and keys, the removed device ids);
@@ -175,7 +180,7 @@ none ─start→ waiting_for_email ─code→ waiting (72 h) ─time→ ready �
 
    Running it again after it committed changes nothing.
 5. **Replays.** A repeated finish returns the stored result without opening the HSM again.
-6. **Stuck in `finishing`.** If sealing keeps failing (HSM down, KEK lost), `finishing` moves back to `ready` after 24 hours. Cancel then works as usual, and a cancel always works before `sealed`. After `sealed` the recovery can only complete, because the old devices are still untouched and keep working until step 4 commits.
+6. **Stuck in `finishing`.** If sealing keeps failing (HSM down, KEK lost), `finishing` moves back to `ready` after 24 hours, and cancel works again. After `sealed`, the recovery either completes in step 4 or, when step 4 refuses, is cancelled. Either way the old devices are untouched until step 4 commits.
 7. **Rotation afterwards.**
    - Before uploading anything, the recovered device rotates every zone key, sending envelopes only to itself and, while Standard, to the service.
    - The server refuses the recovered device's record uploads under a zone key created before the finish, until that zone is rotated.
@@ -205,18 +210,22 @@ none ─start→ waiting_for_email ─code→ waiting (72 h) ─time→ ready �
   - a verifiable map from account digest to that account's own hash chain of entries.
 
   Devices ask for their account's lookup proof. It proves the full chain for the account, or proves there is none, so "nothing for your account" can be checked, not just asserted.
-- **The account digest.** It is HMAC-SHA256 under a key that the account's own devices create at sign-up and share through the keychain. The key service learns the digest, never the key, so the map does not list accounts by id. A recovered device gets the key with the zone keys.
-- **Signed heads.** Heads carry the time, the log size and root, and the map root. They are signed by a **log key** kept apart from the service identities, then **cosigned by at least one independent witness**. A witness checks consistency with the last head it signed and refuses to sign a fork. Production needs one witness run by someone other than Orbyn; who that is is an open decision. Self-hosters may run their own.
-- **Freshness.** A device refuses a head older than 24 hours, or one that is not consistent with the last head it saw.
+- **The map key.** It is `SHA-256(orbyn/log-account/v1 ‖ the account's certified service public key)`. The key service computes it from the service key it holds for the account id, so neither the record server nor anyone else chooses where an entry is filed. A device computes the same value from the service key it verified. The map does not list accounts by id, but anyone who holds an account's service public key can look it up, and that key is given only to the account's own sessions. A service-key rotation is itself logged under the old key and links to the new one.
+- **Signed heads.** Heads carry the time, the log size and root, and the map root. They are signed by a **log key** kept apart from the service identities, then **cosigned by at least one independent witness**. A witness checks consistency with the last head it signed and refuses to sign a fork.
+- **Pinned keys.** The log keys and witness keys are pinned in client configuration, versioned like the service identities. A head signed by any other key is refused.
+- **No witness, no recovery.** Recovery is refused while no witness is configured.
+  - Production needs a witness run by someone other than Orbyn. Who runs it is an open decision.
+  - A self-hoster may run their own, but then the witness is the same operator, so resistance to forks rests only on gossip between devices, which that operator's record server can withhold.
+- **Freshness.** A device refuses a head older than 24 hours, or one that is not consistent with the last head it saw. A missing or failing lookup proof counts the same as a stale head.
 - **Gossip between devices.** Each device writes the last head it verified into a record in a private system zone, so the account's other devices read it encrypted. A device that sees another device's head inconsistent with its own has found a fork and warns.
 - **Checks devices make.** On every sync, and at least daily, a trusted device fetches the newest head, checks it is fresh, consistent and cosigned, then checks its account's lookup proof. It verifies that every recovery and certification in its chain is one it knew of through the normal flow.
 - **What a finding means.** An unknown recovery or key, a fork, or a stale head is shown to the person as a possible takeover.
-- **Availability.** A failed head fetch never blocks sync. The device retries, and after 48 hours without a fresh head it warns that the log cannot be checked.
+- **Availability.** A failed head or proof fetch never blocks sync. The device retries, and after 24 hours without a fresh head and proof it sends a notification, not only an in-app notice: the log cannot be checked, so a recovery might be hidden. With the 72-hour wait, that leaves at least 48 hours to cancel.
 - **Its limit.** The log catches a recovery hidden from the device list. It cannot catch an operator who reads keys without any recovery; the off-machine audit and the HSM roles below are the control for that.
 
 ## Audit and HSM access
 
-- **The audit off the machine.** Every HSM open, certification, rotation and recovery step is written to append-only storage outside the key service's hosts, such as object storage with a retention lock. Each record names the account digest, the recovery id, the device and the time. No keys, codes or emails.
+- **The audit off the machine.** Every HSM open, certification, rotation and recovery step is written to append-only storage outside the key service's hosts, such as object storage with a retention lock. Each record names the map key, the recovery id, the device and the time. No keys, codes or emails.
 - **Separate HSM roles.** Opening envelopes needs the key service's HSM role. Administering the HSM (exporting, rotating, changing policy) needs a separate role held by different people, with two-person approval.
 - **Day-to-day operators.** People who run the record server hold neither HSM role.
 
