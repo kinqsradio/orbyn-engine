@@ -94,15 +94,16 @@ async fn serve(config: Config) -> Result<(), String> {
             let pool_size = db.pool().options().get_max_connections() as usize;
             let mut limits = *store.limits();
             if let Some(cap) = config.max_uploads_in_flight {
-                // Uploads hold a connection for their whole run: leave two for
-                // reads, sign-in and the worker, or the cap stops protecting the pool.
-                let most = pool_size.saturating_sub(2).max(1);
+                // Uploads hold a connection for their whole run: leave one for the
+                // live listener and two for reads and sign-in, or the cap stops
+                // protecting the pool.
+                let most = pool_size.saturating_sub(3).max(1);
                 if cap > most {
                     tracing::warn!(
                         cap,
                         pool_size,
                         used = most,
-                        "ORBYN_MAX_UPLOADS_IN_FLIGHT is above the pool size less two; using the lower value"
+                        "ORBYN_MAX_UPLOADS_IN_FLIGHT is above the pool size less three (the live listener and two spare); using the lower value"
                     );
                 }
                 limits.max_uploads_in_flight_global = cap.min(most);

@@ -62,7 +62,7 @@ pub enum ConfigError {
     InvalidUploadCap,
     #[error("ORBYN_MAX_UPLOADS_PER_ADDRESS is not a whole number from 1 to 1000")]
     InvalidAddressUploadCap,
-    #[error("ORBYN_DATABASE_POOL_SIZE is not a whole number from 2 to 200")]
+    #[error("ORBYN_DATABASE_POOL_SIZE is not a whole number from 4 to 200")]
     InvalidPoolSize,
 }
 
@@ -71,7 +71,7 @@ impl Config {
     /// `ORBYN_ALLOWED_ORIGINS` (comma-separated, default the planner's dev server),
     /// `ORBYN_AUTH_SETUP` and `ORBYN_CLIENT_IP_HEADER` (both optional), and
     /// `ORBYN_PURGE_AFTER_DAYS` (default 30) and `ORBYN_MAX_UPLOADS_IN_FLIGHT`
-    /// (optional, 1 to 1000; default half the database pool).
+    /// (optional, 1 to 1000; default half of the database pool less the live listener).
     pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_lookup(|name| std::env::var(name).ok())
     }
@@ -223,10 +223,10 @@ mod tests {
         };
         let unset = Config::from_lookup(lookup(&[("DATABASE_URL", "postgres://x")]))?;
         assert_eq!(unset.database_pool_size, 10);
-        assert_eq!(with("2")?.database_pool_size, 2);
+        assert_eq!(with("4")?.database_pool_size, 4);
         assert_eq!(with(" 40 ")?.database_pool_size, 40);
         assert_eq!(with("200")?.database_pool_size, 200);
-        for bad in ["1", "0", "201", "-5", "ten", "", "2.5"] {
+        for bad in ["3", "2", "1", "0", "201", "-5", "ten", "", "2.5"] {
             assert_eq!(with(bad).err(), Some(ConfigError::InvalidPoolSize), "{bad}");
         }
         Ok(())

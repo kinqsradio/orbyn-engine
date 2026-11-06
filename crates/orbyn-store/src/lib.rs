@@ -337,7 +337,9 @@ impl Store {
         // Half the pool by default: uploads hold a connection for their whole
         // run, so the other half stays for reads, sign-in and the worker.
         let limits = Limits {
-            max_uploads_in_flight_global: ((pool.options().get_max_connections() / 2) as usize)
+            // Half of what is left after the live listener, which holds one connection for good.
+            max_uploads_in_flight_global: ((pool.options().get_max_connections().saturating_sub(1)
+                / 2) as usize)
                 .max(1),
             ..Limits::default()
         };
@@ -480,12 +482,11 @@ mod tests {
     async fn the_replica_cap_is_half_the_pool_and_the_address_cap_leaves_room() {
         // (pool, replica cap, address cap that applies)
         for (pool, global, address) in [
-            (2, 1, 1),
-            (4, 2, 1),
-            (10, 5, 4),
-            (20, 10, 9),
-            (34, 17, 16),
-            (200, 100, 16),
+            (4, 1, 1),
+            (10, 4, 3),
+            (20, 9, 8),
+            (35, 17, 16),
+            (200, 99, 16),
         ] {
             let store = store_on_pool(pool).await;
             let caps = store.limits().in_flight_caps();

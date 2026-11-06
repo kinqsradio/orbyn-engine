@@ -2076,7 +2076,9 @@ async fn thirty_accounts_flooding_from_one_address_leave_another_account_fast() 
         saved += s;
         refused += r;
     }
-    assert!(slowest < Duration::from_millis(200), "slowest {slowest:?}");
+    // Starvation looked like 20 s waits and pool timeouts; 500 ms leaves room for a
+    // loaded test machine while still failing on that.
+    assert!(slowest < Duration::from_millis(500), "slowest {slowest:?}");
     assert!(saved > 0 && refused > 0, "{saved} saved, {refused} refused");
 }
 

@@ -15,7 +15,9 @@ pub const DEFAULT_POOL_SIZE: u32 = 10;
 /// The bounds of `ORBYN_DATABASE_POOL_SIZE`: two connections are the least the server can work
 /// with (one for a request, one for the limiters and sign-in), and 200 is already more than
 /// one Postgres serves several replicas with.
-pub const MIN_POOL_SIZE: u32 = 2;
+/// At least 4: the server's live listener holds one connection for good, and uploads,
+/// sign-in and fetches need the rest.
+pub const MIN_POOL_SIZE: u32 = 4;
 pub const MAX_POOL_SIZE: u32 = 200;
 
 impl Database {
