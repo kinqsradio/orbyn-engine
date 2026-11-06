@@ -183,7 +183,10 @@ async fn an_expired_lease_after_the_last_attempt_fails_the_job() {
             .await
             .expect("read");
     assert_eq!(row.0, "failed");
-    assert_eq!(row.1.as_deref(), Some("lease expired after the last attempt"));
+    assert_eq!(
+        row.1.as_deref(),
+        Some("lease expired after the last attempt")
+    );
 }
 
 #[tokio::test]
@@ -198,7 +201,11 @@ async fn only_the_running_holder_can_renew() {
     assert!(!jobs::renew(pool, id, "worker-b", lease).await.expect("b"));
     assert!(jobs::renew(pool, id, "worker-a", lease).await.expect("a"));
     jobs::complete(pool, id, "worker-a").await.expect("done");
-    assert!(!jobs::renew(pool, id, "worker-a", lease).await.expect("after"));
+    assert!(
+        !jobs::renew(pool, id, "worker-a", lease)
+            .await
+            .expect("after")
+    );
 }
 
 #[tokio::test]

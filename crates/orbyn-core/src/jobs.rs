@@ -72,13 +72,15 @@ pub async fn claim(
     .bind(lease_secs)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|(id, kind, payload, attempts, idempotency_key)| Job {
-        id,
-        kind,
-        payload,
-        attempts,
-        idempotency_key,
-    }))
+    Ok(
+        row.map(|(id, kind, payload, attempts, idempotency_key)| Job {
+            id,
+            kind,
+            payload,
+            attempts,
+            idempotency_key,
+        }),
+    )
 }
 
 /// Extends the lease of a running job by `lease` from now. Only the holder can
