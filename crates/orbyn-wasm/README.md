@@ -57,10 +57,29 @@ wasm-bindgen --target web --out-dir pkg \
 | sign-up signature | `keys.signRegistration(email, upload)` | `register_message` under `orbyn/device-register/v1`; normalises the email |
 | sign-in signature | `keys.signLogin(loginId)` | `login_message` under `orbyn/device-login/v1`; `loginId` is the UUID from `LoginStarted` |
 | trusted start proof | `keys.signTrustedStart(email, credentialRequest, signedAt)` | `trusted_start_message`; `signedAt` in Unix seconds |
-| approval | `keys.signApproval(accountId, deviceId, signingKey, agreementKey)` | `approval_message` under `orbyn/device-approval/v1` |
 | email | `normalizeEmail(email): string \| undefined` | |
 
 The OPAQUE export key never leaves WebAssembly: it is wiped when `finishRegistration` or `finishLogin` returns. It will be used inside the module when Advanced protection needs it.
+
+## Approving a device
+
+Both screens show the same six digits; the person confirms on each. The protocol and its exact message order are in `docs/architecture.md` (Accounts and devices). The calls, in order:
+
+| Step | Approver (trusted device) | New device |
+| --- | --- | --- |
+| 1 | `s = engine.startApproval(pendingDeviceJson, nowSecs)`; send `s.createJson` to `POST /v1/devices/approvals` | |
+| 2 | | read `GET /v1/devices/current`; `d = engine.joinApproval(approvalJson, nowSecs)`; send `d.nonceJson` to `…/{id}/nonce` |
+| 3 | read `GET /v1/devices/approvals/{id}`; send `s.reveal(approvalJson)` to `…/{id}/reveal` | |
+| 4 | show `s.sas()` and `s.deviceFingerprint()`; only on "They match": send `engine.confirmApproval(s, deviceListJson)` to `…/{id}/confirm` | read `GET /v1/devices/current`; show `d.sas(approvalJson)` |
+| 5 | | only on "They match": `code = engine.finishApproval(d, approvalJson, typedOrUndefined, nowSecs)`; send `{code}` to `…/{id}/code` |
+
+On "They don't match" either device sends `…/{id}/cancel`. Each session works once; a new attempt needs a new approval. `finishApproval` refuses until the approver has confirmed, so poll `GET /v1/devices/current` until `signature` is set.
+
+Removing a device: send `engine.signRemoval(deviceJson)` as the body of `DELETE /v1/devices/{id}`. Deleting a zone: send `engine.deleteZoneProof(zone)` as the body of `DELETE /v1/zones/{zone}`.
+
+## Losing local data
+
+Clearing the site's data (or the browser's storage for it) deletes the sealed device keys, the snapshot and the wrapping key, and none of them can be recovered: the server never had them. If the person has another trusted device, sign in again as a new device, approve it from that device and let it share the zone keys again; the records come back from the server. If this was the person's only device, its encrypted data is lost for good until Standard or Advanced protection (with recovery) exists.
 
 ## Sync engine
 
@@ -73,5 +92,5 @@ The OPAQUE export key never leaves WebAssembly: it is wiped when `finishRegistra
 - `applyChanges(zone, zoneChangesJson, now)`: returns `{changed, removed, trashed, quarantined, unverified_deletes, rejected, more}`.
 - `retryQuarantined(zone, now)` after new keys arrive; `trash(zone)` and `takeFromTrash(zone, id)`.
 - `checkZones(zoneListJson)`: returns `{stale, next}`; follow `next` as `?after=`.
-- Devices and keys: `verifyDevices(deviceListJson)` (the ids this device trusts by approval chain), `pinDevice(id, signingKey, agreementKey)`, `createZoneKey(zone)`, `rotateZoneKey(zone)`, `envelopesFor(zone, deviceListJson)` (a `PutKeyEnvelopes`, only to verified devices), `acceptEnvelopes(keyEnvelopeListJson, deviceListJson)`.
+- Devices and keys: `verifyDevices(deviceListJson)` (the ids this device trusts: its approver, the devices that approver endorsed, and their approval chains, minus signed removals), `pinDevice(id, signingKey, agreementKey)`, `createZoneKey(zone)`, `rotateZoneKey(zone)`, `envelopesFor(zone, deviceListJson)` (a `PutKeyEnvelopes`, only to verified devices), `acceptEnvelopes(keyEnvelopeListJson, deviceListJson)`.
 - `itemToFields(itemJson, beforeJson?, stampJson)` and `itemFromFields(id, fieldsJson)`.

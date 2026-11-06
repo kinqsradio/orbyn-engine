@@ -240,25 +240,6 @@ impl DeviceKeys {
         Ok(self.sign(auth::TRUSTED_START_CONTEXT, &message))
     }
 
-    /// The `signature` of `CreateApproval` for a pending device and its keys
-    /// (base64url, from the device list).
-    #[wasm_bindgen(js_name = signApproval)]
-    pub fn sign_approval(
-        &self,
-        account_id: &str,
-        device_id: &str,
-        signing_key: &str,
-        agreement_key: &str,
-    ) -> Result<Vec<u8>> {
-        let pending = DevicePublic {
-            signing: key32(signing_key)?,
-            agreement: key32(agreement_key)?,
-        };
-        let message =
-            auth::approval_message(&uuid_bytes(account_id)?, &uuid_bytes(device_id)?, &pending);
-        Ok(self.sign(auth::DEVICE_APPROVAL_CONTEXT, &message))
-    }
-
     fn copy(&self) -> Result<orbyn_crypto::DeviceKeys> {
         Ok(orbyn_crypto::DeviceKeys::from_bytes(
             self.keys.to_bytes().as_slice(),
@@ -373,6 +354,78 @@ pub fn item_from_fields(id: &str, fields_json: &str) -> Result<String> {
     let fields: Fields = parse(fields_json)?;
     let item = orbyn_client::item_from_fields(id, &fields).map_err(|e| error("invalid_item", e))?;
     to_json(&item)
+}
+
+/// An approval this trusted device started (steps 1, 3 and 4). Use it once.
+#[wasm_bindgen]
+pub struct ApproverSession {
+    inner: Option<orbyn_client::ApproverPairing>,
+    create: String,
+}
+
+#[wasm_bindgen]
+impl ApproverSession {
+    /// The `CreateApproval` to send (step 1).
+    #[wasm_bindgen(getter, js_name = createJson)]
+    pub fn create_json(&self) -> String {
+        self.create.clone()
+    }
+
+    /// The new device's key fingerprint, to show next to the digits.
+    #[wasm_bindgen(js_name = deviceFingerprint)]
+    pub fn device_fingerprint(&self) -> Result<String> {
+        Ok(self.session()?.device_fingerprint())
+    }
+
+    /// Step 3: reads `GET /v1/devices/approvals/{id}` and returns the
+    /// `ApprovalNonce` to send to `…/reveal`. Refused if the server shows
+    /// other keys than this session started with.
+    pub fn reveal(&mut self, view_json: &str) -> Result<String> {
+        let view: wire::PendingApproval = parse(view_json)?;
+        let session = self
+            .inner
+            .as_mut()
+            .ok_or_else(|| error("already_finished", "this approval was used"))?;
+        to_json(&session.reveal(&view)?)
+    }
+
+    /// The six digits to show after `reveal`.
+    pub fn sas(&self) -> Result<Option<String>> {
+        Ok(self.session()?.sas())
+    }
+
+    fn session(&self) -> Result<&orbyn_client::ApproverPairing> {
+        self.inner
+            .as_ref()
+            .ok_or_else(|| error("already_finished", "this approval was used"))
+    }
+}
+
+/// An approval this new device joined (steps 2 and 5). Use it once.
+#[wasm_bindgen]
+pub struct DeviceSession {
+    inner: Option<orbyn_client::DevicePairing>,
+    nonce: String,
+}
+
+#[wasm_bindgen]
+impl DeviceSession {
+    /// The `ApprovalNonce` to send to `…/nonce` (step 2).
+    #[wasm_bindgen(getter, js_name = nonceJson)]
+    pub fn nonce_json(&self) -> String {
+        self.nonce.clone()
+    }
+
+    /// The six digits to show, once `GET /v1/devices/current` has the
+    /// approver's nonce. Refused if it does not match the commitment.
+    pub fn sas(&self, view_json: &str) -> Result<String> {
+        let view: wire::PendingApproval = parse(view_json)?;
+        let session = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| error("already_finished", "this approval was used"))?;
+        Ok(session.sas(&view)?)
+    }
 }
 
 /// The sync engine for one device.
@@ -589,6 +642,80 @@ impl SyncEngine {
     #[wasm_bindgen(js_name = retryQuarantined)]
     pub fn retry_quarantined(&mut self, zone: &str, now: f64) -> Result<String> {
         to_json(&self.engine.retry_quarantined(zone, millis(now)))
+    }
+
+    /// Step 1 on a trusted device: starts approving `device_json` (a pending
+    /// `Device` from `GET /v1/devices`). `now_secs` is Unix seconds.
+    #[wasm_bindgen(js_name = startApproval)]
+    pub fn start_approval(&self, device_json: &str, now_secs: f64) -> Result<ApproverSession> {
+        let device: wire::Device = parse(device_json)?;
+        let (inner, create) = self.engine.start_approval(&device, now_secs as i64)?;
+        Ok(ApproverSession {
+            create: to_json(&create)?,
+            inner: Some(inner),
+        })
+    }
+
+    /// Step 4, only after the person tapped "They match" on this device:
+    /// the `ConfirmApproval` to send to `…/confirm`. Uses the session up.
+    #[wasm_bindgen(js_name = confirmApproval)]
+    pub fn confirm_approval(
+        &mut self,
+        session: &mut ApproverSession,
+        devices_json: &str,
+    ) -> Result<String> {
+        let devices: wire::DeviceList = parse(devices_json)?;
+        let inner = session
+            .inner
+            .take()
+            .ok_or_else(|| error("already_finished", "this approval was used"))?;
+        to_json(&self.engine.confirm_approval(inner, &devices)?)
+    }
+
+    /// Step 2 on the new device: joins the approval of `GET /v1/devices/current`.
+    #[wasm_bindgen(js_name = joinApproval)]
+    pub fn join_approval(&self, view_json: &str, now_secs: f64) -> Result<DeviceSession> {
+        let view: wire::PendingApproval = parse(view_json)?;
+        let (inner, nonce) = self.engine.join_approval(&view, now_secs as i64)?;
+        Ok(DeviceSession {
+            nonce: to_json(&nonce)?,
+            inner: Some(inner),
+        })
+    }
+
+    /// Step 5, only after the person confirmed on this device (`typed` is the
+    /// approver's digits if the person typed them). Checks everything, then
+    /// trusts the approver and the devices it endorsed; returns the digits to
+    /// send to `…/code`. Uses the session up, also on failure.
+    #[wasm_bindgen(js_name = finishApproval)]
+    pub fn finish_approval(
+        &mut self,
+        session: &mut DeviceSession,
+        view_json: &str,
+        typed: Option<String>,
+        now_secs: f64,
+    ) -> Result<String> {
+        let view: wire::PendingApproval = parse(view_json)?;
+        let inner = session
+            .inner
+            .take()
+            .ok_or_else(|| error("already_finished", "this approval was used"))?;
+        Ok(self
+            .engine
+            .finish_approval(inner, &view, typed.as_deref(), now_secs as i64)?)
+    }
+
+    /// The `RemoveDevice` body that removes `device_json`, signed by this device.
+    #[wasm_bindgen(js_name = signRemoval)]
+    pub fn sign_removal(&self, device_json: &str) -> Result<String> {
+        let device: wire::Device = parse(device_json)?;
+        to_json(&self.engine.sign_removal(&device)?)
+    }
+
+    /// The `DeleteZone` body for `DELETE /v1/zones/{zone}`.
+    #[wasm_bindgen(js_name = deleteZoneProof)]
+    pub fn delete_zone_proof(&self, zone: &str) -> Result<String> {
+        to_json(&self.engine.delete_zone_proof(zone)?)
     }
 
     /// Records another device deleted while this one had edits, as

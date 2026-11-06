@@ -6,29 +6,90 @@ const A: &str = "0000000a-0000-4000-8000-00000000000a";
 const B: &str = "0000000b-0000-4000-8000-00000000000b";
 const SECRET: [u8; 32] = [42; 32];
 
-/// `id` as the server lists it, approved by `approver` (the first device when `None`).
-fn device(id: &str, keys: &DeviceKeys, approver: Option<&DeviceKeys>) -> Value {
-    let signature = approver.map(|a| {
-        let message = auth::approval_message(
-            &uuid_bytes(ACCOUNT).expect("uuid"),
-            &uuid_bytes(id).expect("uuid"),
-            &keys.keys.public(),
-        );
-        URL_SAFE_NO_PAD.encode(a.sign(auth::DEVICE_APPROVAL_CONTEXT, &message))
-    });
-    let approved_by = approver.map(|_| A);
+const NOW_S: f64 = 1_800_000_000.0;
+
+/// `id` as the server lists it, in `state`, not yet approved.
+fn device(id: &str, keys: &DeviceKeys, state: &str) -> Value {
     json!({
         "id": id,
         "name": id,
         "platform": "web",
-        "state": "trusted",
+        "state": state,
         "signing_key": keys.signing_key(),
         "agreement_key": keys.agreement_key(),
         "created_at": "2026-11-07T00:00:00Z",
-        "approved_by": approved_by,
-        "approval_signature": signature,
+        "approved_by": null,
+        "approval_signature": null,
         "current": false,
     })
+}
+
+fn get(v: &Value, key: &str) -> String {
+    v[key].as_str().expect("string").to_owned()
+}
+
+/// The whole approval through the JavaScript API, relayed as the server
+/// would. Returns `new`'s entry as the server lists it afterwards.
+fn approve_json(
+    approver: &mut SyncEngine,
+    approver_id: &str,
+    approver_keys: &DeviceKeys,
+    new: &mut SyncEngine,
+    new_id: &str,
+    new_keys: &DeviceKeys,
+    devices: &Value,
+) -> Result<Value> {
+    let pending = device(new_id, new_keys, "pending");
+    let mut a = approver.start_approval(&pending.to_string(), NOW_S)?;
+    let create: Value =
+        serde_json::from_str(&a.create_json()).map_err(|e| error("invalid_json", e))?;
+    let mut view = json!({
+        "id": create["approval_id"],
+        "expires_at": "",
+        "created_at": create["created_at"],
+        "approver_id": approver_id,
+        "approver_signing_key": approver_keys.signing_key(),
+        "approver_agreement_key": approver_keys.agreement_key(),
+        "device_id": new_id,
+        "device_signing_key": new_keys.signing_key(),
+        "device_agreement_key": new_keys.agreement_key(),
+        "commitment": create["commitment"],
+        "device_nonce": null,
+        "approver_nonce": null,
+        "signature": null,
+        "endorsement": null,
+    });
+    let mut d = new.join_approval(&view.to_string(), NOW_S)?;
+    let nonce: Value =
+        serde_json::from_str(&d.nonce_json()).map_err(|e| error("invalid_json", e))?;
+    view["device_nonce"] = nonce["nonce"].clone();
+    let reveal: Value = serde_json::from_str(&a.reveal(&view.to_string())?)
+        .map_err(|e| error("invalid_json", e))?;
+    view["approver_nonce"] = reveal["nonce"].clone();
+    let on_new = d.sas(&view.to_string())?;
+    assert_eq!(a.sas()?, Some(on_new.clone()));
+    assert_eq!(a.device_fingerprint()?.len(), 19);
+    let confirm: Value =
+        serde_json::from_str(&approver.confirm_approval(&mut a, &devices.to_string())?)
+            .map_err(|e| error("invalid_json", e))?;
+    view["signature"] = confirm["signature"].clone();
+    view["endorsement"] = confirm["endorsement"].clone();
+    assert_eq!(
+        new.finish_approval(&mut d, &view.to_string(), None, NOW_S + 5.0)?,
+        on_new
+    );
+    // Each session works once.
+    assert!(a.reveal(&view.to_string()).is_err());
+    assert!(
+        new.finish_approval(&mut d, &view.to_string(), None, NOW_S)
+            .is_err()
+    );
+    let mut entry = device(new_id, new_keys, "trusted");
+    entry["approved_by"] = json!(approver_id);
+    entry["approval_signature"] = confirm["signature"].clone();
+    entry["approval_id"] = json!(get(&view, "id"));
+    entry["approval_created_at"] = view["created_at"].clone();
+    Ok(entry)
 }
 
 #[test]
@@ -68,24 +129,6 @@ fn device_keys_export_import_and_sign_the_auth_messages() -> Result<()> {
         .expect("64");
     let message = auth::register_message("ada@example.com", b"upload", &public);
     orbyn_crypto::verify(&public, auth::DEVICE_REGISTER_CONTEXT, &message, &signature)?;
-
-    let pending = DeviceKeys::create()?;
-    let account = "11111111-2222-4333-8444-555555555555";
-    let signature: [u8; 64] = keys
-        .sign_approval(
-            account,
-            login_id,
-            &pending.signing_key(),
-            &pending.agreement_key(),
-        )?
-        .try_into()
-        .expect("64");
-    let message = auth::approval_message(
-        &uuid_bytes(account)?,
-        &uuid_bytes(login_id)?,
-        &pending.keys.public(),
-    );
-    orbyn_crypto::verify(&public, auth::DEVICE_APPROVAL_CONTEXT, &message, &signature)?;
 
     let signature: [u8; 64] = keys
         .sign_trusted_start("ada@example.com", b"request", 1_700_000_000.0)?
@@ -127,15 +170,22 @@ fn two_engines_sync_an_item_through_json() -> Result<()> {
     let (a_keys, b_keys) = (DeviceKeys::create()?, DeviceKeys::create()?);
     let mut a = SyncEngine::create(&a_keys, ACCOUNT, A)?;
     let mut b = SyncEngine::create(&b_keys, ACCOUNT, B)?;
-    let devices = json!({"devices": [device(A, &a_keys, None), device(B, &b_keys, Some(&a_keys))]});
+    let only_a = json!({"devices": [device(A, &a_keys, "trusted"), device(B, &b_keys, "pending")]});
+    let b_entry = approve_json(&mut a, A, &a_keys, &mut b, B, &b_keys, &only_a)?;
+    let devices = json!({"devices": [device(A, &a_keys, "trusted"), b_entry.clone()]});
     assert_eq!(b.verify_devices(&devices.to_string())?, to_json(&[A, B])?);
     // A device the server lists with no approval gets no keys.
     let stranger = DeviceKeys::create()?;
     let with_stranger = json!({"devices": [
-        device(A, &a_keys, None),
-        device(B, &b_keys, Some(&a_keys)),
-        device("0000000c-0000-4000-8000-00000000000c", &stranger, None),
+        device(A, &a_keys, "trusted"),
+        b_entry,
+        device("0000000c-0000-4000-8000-00000000000c", &stranger, "trusted"),
     ]});
+    // Removal and zone deletion bodies are signed.
+    let removal: Value =
+        serde_json::from_str(&a.sign_removal(&device(B, &b_keys, "trusted").to_string())?)
+            .map_err(|e| error("invalid_json", e))?;
+    assert_eq!(unb64(&get(&removal, "signature"))?.len(), 64);
 
     a.create_zone_key("inbox")?;
     let put: Value = serde_json::from_str(&a.envelopes_for("inbox", &with_stranger.to_string())?)
