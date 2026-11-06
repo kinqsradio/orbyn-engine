@@ -69,6 +69,7 @@ mod tests {
             kind: kind.into(),
             payload: Default::default(),
             attempts: 1,
+            idempotency_key: None,
         }
     }
 

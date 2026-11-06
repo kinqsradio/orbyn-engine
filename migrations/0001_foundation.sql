@@ -1,11 +1,12 @@
 -- Background work. A worker claims a job with FOR UPDATE SKIP LOCKED and holds a
--- lease; a job whose lease runs out goes back to the queue. The idempotency key
--- makes enqueueing the same effect twice a no-op.
+-- lease; a job whose lease runs out goes back to the queue, or fails when it has
+-- used all its attempts. The idempotency key, scoped to the job kind, makes
+-- enqueueing the same effect twice a no-op.
 CREATE TABLE jobs (
     id              uuid        PRIMARY KEY,
     kind            text        NOT NULL,
     payload         jsonb       NOT NULL DEFAULT '{}'::jsonb,
-    idempotency_key text        UNIQUE,
+    idempotency_key text,
     state           text        NOT NULL DEFAULT 'queued'
                     CHECK (state IN ('queued', 'running', 'done', 'failed')),
     attempts        integer     NOT NULL DEFAULT 0,
@@ -15,7 +16,8 @@ CREATE TABLE jobs (
     lease_until     timestamptz,
     last_error      text,
     created_at      timestamptz NOT NULL DEFAULT now(),
-    updated_at      timestamptz NOT NULL DEFAULT now()
+    updated_at      timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (kind, idempotency_key)
 );
 
 CREATE INDEX jobs_ready ON jobs (run_at) WHERE state = 'queued';

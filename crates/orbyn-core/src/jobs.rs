@@ -12,10 +12,13 @@ pub struct Job {
     pub kind: String,
     pub payload: Value,
     pub attempts: i32,
+    /// The caller's operation identity, if any. Handlers pass it to providers so a
+    /// redelivered job never repeats the effect.
+    pub idempotency_key: Option<String>,
 }
 
-/// Adds a job. With an idempotency key, adding the same key again returns the
-/// existing job's id and adds nothing.
+/// Adds a job. With an idempotency key, adding the same key for the same kind
+/// again returns the existing job's id and adds nothing.
 pub async fn enqueue(
     pool: &PgPool,
     kind: &str,
@@ -25,7 +28,7 @@ pub async fn enqueue(
     let id = Uuid::new_v4();
     let row: (Uuid,) = sqlx::query_as(
         "INSERT INTO jobs (id, kind, payload, idempotency_key) VALUES ($1, $2, $3, $4)
-         ON CONFLICT (idempotency_key) DO UPDATE SET idempotency_key = EXCLUDED.idempotency_key
+         ON CONFLICT (kind, idempotency_key) DO UPDATE SET idempotency_key = EXCLUDED.idempotency_key
          RETURNING id",
     )
     .bind(id)
@@ -38,35 +41,65 @@ pub async fn enqueue(
 }
 
 /// Claims the next ready job for `worker`, holding it for `lease`. A running job
-/// whose lease has expired counts as ready again.
+/// whose lease has expired counts as ready again, unless it has used all its
+/// attempts: then it is marked failed instead of being reclaimed forever.
 pub async fn claim(
     pool: &PgPool,
     worker: &str,
     lease: Duration,
 ) -> Result<Option<Job>, sqlx::Error> {
     let lease_secs = lease.as_secs_f64();
-    let row: Option<(Uuid, String, Value, i32)> = sqlx::query_as(
+    sqlx::query(
+        "UPDATE jobs SET state = 'failed', leased_by = NULL, lease_until = NULL,
+                last_error = 'lease expired after the last attempt', updated_at = now()
+         WHERE state = 'running' AND lease_until < now() AND attempts >= max_attempts",
+    )
+    .execute(pool)
+    .await?;
+    let row: Option<(Uuid, String, Value, i32, Option<String>)> = sqlx::query_as(
         "UPDATE jobs SET state = 'running', attempts = attempts + 1, leased_by = $1,
                 lease_until = now() + make_interval(secs => $2), updated_at = now()
          WHERE id = (
              SELECT id FROM jobs
              WHERE (state = 'queued' AND run_at <= now())
-                OR (state = 'running' AND lease_until < now())
+                OR (state = 'running' AND lease_until < now() AND attempts < max_attempts)
              ORDER BY run_at
              FOR UPDATE SKIP LOCKED
              LIMIT 1)
-         RETURNING id, kind, payload, attempts",
+         RETURNING id, kind, payload, attempts, idempotency_key",
     )
     .bind(worker)
     .bind(lease_secs)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|(id, kind, payload, attempts)| Job {
+    Ok(row.map(|(id, kind, payload, attempts, idempotency_key)| Job {
         id,
         kind,
         payload,
         attempts,
+        idempotency_key,
     }))
+}
+
+/// Extends the lease of a running job by `lease` from now. Only the holder can
+/// renew, and only while the job is running; `false` means the lease was lost and
+/// the holder must abandon its result.
+pub async fn renew(
+    pool: &PgPool,
+    id: Uuid,
+    worker: &str,
+    lease: Duration,
+) -> Result<bool, sqlx::Error> {
+    let renewed = sqlx::query(
+        "UPDATE jobs SET lease_until = now() + make_interval(secs => $3), updated_at = now()
+         WHERE id = $1 AND state = 'running' AND leased_by = $2",
+    )
+    .bind(id)
+    .bind(worker)
+    .bind(lease.as_secs_f64())
+    .execute(pool)
+    .await?;
+    Ok(renewed.rows_affected() == 1)
 }
 
 /// Marks a job done. Only the worker holding the lease can finish it.
