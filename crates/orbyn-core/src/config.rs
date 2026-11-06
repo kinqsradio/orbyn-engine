@@ -2,6 +2,10 @@
 //! are secrets and are never logged.
 
 use std::net::SocketAddr;
+use std::time::Duration;
+
+/// Days tombstones and deleted zones are kept by default.
+pub const DEFAULT_PURGE_DAYS: u64 = 30;
 
 #[derive(Clone)]
 pub struct Config {
@@ -16,6 +20,9 @@ pub struct Config {
     /// `x-forwarded-for`; the last address in it is used. Without it, the
     /// connection's own address is used.
     pub client_ip_header: Option<String>,
+    /// How long tombstones and deleted zones are kept before the worker purges
+    /// them. A device that was offline longer fetches the zone from the start.
+    pub purge_after: Duration,
 }
 
 impl std::fmt::Debug for Config {
@@ -26,6 +33,7 @@ impl std::fmt::Debug for Config {
             .field("allowed_origins", &self.allowed_origins)
             .field("auth_setup", &self.auth_setup.as_ref().map(|_| "(hidden)"))
             .field("client_ip_header", &self.client_ip_header)
+            .field("purge_after", &self.purge_after)
             .finish()
     }
 }
@@ -36,12 +44,15 @@ pub enum ConfigError {
     MissingDatabaseUrl,
     #[error("ORBYN_BIND is not an address and port, such as 0.0.0.0:8080")]
     InvalidBind,
+    #[error("ORBYN_PURGE_AFTER_DAYS is not a whole number of days from 1 to 3650")]
+    InvalidRetention,
 }
 
 impl Config {
     /// Reads `DATABASE_URL`, `ORBYN_BIND` (default `127.0.0.1:8080`) and
     /// `ORBYN_ALLOWED_ORIGINS` (comma-separated, default the planner's dev server),
-    /// `ORBYN_AUTH_SETUP` and `ORBYN_CLIENT_IP_HEADER` (both optional).
+    /// `ORBYN_AUTH_SETUP` and `ORBYN_CLIENT_IP_HEADER` (both optional), and
+    /// `ORBYN_PURGE_AFTER_DAYS` (default 30).
     pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_lookup(|name| std::env::var(name).ok())
     }
@@ -65,12 +76,22 @@ impl Config {
                 .map(|v| v.trim().to_owned())
                 .filter(|v| !v.is_empty())
         };
+        let purge_days: u64 = match get("ORBYN_PURGE_AFTER_DAYS") {
+            None => DEFAULT_PURGE_DAYS,
+            Some(text) => text
+                .trim()
+                .parse()
+                .ok()
+                .filter(|days| (1..=3650).contains(days))
+                .ok_or(ConfigError::InvalidRetention)?,
+        };
         Ok(Self {
             database_url,
             bind,
             allowed_origins,
             auth_setup: optional("ORBYN_AUTH_SETUP"),
             client_ip_header: optional("ORBYN_CLIENT_IP_HEADER").map(|v| v.to_lowercase()),
+            purge_after: Duration::from_secs(purge_days * 24 * 60 * 60),
         })
     }
 }
@@ -95,6 +116,29 @@ mod tests {
         assert_eq!(config.allowed_origins, vec!["http://localhost:5173"]);
         assert_eq!(config.auth_setup, None);
         assert_eq!(config.client_ip_header, None);
+        assert_eq!(config.purge_after, Duration::from_secs(30 * 24 * 60 * 60));
+        Ok(())
+    }
+
+    #[test]
+    fn the_retention_window_is_configurable_within_bounds() -> Result<(), ConfigError> {
+        let with = |days: &str| {
+            Config::from_lookup(lookup(&[
+                ("DATABASE_URL", "postgres://x"),
+                ("ORBYN_PURGE_AFTER_DAYS", days),
+            ]))
+        };
+        assert_eq!(
+            with("7")?.purge_after,
+            Duration::from_secs(7 * 24 * 60 * 60)
+        );
+        for bad in ["0", "-1", "soon", "", "3651"] {
+            assert_eq!(
+                with(bad).err(),
+                Some(ConfigError::InvalidRetention),
+                "{bad}"
+            );
+        }
         Ok(())
     }
 

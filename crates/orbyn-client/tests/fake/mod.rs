@@ -8,6 +8,8 @@ use std::collections::BTreeMap;
 #[derive(Default)]
 struct Zone {
     seq: i64,
+    /// The highest tombstone version purged; older tokens have expired.
+    floor: i64,
     records: BTreeMap<String, wire::Record>,
     /// Operation id to (batch, answer).
     operations: BTreeMap<String, (Vec<wire::RecordChange>, wire::UploadResult)>,
@@ -153,12 +155,46 @@ impl FakeStore {
         } else {
             z.seq
         };
+        // Mid-way through reading from the start below the floor, as the real
+        // server: a token that does not look stale.
+        let partial = more && (since.is_none_or(|t| t.starts_with('p'))) && next < z.floor;
         wire::ZoneChanges {
             records: records.into_iter().cloned().collect(),
-            token: token(next),
+            token: if partial {
+                format!("p{next}")
+            } else {
+                token(next)
+            },
             more,
             zone_deleted: false,
         }
+    }
+
+    /// Removes every tombstone, as a purge after the retention window would,
+    /// and raises the zone's floor to the highest version removed.
+    pub fn purge_tombstones(&mut self, zone: &str) {
+        let z = self.zones.get_mut(zone).expect("zone");
+        let gone: Vec<(String, i64)> = z
+            .records
+            .values()
+            .filter(|r| r.deleted)
+            .map(|r| (r.record_id.clone(), r.version))
+            .collect();
+        for (id, version) in gone {
+            z.records.remove(&id);
+            z.floor = z.floor.max(version);
+        }
+    }
+
+    /// Like [`FakeStore::changes`], but `None` when the token is older than a
+    /// purge: the server's `token_expired`.
+    pub fn try_changes(&self, zone: &str, since: Option<&str>) -> Option<wire::ZoneChanges> {
+        // From the start always works; a token must not be older than the floor.
+        let expired = since
+            .filter(|t| t.starts_with('t'))
+            .map(|t| t[1..].parse::<i64>().expect("token"))
+            .is_some_and(|after| after < self.zones[zone].floor);
+        (!expired).then(|| self.changes(zone, since))
     }
 
     pub fn list_zones(&self, after: Option<&str>) -> wire::ZoneList {

@@ -157,6 +157,7 @@ impl IntoResponse for Refusal {
             StoreError::ZoneNotFound => (StatusCode::NOT_FOUND, "zone_not_found"),
             StoreError::ZoneDeleted => (StatusCode::CONFLICT, "zone_deleted"),
             StoreError::InvalidToken => (StatusCode::BAD_REQUEST, "invalid_change_token"),
+            StoreError::TokenExpired => (StatusCode::GONE, "token_expired"),
             StoreError::OperationReused => (StatusCode::CONFLICT, "operation_reused"),
             StoreError::TooManyZones => (StatusCode::UNPROCESSABLE_ENTITY, "too_many_zones"),
             StoreError::TooManyRecords => (StatusCode::UNPROCESSABLE_ENTITY, "too_many_records"),

@@ -278,6 +278,16 @@ impl Store {
                 _ => false,
             };
             if !matches {
+                // The device holds a version of a record the server no longer
+                // has. Only a purge removes rows, so the record was deleted and
+                // its tombstone purged; the device must fetch before it writes.
+                if server.is_none()
+                    && change
+                        .expected_version()
+                        .is_some_and(|v| v <= row.purge_floor)
+                {
+                    return Err(StoreError::TokenExpired);
+                }
                 conflicts.push(Conflict {
                     record_id: change.record_id().to_owned(),
                     server_record: server.cloned(),
@@ -470,6 +480,7 @@ impl Store {
         // The zone's sequence is read first: every write up to it has
         // committed, because writes hold the zone row until they commit.
         let row = find(&self.pool, session, zone, false).await?;
+        let mut resuming = false;
         let from = match since {
             None => 0,
             Some(text) => {
@@ -477,6 +488,18 @@ impl Store {
                 if !token.fits(row.id, row.seq) {
                     return Err(StoreError::InvalidToken);
                 }
+                // The device may have missed a delete that was purged since.
+                // A token from the middle of a fetch from the start is exempt
+                // while the floor is the one it was made under: that device
+                // reads what the purge left, whatever it held before.
+                let expired = match token.floor() {
+                    None => token.seq() < row.purge_floor,
+                    Some(made_under) => made_under != row.purge_floor,
+                };
+                if expired {
+                    return Err(StoreError::TokenExpired);
+                }
+                resuming = token.floor().is_some();
                 token.seq()
             }
         };
@@ -509,9 +532,17 @@ impl Store {
             (true, Some(last)) => last.version,
             _ => row.seq,
         };
+        // Reading from the start (or resuming that) below the purge floor: the
+        // next token must not look like a stale one.
+        let from_start = since.is_none() || resuming;
+        let token = if more && from_start && seq < row.purge_floor {
+            ChangeToken::partial(row.id, seq, row.purge_floor)
+        } else {
+            ChangeToken::new(row.id, seq)
+        };
         Ok(Changes {
             records,
-            token: ChangeToken::new(row.id, seq),
+            token,
             more,
             zone_deleted: row.deleted,
         })

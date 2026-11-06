@@ -571,3 +571,80 @@ async fn an_account_over_its_socket_cap_is_refused_with_a_code() {
     auth(&mut socket, &other).await;
     assert_eq!(next_json(&mut socket).await["type"], "ready");
 }
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_token_from_before_a_purge_is_answered_token_expired() {
+    let server = server().await;
+    let (_, token) = server.sign_up().await;
+    let token = token.as_str();
+    let (status, _) = server
+        .call(Method::PUT, "/v1/zones/inbox", Some(token), None)
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, saved) = server
+        .call(
+            Method::POST,
+            "/v1/zones/inbox/changes",
+            Some(token),
+            Some(upload(vec![save("a", Value::Null, b"x")])),
+        )
+        .await;
+    let early = saved["token"].as_str().expect("token").to_owned();
+    let (status, _) = server
+        .call(
+            Method::POST,
+            "/v1/zones/inbox/changes",
+            Some(token),
+            Some(upload(vec![
+                json!({"op": "delete", "record_id": "a", "expected_version": 1}),
+            ])),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    // The zone's id is the first half of any of its tokens.
+    let zone_id = Uuid::from_slice(&unb64(&json!(early))[..16]).expect("zone id");
+    orbyn_core::sqlx::query(
+        "UPDATE records SET modified_at = now() - interval '40 days' WHERE deleted AND zone_id = $1",
+    )
+    .bind(zone_id)
+    .execute(server.db.pool())
+    .await
+    .expect("age");
+    for _ in 0..20 {
+        orbyn_store::purge(
+            server.db.pool(),
+            Duration::from_secs(30 * 86_400),
+            1000,
+            100,
+        )
+        .await
+        .expect("purge");
+        let (_, all) = server
+            .call(Method::GET, "/v1/zones/inbox/changes", Some(token), None)
+            .await;
+        if all["records"].as_array().expect("records").is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let (status, body) = server
+        .call(
+            Method::GET,
+            &format!("/v1/zones/inbox/changes?since={early}"),
+            Some(token),
+            None,
+        )
+        .await;
+    assert_eq!(
+        (status, &body["code"]),
+        (StatusCode::GONE, &json!("token_expired")),
+        "{body}"
+    );
+    // From the start still works.
+    let (status, _) = server
+        .call(Method::GET, "/v1/zones/inbox/changes", Some(token), None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+}

@@ -62,6 +62,7 @@ impl From<ClientError> for Error {
             ClientError::Mismatch => "mismatch",
             ClientError::InvalidInput => "invalid_input",
             ClientError::Random => "random_failed",
+            ClientError::ExpiredAgain => "expired_again",
         };
         error(code, err)
     }
@@ -561,6 +562,13 @@ impl SyncEngine {
     #[wasm_bindgen(js_name = abandonUpload)]
     pub fn abandon_upload(&mut self, zone: &str) -> Result<()> {
         Ok(self.engine.abandon_upload(zone)?)
+    }
+
+    /// Call on a `token_expired` answer to a fetch or an upload: the token is
+    /// forgotten, so `token(zone)` is empty and the zone is fetched from the start.
+    #[wasm_bindgen(js_name = tokenExpired)]
+    pub fn token_expired(&mut self, zone: &str) -> Result<()> {
+        Ok(self.engine.token_expired(zone)?)
     }
 
     /// Applies one `ZoneChanges` page; returns what changed (`Applied`).

@@ -21,12 +21,14 @@
 mod inflight;
 mod keychain;
 mod live;
+mod purge;
 mod records;
 mod token;
 mod zones;
 
 pub use keychain::{Envelope, KEY_ID_LEN, NewEnvelope, Rotation};
 pub use live::{Feed, Hub, Notice};
+pub use purge::{Purged, purge};
 pub use token::ChangeToken;
 
 use chrono::{DateTime, Utc};
@@ -128,6 +130,11 @@ pub enum StoreError {
     ZoneDeleted,
     #[error("the change token is not valid for this zone")]
     InvalidToken,
+    /// Tombstones the device has not seen were purged; fetch the zone from the start.
+    #[error(
+        "the change token is older than the zone's purged history; fetch the zone from the start"
+    )]
+    TokenExpired,
     /// The atomic upload wrote nothing. Each conflict carries the server's record.
     #[error("records changed on the server")]
     RecordChanged(Vec<Conflict>),

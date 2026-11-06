@@ -1645,6 +1645,7 @@ name = "orbyn-worker"
 version = "0.1.0"
 dependencies = [
  "orbyn-core",
+ "orbyn-store",
  "tokio",
  "tracing",
 ]

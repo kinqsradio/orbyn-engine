@@ -1431,3 +1431,376 @@ async fn a_flood_from_one_account_leaves_the_pool_to_others() {
         "{saved} saved, {limited} limited"
     );
 }
+
+/// An ordinary token for the same zone at another position.
+fn at(token: &ChangeToken, seq: i64) -> String {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let mut bytes = URL_SAFE_NO_PAD.decode(token.encode()).expect("token");
+    bytes.truncate(24);
+    bytes[16..].copy_from_slice(&seq.to_be_bytes());
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+const MONTH: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// Makes a record look `days` old, as if time had passed.
+async fn age_record(db: &Database, session: &Session, zone: &str, record: &str, days: i32) {
+    sqlx::query(
+        "UPDATE records SET modified_at = now() - make_interval(days => $4)
+         WHERE record_id = $3 AND zone_id = (SELECT id FROM zones WHERE owner_id = $1 AND name = $2)",
+    )
+    .bind(session.account_id)
+    .bind(zone)
+    .bind(record)
+    .bind(days)
+    .execute(db.pool())
+    .await
+    .expect("age");
+}
+
+async fn age_zone(db: &Database, session: &Session, zone: &str, days: i32) {
+    sqlx::query(
+        "UPDATE zones SET deleted_at = now() - make_interval(days => $3)
+         WHERE owner_id = $1 AND name = $2",
+    )
+    .bind(session.account_id)
+    .bind(zone)
+    .bind(days)
+    .execute(db.pool())
+    .await
+    .expect("age");
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn only_tombstones_older_than_the_window_are_purged_and_old_tokens_expire() {
+    let (store, db) = store().await;
+    let me = trusted(&db).await;
+    store.create_zone(&me, "list").await.expect("zone");
+    let first = store
+        .upload(
+            &me,
+            "list",
+            &batch(vec![
+                save("old", None, b"1"),
+                save("young", None, b"2"),
+                save("live", None, b"3"),
+            ]),
+        )
+        .await
+        .expect("upload");
+    let early = first.token;
+    let deleted = store
+        .upload(
+            &me,
+            "list",
+            &batch(vec![delete("old", 1), delete("young", 2)]),
+        )
+        .await
+        .expect("delete");
+    age_record(&db, &me, "list", "old", 40).await;
+    age_record(&db, &me, "list", "live", 40).await; // old but live: never purged
+
+    let purged = orbyn_store::purge(db.pool(), MONTH, 1000, 10)
+        .await
+        .expect("purge");
+    // Other tests share the database: this account's rows are what count.
+    assert!(purged.records >= 1);
+    let all = store
+        .fetch_changes(&me, "list", None, None)
+        .await
+        .expect("from the start");
+    let ids: Vec<&str> = all.records.iter().map(|r| r.record_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        ["live", "young"],
+        "the old tombstone is gone, nothing else"
+    );
+
+    // A token before the purged delete (version 4) has expired; one at or after it has not.
+    assert!(matches!(
+        store
+            .fetch_changes(&me, "list", Some(&early.encode()), None)
+            .await,
+        Err(StoreError::TokenExpired)
+    ));
+    store
+        .fetch_changes(&me, "list", Some(&at(&early, 4)), None)
+        .await
+        .expect("a device that saw the delete is current");
+    store
+        .fetch_changes(&me, "list", Some(&deleted.token.encode()), None)
+        .await
+        .expect("so is one past it");
+
+    // A write naming the version of the purged record must fetch first, not
+    // bring the record back; a version above the floor is an ordinary conflict.
+    let stale = store
+        .upload(&me, "list", &batch(vec![save("old", Some(1), b"back")]))
+        .await;
+    assert!(matches!(stale, Err(StoreError::TokenExpired)), "{stale:?}");
+    let conflict = store
+        .upload(&me, "list", &batch(vec![save("never", Some(99), b"x")]))
+        .await;
+    assert!(
+        matches!(conflict, Err(StoreError::RecordChanged(_))),
+        "{conflict:?}"
+    );
+    // Creating it afresh is fine.
+    store
+        .upload(&me, "list", &batch(vec![save("old", None, b"new")]))
+        .await
+        .expect("a new record under the id");
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_purge_works_in_bounded_batches_oldest_version_first() {
+    let (store, db) = store().await;
+    let me = trusted(&db).await;
+    store.create_zone(&me, "list").await.expect("zone");
+    let ids: Vec<String> = (0..5).map(|n| format!("r{n}")).collect();
+    store
+        .upload(
+            &me,
+            "list",
+            &batch(ids.iter().map(|id| save(id, None, b"x")).collect()),
+        )
+        .await
+        .expect("upload");
+    store
+        .upload(
+            &me,
+            "list",
+            &batch(
+                ids.iter()
+                    .enumerate()
+                    .map(|(n, id)| delete(id, n as i64 + 1))
+                    .collect(),
+            ),
+        )
+        .await
+        .expect("delete");
+    for id in &ids {
+        age_record(&db, &me, "list", id, 40).await;
+    }
+    let remaining = || async {
+        store
+            .fetch_changes(&me, "list", None, None)
+            .await
+            .expect("fetch")
+            .records
+            .len()
+    };
+    // Only this account's rows can change the count of its zone; a step removes
+    // at most `batch` of them even if other tests' tombstones are purged too.
+    let mut left = 5;
+    for expected in [3, 1, 0] {
+        orbyn_store::purge(db.pool(), MONTH, 2, 1)
+            .await
+            .expect("step");
+        let now = remaining().await;
+        assert!(
+            now <= left && now >= expected,
+            "{now} left, expected about {expected}"
+        );
+        left = now;
+    }
+    // Run to the end: nothing is left, and the floor is above every version
+    // that was purged, so the token from before the first delete has expired.
+    // Another test's purge may hold a zone for a moment; a busy zone waits for the next run.
+    for _ in 0..20 {
+        orbyn_store::purge(db.pool(), MONTH, 2, 100)
+            .await
+            .expect("rest");
+        if remaining().await == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(remaining().await, 0);
+    let current = store
+        .fetch_changes(&me, "list", None, None)
+        .await
+        .expect("fetch")
+        .token;
+    assert!(matches!(
+        store
+            .fetch_changes(&me, "list", Some(&at(&current, 5)), None)
+            .await,
+        Err(StoreError::TokenExpired)
+    ));
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn limits_count_only_what_is_retained() {
+    let (store, db) = store_with(Limits {
+        max_records_per_zone: 3,
+        max_zones: 2,
+        ..Limits::default()
+    })
+    .await;
+    let me = trusted(&db).await;
+    store.create_zone(&me, "a").await.expect("a");
+    store.create_zone(&me, "b").await.expect("b");
+    assert!(matches!(
+        store.create_zone(&me, "c").await,
+        Err(StoreError::TooManyZones)
+    ));
+    // A zone of three records, all deleted: the tombstones still fill it.
+    store
+        .upload(
+            &me,
+            "a",
+            &batch(vec![
+                save("1", None, b"x"),
+                save("2", None, b"x"),
+                save("3", None, b"x"),
+            ]),
+        )
+        .await
+        .expect("fill");
+    store
+        .upload(
+            &me,
+            "a",
+            &batch(vec![delete("1", 1), delete("2", 2), delete("3", 3)]),
+        )
+        .await
+        .expect("delete");
+    let full = store
+        .upload(&me, "a", &batch(vec![save("4", None, b"x")]))
+        .await;
+    assert!(matches!(full, Err(StoreError::TooManyRecords)), "{full:?}");
+    // Deleted zone b still holds its name.
+    store.delete_zone(&me, "b", None).await.expect("delete b");
+
+    // Young tombstones and a young deleted zone are not purged.
+    orbyn_store::purge(db.pool(), MONTH, 1000, 100)
+        .await
+        .expect("purge");
+    assert!(matches!(
+        store
+            .upload(&me, "a", &batch(vec![save("4", None, b"x")]))
+            .await,
+        Err(StoreError::TooManyRecords)
+    ));
+    assert!(matches!(
+        store.create_zone(&me, "c").await,
+        Err(StoreError::TooManyZones)
+    ));
+
+    for id in ["1", "2", "3"] {
+        age_record(&db, &me, "a", id, 40).await;
+    }
+    age_zone(&db, &me, "b", 40).await;
+    let purged = orbyn_store::purge(db.pool(), MONTH, 1000, 100)
+        .await
+        .expect("purge");
+    assert!(purged.records >= 3 && purged.zones >= 1, "{purged:?}");
+
+    // Both limits have room again.
+    store
+        .upload(&me, "a", &batch(vec![save("4", None, b"x")]))
+        .await
+        .expect("room for a record");
+    // The purged zone's name is free again, as a new empty zone.
+    let (b, created) = store.create_zone(&me, "b").await.expect("room for a zone");
+    assert!(created);
+    assert_eq!(b.token.seq(), 0);
+    // Only the retained zones count.
+    assert!(matches!(
+        store.create_zone(&me, "c").await,
+        Err(StoreError::TooManyZones)
+    ));
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn paging_from_the_start_below_the_floor_is_not_mistaken_for_a_stale_token() {
+    let (store, db) = store().await;
+    let me = trusted(&db).await;
+    store.create_zone(&me, "list").await.expect("zone");
+    store
+        .upload(
+            &me,
+            "list",
+            &batch(vec![
+                save("x1", None, b"x"),
+                save("x2", None, b"x"),
+                save("live1", None, b"x"),
+                save("live2", None, b"x"),
+            ]),
+        )
+        .await
+        .expect("upload");
+    store
+        .upload(&me, "list", &batch(vec![delete("x1", 1), delete("x2", 2)]))
+        .await
+        .expect("delete");
+    for id in ["x1", "x2"] {
+        age_record(&db, &me, "list", id, 40).await;
+    }
+    let purged_zone = |db: &Database| {
+        let pool = db.pool().clone();
+        async move {
+            for _ in 0..20 {
+                orbyn_store::purge(&pool, MONTH, 1000, 100)
+                    .await
+                    .expect("purge");
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        }
+    };
+    purged_zone(&db).await;
+
+    // Floor is 6 (the second delete). Page one ends at version 3, below it.
+    let first = store
+        .fetch_changes(&me, "list", None, Some(1))
+        .await
+        .expect("first page");
+    assert!(first.more);
+    assert_eq!(first.records[0].record_id, "live1");
+    assert!(first.token.seq() < 6, "the page token is below the floor");
+    // That token is for a device reading what the purge left: it resumes.
+    let second = store
+        .fetch_changes(&me, "list", Some(&first.token.encode()), Some(1))
+        .await
+        .expect("a mid-way token below the floor still works");
+    assert_eq!(second.records[0].record_id, "live2");
+    assert!(!second.more);
+    assert_eq!(second.token.seq(), 6);
+
+    // A genuinely stale token is still refused.
+    assert!(matches!(
+        store
+            .fetch_changes(&me, "list", Some(&at(&first.token, 3)), None)
+            .await,
+        Err(StoreError::TokenExpired)
+    ));
+
+    // If the floor moves while the device is part-way, the resume is refused too.
+    store
+        .upload(&me, "list", &batch(vec![save("y", None, b"x")]))
+        .await
+        .expect("y");
+    store
+        .upload(&me, "list", &batch(vec![delete("y", 7)]))
+        .await
+        .expect("delete y");
+    age_record(&db, &me, "list", "y", 40).await;
+    for _ in 0..20 {
+        purged_zone(&db).await;
+        if matches!(
+            store
+                .fetch_changes(&me, "list", Some(&first.token.encode()), Some(1))
+                .await,
+            Err(StoreError::TokenExpired)
+        ) {
+            return;
+        }
+    }
+    panic!("a token made under an older floor must expire");
+}

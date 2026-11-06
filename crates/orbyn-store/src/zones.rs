@@ -14,6 +14,8 @@ pub(crate) struct ZoneRow {
     pub live_records: i32,
     pub total_records: i64,
     pub deleted: bool,
+    /// The highest tombstone version purged; tokens below it have expired.
+    pub purge_floor: i64,
 }
 
 /// The session account's zone named `name`. Only the owner can reach a zone
@@ -26,24 +28,26 @@ pub(crate) async fn find<'e, E: sqlx::PgExecutor<'e>>(
     lock: bool,
 ) -> Result<ZoneRow> {
     let sql = if lock {
-        "SELECT id, seq, live_records, total_records::bigint, deleted_at IS NOT NULL FROM zones
+        "SELECT id, seq, live_records, total_records::bigint, deleted_at IS NOT NULL, purge_floor FROM zones
          WHERE owner_id = $1 AND name = $2 FOR UPDATE"
     } else {
-        "SELECT id, seq, live_records, total_records::bigint, deleted_at IS NOT NULL FROM zones
+        "SELECT id, seq, live_records, total_records::bigint, deleted_at IS NOT NULL, purge_floor FROM zones
          WHERE owner_id = $1 AND name = $2"
     };
-    let row: Option<(Uuid, i64, i32, i64, bool)> = sqlx::query_as(sql)
+    let row: Option<(Uuid, i64, i32, i64, bool, i64)> = sqlx::query_as(sql)
         .bind(session.account_id)
         .bind(name)
         .fetch_optional(executor)
         .await?;
-    let (id, seq, live_records, total_records, deleted) = row.ok_or(StoreError::ZoneNotFound)?;
+    let (id, seq, live_records, total_records, deleted, purge_floor) =
+        row.ok_or(StoreError::ZoneNotFound)?;
     Ok(ZoneRow {
         id,
         seq,
         live_records,
         total_records,
         deleted,
+        purge_floor,
     })
 }
 
