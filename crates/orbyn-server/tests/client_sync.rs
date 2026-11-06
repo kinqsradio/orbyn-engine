@@ -210,39 +210,6 @@ impl Server {
         assert_eq!(status, StatusCode::OK, "{session}");
         serde_json::from_value(session).expect("session")
     }
-
-    /// The trusted device approves the pending one and the pending one types the code.
-    async fn approve(
-        &self,
-        trusted: &(DeviceKeys, String),
-        pending: &wire::SessionCreated,
-        keys: &DevicePublic,
-    ) {
-        let account = Uuid::parse_str(&pending.account_id).expect("uuid");
-        let device = Uuid::parse_str(&pending.device_id).expect("uuid");
-        let signature = trusted.0.sign(
-            auth::DEVICE_APPROVAL_CONTEXT,
-            &auth::approval_message(account.as_bytes(), device.as_bytes(), keys),
-        );
-        let approval: wire::ApprovalCreated = self
-            .ok(
-                Method::POST,
-                "/v1/devices/approvals",
-                &trusted.1,
-                Some(json!({"device_id": pending.device_id, "signature": b64(&signature)})),
-                StatusCode::CREATED,
-            )
-            .await;
-        let (status, body) = self
-            .call(
-                Method::POST,
-                &format!("/v1/devices/approvals/{}/code", approval.id),
-                Some(&pending.token),
-                Some(json!({"code": approval.code})),
-            )
-            .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-    }
 }
 
 /// One device: its engine and session.
@@ -251,6 +218,116 @@ struct Device {
     token: String,
     id: String,
     now: u64,
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// The open approval the device sees in `GET /v1/devices/current`.
+async fn current_approval(server: &Server, token: &str) -> wire::PendingApproval {
+    let current: wire::CurrentDevice = server
+        .ok(
+            Method::GET,
+            "/v1/devices/current",
+            token,
+            None,
+            StatusCode::OK,
+        )
+        .await;
+    current.approval.expect("an open approval")
+}
+
+/// The whole two-way approval over HTTP, with the person confirming that both
+/// screens show the same digits.
+async fn approve(server: &Server, approver: &mut Device, new: &mut Device) {
+    let list = approver.devices(server).await;
+    let pending = list
+        .devices
+        .iter()
+        .find(|d| d.id == new.id)
+        .expect("the new device is listed")
+        .clone();
+    let (mut pa, create) = approver
+        .engine
+        .start_approval(&pending, now_secs())
+        .expect("start");
+    let created: wire::ApprovalCreated = server
+        .ok(
+            Method::POST,
+            "/v1/devices/approvals",
+            &approver.token,
+            Some(value(&create)),
+            StatusCode::CREATED,
+        )
+        .await;
+    let step = |name: &str| format!("/v1/devices/approvals/{}/{name}", created.id);
+    let view = current_approval(server, &new.token).await;
+    let (pd, nonce) = new.engine.join_approval(&view, now_secs()).expect("join");
+    let (status, body) = server
+        .call(
+            Method::POST,
+            &step("nonce"),
+            Some(&new.token),
+            Some(value(&nonce)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let on_approver: wire::PendingApproval = server
+        .ok(
+            Method::GET,
+            &format!("/v1/devices/approvals/{}", created.id),
+            &approver.token,
+            None,
+            StatusCode::OK,
+        )
+        .await;
+    let reveal = pa.reveal(&on_approver).expect("reveal");
+    let (status, body) = server
+        .call(
+            Method::POST,
+            &step("reveal"),
+            Some(&approver.token),
+            Some(value(&reveal)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let view = current_approval(server, &new.token).await;
+    let on_new = pd.sas(&view).expect("sas");
+    assert_eq!(
+        pa.sas(),
+        Some(on_new.clone()),
+        "both screens show the same digits"
+    );
+    let confirm = approver
+        .engine
+        .confirm_approval(pa, &list)
+        .expect("confirm");
+    let (status, body) = server
+        .call(
+            Method::POST,
+            &step("confirm"),
+            Some(&approver.token),
+            Some(value(&confirm)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let view = current_approval(server, &new.token).await;
+    let code = new
+        .engine
+        .finish_approval(pd, &view, None, now_secs())
+        .expect("finish");
+    let (status, body) = server
+        .call(
+            Method::POST,
+            &step("code"),
+            Some(&new.token),
+            Some(json!({"code": code})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 fn value<T: Serialize>(v: &T) -> Value {
@@ -346,14 +423,6 @@ async fn two_devices_sync_encrypted_tasks_through_the_server() {
         (status, &body["code"]),
         (StatusCode::FORBIDDEN, &json!("device_not_trusted"))
     );
-    server
-        .approve(
-            &(copy(&a_keys), a_session.token.clone()),
-            &b_session,
-            &b_keys.public(),
-        )
-        .await;
-
     let now = 1_800_000_000_000;
     let mut a = Device {
         engine: Engine::new(copy(&a_keys), &a_session.account_id, &a_session.device_id)
@@ -369,6 +438,7 @@ async fn two_devices_sync_encrypted_tasks_through_the_server() {
         id: b_session.device_id.clone(),
         now,
     };
+    approve(&server, &mut a, &mut b).await;
 
     // A makes the zone and its key, and seals the key to B.
     let _: wire::Zone = server
@@ -557,4 +627,78 @@ async fn two_devices_sync_encrypted_tasks_through_the_server() {
             "the server stored {secret:?} in the clear"
         );
     }
+
+    // A third device, approved by b, trusts a through b's endorsement, gets
+    // the zone key from a and reads the tasks.
+    let c_keys = DeviceKeys::generate().expect("keys");
+    let c_session = server.sign_in(&email, &c_keys).await;
+    let mut c = Device {
+        engine: Engine::new(copy(&c_keys), &c_session.account_id, &c_session.device_id)
+            .expect("engine"),
+        token: c_session.token.clone(),
+        id: c_session.device_id.clone(),
+        now,
+    };
+    approve(&server, &mut b, &mut c).await;
+    let devices = c.devices(&server).await;
+    assert_eq!(
+        c.engine.verify_devices(&devices).len(),
+        3,
+        "c trusts a and b"
+    );
+    let devices = a.devices(&server).await;
+    let envelopes = a.engine.envelopes_for(ZONE, &devices).expect("envelopes");
+    assert!(envelopes.iter().any(|e| e.recipient_device_id == c.id));
+    let (status, body) = server
+        .call(
+            Method::POST,
+            "/v1/keychain/envelopes",
+            Some(&a.token),
+            Some(value(&wire::PutKeyEnvelopes { envelopes })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let list: wire::KeyEnvelopeList = server
+        .ok(
+            Method::GET,
+            "/v1/keychain/envelopes",
+            &c.token,
+            None,
+            StatusCode::OK,
+        )
+        .await;
+    let devices = c.devices(&server).await;
+    let accepted = c.engine.accept_envelopes(&list.envelopes, &devices);
+    assert!(accepted.refused.is_empty(), "{accepted:?}");
+    c.fetch(&server).await;
+    assert_eq!(c.item("t1"), expected);
+
+    // a deletes the zone with a signed proof; c sees both records go.
+    let proof = a.engine.delete_zone_proof(ZONE).expect("proof");
+    let (status, body) = server
+        .call(
+            Method::DELETE,
+            &format!("/v1/zones/{ZONE}"),
+            Some(&a.token),
+            Some(value(&proof)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let since = c.engine.token(ZONE).expect("token").to_owned();
+    let changes: wire::ZoneChanges = server
+        .ok(
+            Method::GET,
+            &format!("/v1/zones/{ZONE}/changes?since={since}"),
+            &c.token,
+            None,
+            StatusCode::OK,
+        )
+        .await;
+    assert!(changes.zone_deleted);
+    let applied = c
+        .engine
+        .apply_changes(ZONE, &changes, c.now)
+        .expect("apply");
+    assert_eq!(applied.removed, ["t1"]);
+    assert!(applied.unverified_deletes.is_empty());
 }
