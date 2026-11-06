@@ -56,7 +56,12 @@ The key service runs as its own container with:
 - its own Postgres instance, whose credentials neither the record server nor its database operators hold;
 - its own HSM credentials;
 - an internal API reachable only from `orbyn-server`, authenticated with mutual TLS, for starts, finishes and escrow;
-- a small public API that clients reach directly, on its own hostname, for log heads, lookup proofs and cancels. The record server therefore cannot hide the log from a device or drop a device's cancel.
+- a small public API that clients reach directly, on its own hostname, for log heads, lookup proofs and cancels. Hiding the log from a device or dropping its cancel then needs control of the key service's network path (its DNS or ingress), not just the record server, and the device detects a dropped cancel within an hour.
+- **Rate limits on the public API.** Cancels: 10 per address an hour. Lookup proofs: 60 per address an hour. Heads are cached at the edge for up to a minute.
+- **Clients can reach it.** The key-service origin is pinned per deployment beside the engine URL.
+  - Desktop: it is added to the CSP connect-src.
+  - Web: the public API sends CORS headers for the planner's origins only.
+  - A planner contract test sends a cancel and fetches a proof from that host, so a blocked path fails CI rather than showing up only as "stale".
 
 It does not trust its own rows for time. A recovery's 72 hours are measured from the time in the first witness-cosigned log head that includes the start (see *Transparency log*). Neither a back-dated row nor a host clock set forward can shorten the wait: the witness signs its own time, and an entry without such a head has no start time at all.
 
@@ -210,7 +215,10 @@ A cancel is a statement signed by a device (`orbyn/recovery-cancel/v1`: account,
   - a verifiable map from map key (below) to that account's own hash chain of entries.
 
   Devices ask for their account's lookup proof. It proves the full chain for the account, or proves there is none, so "nothing for your account" can be checked, not just asserted.
-- **The map key.** It is `SHA-256(orbyn/log-account/v1 ‖ the account's certified service public key)`. The key service computes it from the service key it holds for the account id, so neither the record server nor anyone else chooses where an entry is filed. A device computes the same value from the service key it verified. The map does not list accounts by id, but anyone who holds an account's service public key can look it up, and that key is given only to the account's own sessions. A service-key rotation is itself logged under the old key and links to the new one.
+- **The map key.** It is `SHA-256(orbyn/log-account/v1 ‖ the account's certified service public key)`. The key service computes it from the service key it holds for the account id, so neither the record server nor anyone else chooses where an entry is filed. A device computes the same value from the service key it verified. The map does not list accounts by id, but anyone who holds an account's service public key can look it up, and that key is given only to the account's own sessions. - **Rotating an account's service key.**
+  - **Who can start it.** Only a request signed by a trusted device of the account (`orbyn/service-key-rotate/v1`), for example after a suspected leak. Identity and KEK rotations keep the X25519 key, so they do not move the map key.
+  - **The link between chains.** The old chain's last entry names the new key, and the new chain's first entry links back to the old one.
+  - **Devices follow the link.** They watch both chains, and alert on any rotation they did not ask for.
 - **Signed heads.** Heads carry the time, the log size and root, and the map root. They are signed by a **log key** kept apart from the service identities, then **cosigned by at least one independent witness**. A witness checks consistency with the last head it signed and refuses to sign a fork.
 - **Pinned keys.** The log keys and witness keys are pinned in client configuration, versioned like the service identities. A head signed by any other key is refused.
 - **No witness, no recovery.** Recovery is refused while no witness is configured.
@@ -220,7 +228,11 @@ A cancel is a statement signed by a device (`orbyn/recovery-cancel/v1`: account,
 - **Gossip between devices.** Each device writes the last head it verified into a record in a private system zone, so the account's other devices read it encrypted. A device that sees another device's head inconsistent with its own has found a fork and warns.
 - **Checks devices make.** On every sync, and at least daily, a trusted device fetches the newest head, checks it is fresh, consistent and cosigned, then checks its account's lookup proof. It verifies that every recovery and certification in its chain is one it knew of through the normal flow.
 - **What a finding means.** An unknown recovery or key, a fork, or a stale head is shown to the person as a possible takeover.
-- **Availability.** A failed head or proof fetch never blocks sync. The device retries, and after 24 hours without a fresh head and proof it sends a notification, not only an in-app notice: the log cannot be checked, so a recovery might be hidden. With the 72-hour wait, that leaves at least 48 hours to cancel.
+- **Availability.** A failed head or proof fetch never blocks sync; the device retries.
+- **A dead man's switch.** Each successful check reschedules a **local operating-system notification**, made by the client itself, for 24 hours ahead: "Orbyn couldn't check your account's recovery log. Open Orbyn to check."
+  - If checks stop for any reason, including a server withholding the log or the app staying closed, it fires anyway, with no push or email from the server involved.
+  - With the 72-hour wait, that leaves at least 48 hours to cancel.
+  - On the web, where a closed tab cannot schedule one, the check runs when the page opens, and the desktop and phone apps carry the guarantee.
 - **Its limit.** The log catches a recovery hidden from the device list. It cannot catch an operator who reads keys without any recovery; the off-machine audit and the HSM roles below are the control for that.
 
 ## Audit and HSM access
