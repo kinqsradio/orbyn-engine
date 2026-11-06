@@ -31,6 +31,11 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/v1/devices", get(list_devices))
         .route("/v1/devices/current", get(current_device))
         .route("/v1/devices/approvals", post(create_approval))
+        .route("/v1/devices/approvals/{id}", get(approval))
+        .route("/v1/devices/approvals/{id}/nonce", post(submit_nonce))
+        .route("/v1/devices/approvals/{id}/reveal", post(reveal_nonce))
+        .route("/v1/devices/approvals/{id}/confirm", post(confirm_approval))
+        .route("/v1/devices/approvals/{id}/cancel", post(cancel_approval))
         .route("/v1/devices/approvals/{id}/code", post(submit_code))
         .route("/v1/devices/{id}", delete(remove_device))
 }
@@ -91,6 +96,9 @@ impl IntoResponse for Failure {
                 return error(StatusCode::BAD_REQUEST, "wrong_code", &message);
             }
             AccountError::ApprovalExpired => (StatusCode::GONE, "approval_expired"),
+            AccountError::ApprovalOutOfOrder => (StatusCode::CONFLICT, "approval_out_of_order"),
+            AccountError::ApprovalNotConfirmed => (StatusCode::CONFLICT, "approval_not_confirmed"),
+            AccountError::InvalidCommitment => (StatusCode::BAD_REQUEST, "invalid_commitment"),
             AccountError::DeviceKeyConflict => (StatusCode::CONFLICT, "device_key_conflict"),
             AccountError::LastTrustedDevice => (StatusCode::CONFLICT, "last_trusted_device"),
             AccountError::Database(db) => {
@@ -270,6 +278,8 @@ fn wire_device(device: accounts::Device, current: Uuid) -> wire::Device {
         created_at: time(device.created_at),
         approved_by: device.approved_by.map(|id| id.to_string()),
         approval_signature: device.approval_signature.map(|s| encode(&s)),
+        approval_id: device.approval_id.map(|id| id.to_string()),
+        approval_created_at: device.approval_created_at,
         current: device.id == current,
     }
 }
@@ -382,11 +392,21 @@ async fn list_devices(
     State(state): State<AppState>,
     Authed(session): Authed,
 ) -> Answer<Json<wire::DeviceList>> {
-    let devices = service(&state)?.list_devices(&session).await?;
+    let (devices, removals) = service(&state)?.list_devices(&session).await?;
     Ok(Json(wire::DeviceList {
         devices: devices
             .into_iter()
             .map(|d| wire_device(d, session.device_id))
+            .collect(),
+        removals: removals
+            .into_iter()
+            .map(|r| wire::DeviceRemoval {
+                device_id: r.device_id.to_string(),
+                signing_key: encode(&r.keys.signing),
+                agreement_key: encode(&r.keys.agreement),
+                removed_by: r.removed_by.to_string(),
+                signature: encode(&r.signature),
+            })
             .collect(),
     }))
 }
@@ -398,11 +418,27 @@ async fn current_device(
     let (device, approval) = service(&state)?.current_device(&session).await?;
     Ok(Json(wire::CurrentDevice {
         device: wire_device(device, session.device_id),
-        approval: approval.map(|a| wire::PendingApproval {
-            id: a.id.to_string(),
-            expires_at: time(a.expires_at),
-        }),
+        approval: approval.map(wire_approval),
     }))
+}
+
+fn wire_approval(a: accounts::ApprovalView) -> wire::PendingApproval {
+    wire::PendingApproval {
+        id: a.id.to_string(),
+        expires_at: time(a.expires_at),
+        created_at: a.created_at,
+        approver_id: a.approver_id.to_string(),
+        approver_signing_key: encode(&a.approver_keys.signing),
+        approver_agreement_key: encode(&a.approver_keys.agreement),
+        device_id: a.device_id.to_string(),
+        device_signing_key: encode(&a.device_keys.signing),
+        device_agreement_key: encode(&a.device_keys.agreement),
+        commitment: encode(&a.commitment),
+        device_nonce: a.device_nonce.map(|n| encode(&n)),
+        approver_nonce: a.approver_nonce.map(|n| encode(&n)),
+        signature: a.signature.map(|s| encode(&s)),
+        endorsement: a.endorsement.as_deref().map(encode),
+    }
 }
 
 async fn create_approval(
@@ -416,17 +452,80 @@ async fn create_approval(
             &client,
             &session,
             id(&body.device_id)?,
-            &fixed(&body.signature)?,
+            id(&body.approval_id)?,
+            body.created_at,
+            &fixed(&body.commitment)?,
         )
         .await?;
     Ok((
         StatusCode::CREATED,
         Json(wire::ApprovalCreated {
             id: approval.id.to_string(),
-            code: approval.code.clone(),
             expires_at: time(approval.expires_at),
         }),
     ))
+}
+
+async fn approval(
+    State(state): State<AppState>,
+    Authed(session): Authed,
+    Path(approval): Path<String>,
+) -> Answer<Json<wire::PendingApproval>> {
+    let view = service(&state)?.approval(&session, id(&approval)?).await?;
+    Ok(Json(wire_approval(view)))
+}
+
+async fn submit_nonce(
+    State(state): State<AppState>,
+    Authed(session): Authed,
+    Path(approval): Path<String>,
+    Body(body): Body<wire::ApprovalNonce>,
+) -> Answer<StatusCode> {
+    service(&state)?
+        .submit_device_nonce(&session, id(&approval)?, &fixed(&body.nonce)?)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn reveal_nonce(
+    State(state): State<AppState>,
+    Authed(session): Authed,
+    Path(approval): Path<String>,
+    Body(body): Body<wire::ApprovalNonce>,
+) -> Answer<StatusCode> {
+    service(&state)?
+        .reveal_approver_nonce(&session, id(&approval)?, &fixed(&body.nonce)?)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn confirm_approval(
+    State(state): State<AppState>,
+    Authed(session): Authed,
+    Path(approval): Path<String>,
+    Body(body): Body<wire::ConfirmApproval>,
+) -> Answer<StatusCode> {
+    let endorsement = body.endorsement.as_deref().map(bytes).transpose()?;
+    service(&state)?
+        .confirm_approval(
+            &session,
+            id(&approval)?,
+            &fixed(&body.signature)?,
+            endorsement.as_deref(),
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn cancel_approval(
+    State(state): State<AppState>,
+    Authed(session): Authed,
+    Path(approval): Path<String>,
+) -> Answer<StatusCode> {
+    service(&state)?
+        .cancel_approval(&session, id(&approval)?)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn submit_code(
@@ -447,9 +546,10 @@ async fn remove_device(
     Caller(client): Caller,
     Authed(session): Authed,
     Path(device): Path<String>,
+    Body(body): Body<wire::RemoveDevice>,
 ) -> Answer<StatusCode> {
     service(&state)?
-        .remove_device(&client, &session, id(&device)?)
+        .remove_device(&client, &session, id(&device)?, &fixed(&body.signature)?)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }

@@ -71,8 +71,14 @@ pub enum AccountError {
     InvalidSignature,
     #[error("the code is wrong")]
     WrongCode { remaining: i32 },
-    #[error("the approval has expired or used all its attempts")]
+    #[error("the approval has expired, was cancelled or was used")]
     ApprovalExpired,
+    #[error("this approval step needs the one before it, and each step happens once")]
+    ApprovalOutOfOrder,
+    #[error("the approving device has not confirmed the codes yet")]
+    ApprovalNotConfirmed,
+    #[error("the revealed nonce does not match the commitment")]
+    InvalidCommitment,
     #[error("these keys belong to another device of the account")]
     DeviceKeyConflict,
     #[error("the last trusted device cannot be removed")]
@@ -251,31 +257,45 @@ pub struct Device {
     pub created_at: DateTime<Utc>,
     pub approved_by: Option<Uuid>,
     pub approval_signature: Option<[u8; 64]>,
+    /// The approval that trusted this device and the time its approver
+    /// signed into it, both part of the signed message.
+    pub approval_id: Option<Uuid>,
+    pub approval_created_at: Option<i64>,
 }
 
-/// An approval just made. Only the trusted device sees the code.
-#[derive(Clone, PartialEq, Eq)]
+/// An approval just opened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Approval {
     pub id: Uuid,
-    pub code: String,
     pub expires_at: DateTime<Utc>,
 }
 
-impl std::fmt::Debug for Approval {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Approval")
-            .field("id", &self.id)
-            .field("code", &"(hidden)")
-            .field("expires_at", &self.expires_at)
-            .finish()
-    }
+/// A removed device and the signed record of who removed it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Removal {
+    pub device_id: Uuid,
+    pub keys: DevicePublic,
+    pub removed_by: Uuid,
+    pub signature: [u8; 64],
 }
 
-/// An open approval the pending device can answer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PendingApproval {
+/// An approval as either of its devices sees it. Each later field is set by
+/// one step, in order: the commitment, the new device's nonce, the approver's
+/// nonce, then the approver's signature and endorsement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApprovalView {
     pub id: Uuid,
     pub expires_at: DateTime<Utc>,
+    pub created_at: i64,
+    pub approver_id: Uuid,
+    pub approver_keys: DevicePublic,
+    pub device_id: Uuid,
+    pub device_keys: DevicePublic,
+    pub commitment: [u8; 32],
+    pub device_nonce: Option<[u8; 32]>,
+    pub approver_nonce: Option<[u8; 32]>,
+    pub signature: Option<[u8; 64]>,
+    pub endorsement: Option<Vec<u8>>,
 }
 
 /// What the audit log records. Never emails, tokens or keys.

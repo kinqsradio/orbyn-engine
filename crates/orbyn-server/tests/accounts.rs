@@ -218,45 +218,164 @@ impl Server {
         session
     }
 
-    /// A trusted device approves `pending`; returns the approval.
-    async fn approve(
-        &self,
-        approver_token: &str,
-        approver: &DeviceKeys,
-        account_id: Uuid,
-        pending_id: Uuid,
-        pending: &DevicePublic,
-    ) -> (StatusCode, Value) {
-        let signature = approver.sign(
-            auth::DEVICE_APPROVAL_CONTEXT,
-            &auth::approval_message(account_id.as_bytes(), pending_id.as_bytes(), pending),
-        );
+    /// Step 1: the trusted device opens an approval for `b_id` with a
+    /// commitment. Returns the answer and what the approver keeps.
+    async fn start_approval(&self, p: &Pair) -> (StatusCode, Value, Run) {
+        let run = Run {
+            id: Uuid::new_v4(),
+            created_at: chrono_now(),
+            nonce: rand32(),
+            account: p.account_id,
+            a_id: uuid_of(&p.a_session["device_id"]),
+            a: p.a.public(),
+            b_id: uuid_of(&p.b_session["device_id"]),
+            b: p.b.public(),
+        };
+        let (status, body) = self
+            .call(
+                Method::POST,
+                "/v1/devices/approvals",
+                Some(token(&p.a_session)),
+                Some(json!({
+                    "approval_id": run.id.to_string(),
+                    "device_id": run.b_id.to_string(),
+                    "created_at": run.created_at,
+                    "commitment": b64(&run.commitment()),
+                })),
+            )
+            .await;
+        (status, body, run)
+    }
+
+    /// One later step: `POST /v1/devices/approvals/{id}/{step}`.
+    async fn step(&self, token: &str, run: &Run, step: &str, body: Value) -> (StatusCode, Value) {
         self.call(
             Method::POST,
-            "/v1/devices/approvals",
-            Some(approver_token),
-            Some(json!({"device_id": pending_id.to_string(), "signature": b64(&signature)})),
+            &format!("/v1/devices/approvals/{}/{step}", run.id),
+            Some(token),
+            Some(body),
         )
         .await
     }
 
-    async fn submit_code(
+    /// Steps 2 to 4: nonce, reveal, the approver's confirmation. Returns the
+    /// six digits both devices show.
+    async fn exchange(&self, p: &Pair, run: &Run) -> String {
+        let device_nonce = rand32();
+        let (status, body) = self
+            .step(
+                token(&p.b_session),
+                run,
+                "nonce",
+                json!({"nonce": b64(&device_nonce)}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        let (status, body) = self
+            .step(
+                token(&p.a_session),
+                run,
+                "reveal",
+                json!({"nonce": b64(&run.nonce)}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        let signature = p.a.sign(auth::DEVICE_APPROVAL_CONTEXT, &run.message());
+        let (status, body) = self
+            .step(
+                token(&p.a_session),
+                run,
+                "confirm",
+                json!({"signature": b64(&signature)}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        run.sas(&device_nonce)
+    }
+
+    /// The whole approval, with the person confirming on both devices.
+    async fn approve_fully(&self, p: &Pair) -> Value {
+        let (status, body, run) = self.start_approval(p).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let sas = self.exchange(p, &run).await;
+        let (status, device) = self
+            .step(token(&p.b_session), &run, "code", json!({"code": sas}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{device}");
+        device
+    }
+
+    /// `remover` removes `device_id` with its signature.
+    async fn remove(
         &self,
         token: &str,
-        approval_id: &Value,
-        code: &str,
+        remover: &DeviceKeys,
+        account: Uuid,
+        device_id: Uuid,
+        keys: &DevicePublic,
     ) -> (StatusCode, Value) {
-        let path = format!(
-            "/v1/devices/approvals/{}/code",
-            approval_id.as_str().expect("id")
+        let signature = remover.sign(
+            auth::DEVICE_REMOVAL_CONTEXT,
+            &auth::removal_message(account.as_bytes(), device_id.as_bytes(), keys),
         );
         self.call(
-            Method::POST,
-            &path,
+            Method::DELETE,
+            &format!("/v1/devices/{device_id}"),
             Some(token),
-            Some(json!({"code": code})),
+            Some(json!({"signature": b64(&signature)})),
         )
         .await
+    }
+}
+
+fn rand32() -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    bytes[..16].copy_from_slice(Uuid::new_v4().as_bytes());
+    bytes[16..].copy_from_slice(Uuid::new_v4().as_bytes());
+    bytes
+}
+
+fn chrono_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// What the approving device keeps for one approval.
+struct Run {
+    id: Uuid,
+    created_at: i64,
+    nonce: [u8; 32],
+    account: Uuid,
+    a_id: Uuid,
+    a: DevicePublic,
+    b_id: Uuid,
+    b: DevicePublic,
+}
+
+impl Run {
+    fn with<T>(&self, f: impl FnOnce(&auth::Pairing<'_>) -> T) -> T {
+        f(&auth::Pairing {
+            account_id: self.account.as_bytes(),
+            approval_id: self.id.as_bytes(),
+            created_at: self.created_at,
+            approver_id: self.a_id.as_bytes(),
+            approver: &self.a,
+            device_id: self.b_id.as_bytes(),
+            device: &self.b,
+        })
+    }
+
+    fn commitment(&self) -> [u8; 32] {
+        self.with(|p| auth::approval_commitment(p, &self.nonce))
+    }
+
+    fn sas(&self, device_nonce: &[u8; 32]) -> String {
+        self.with(|p| auth::approval_sas(p, &self.nonce, device_nonce))
+    }
+
+    fn message(&self) -> Vec<u8> {
+        self.with(auth::approval_message)
     }
 }
 
@@ -717,11 +836,10 @@ async fn signing_in_gives_back_the_start_it_used() {
 
 #[tokio::test]
 #[ignore = "needs DATABASE_URL"]
-async fn a_trusted_device_approves_a_new_one_with_a_signature_and_code() {
+async fn a_trusted_device_approves_a_new_one_by_comparing_codes() {
     let _turn = TURN.lock().await;
     let server = server().await;
     let p = pair(&server).await;
-    let b_id = uuid_of(&p.b_session["device_id"]);
 
     // A pending device cannot see or change the account's devices.
     let (status, body) = server
@@ -731,31 +849,11 @@ async fn a_trusted_device_approves_a_new_one_with_a_signature_and_code() {
         (status, &body["code"]),
         (StatusCode::FORBIDDEN, &json!("device_not_trusted"))
     );
-    let (status, current) = server
-        .call(
-            Method::GET,
-            "/v1/devices/current",
-            Some(token(&p.b_session)),
-            None,
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(current["device"]["state"], "pending");
-    assert_eq!(current["approval"], Value::Null);
 
-    // The trusted device sees it pending and approves it.
-    let (_, list) = server
-        .call(Method::GET, "/v1/devices", Some(token(&p.a_session)), None)
-        .await;
-    assert_eq!(list["devices"][1]["state"], "pending");
-    let (status, approval) = server
-        .approve(token(&p.a_session), &p.a, p.account_id, b_id, &p.b.public())
-        .await;
+    // Step 1. A stale time, or a pending device approving, is refused.
+    let (status, approval, run) = server.start_approval(&p).await;
     assert_eq!(status, StatusCode::CREATED, "{approval}");
-    let code = approval["code"].as_str().expect("code");
-    assert_eq!(code.len(), 6);
-
-    // The new device finds the approval and answers with the code.
+    assert_eq!(approval["id"], run.id.to_string());
     let (_, current) = server
         .call(
             Method::GET,
@@ -764,33 +862,119 @@ async fn a_trusted_device_approves_a_new_one_with_a_signature_and_code() {
             None,
         )
         .await;
-    assert_eq!(current["approval"]["id"], approval["id"]);
+    assert_eq!(current["approval"]["commitment"], b64(&run.commitment()));
+    assert_eq!(
+        current["approval"]["approver_signing_key"],
+        b64(&p.a.public().signing)
+    );
+    assert_eq!(current["approval"]["created_at"], run.created_at);
+    assert_eq!(current["approval"]["approver_nonce"], Value::Null);
+
+    // The order is enforced: no reveal before the new device's nonce, and
+    // each step happens once.
+    let (status, body) = server
+        .step(
+            token(&p.a_session),
+            &run,
+            "reveal",
+            json!({"nonce": b64(&run.nonce)}),
+        )
+        .await;
+    assert_eq!(
+        (status, &body["code"]),
+        (StatusCode::CONFLICT, &json!("approval_out_of_order"))
+    );
+    let device_nonce = rand32();
+    let (status, _) = server
+        .step(
+            token(&p.b_session),
+            &run,
+            "nonce",
+            json!({"nonce": b64(&device_nonce)}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = server
+        .step(
+            token(&p.b_session),
+            &run,
+            "nonce",
+            json!({"nonce": b64(&rand32())}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, view) = server
+        .call(
+            Method::GET,
+            &format!("/v1/devices/approvals/{}", run.id),
+            Some(token(&p.a_session)),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(view["device_nonce"], b64(&device_nonce));
+    assert_eq!(view["device_signing_key"], b64(&p.b.public().signing));
+    let (status, _) = server
+        .step(
+            token(&p.a_session),
+            &run,
+            "reveal",
+            json!({"nonce": b64(&run.nonce)}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // The new device's code waits for the approver's confirmation.
+    let sas = run.sas(&device_nonce);
+    let (status, body) = server
+        .step(token(&p.b_session), &run, "code", json!({"code": sas}))
+        .await;
+    assert_eq!(
+        (status, &body["code"]),
+        (StatusCode::CONFLICT, &json!("approval_not_confirmed"))
+    );
+    let signature = p.a.sign(auth::DEVICE_APPROVAL_CONTEXT, &run.message());
+    let (status, _) = server
+        .step(
+            token(&p.a_session),
+            &run,
+            "confirm",
+            json!({"signature": b64(&signature), "endorsement": b64(b"opaque")}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, current) = server
+        .call(
+            Method::GET,
+            "/v1/devices/current",
+            Some(token(&p.b_session)),
+            None,
+        )
+        .await;
+    assert_eq!(current["approval"]["approver_nonce"], b64(&run.nonce));
+    assert_eq!(current["approval"]["endorsement"], b64(b"opaque"));
     let (status, device) = server
-        .submit_code(token(&p.b_session), &approval["id"], code)
+        .step(token(&p.b_session), &run, "code", json!({"code": sas}))
         .await;
     assert_eq!(status, StatusCode::OK, "{device}");
     assert_eq!(device["state"], "trusted");
     assert_eq!(device["approved_by"], p.a_session["device_id"]);
+    assert_eq!(device["approval_id"], run.id.to_string());
+    assert_eq!(device["approval_created_at"], run.created_at);
 
     // Any device can check the approval itself.
-    let signature: [u8; 64] = unb64(&device["approval_signature"])
-        .try_into()
-        .expect("64 bytes");
+    let stored: [u8; 64] = unb64(&device["approval_signature"]).try_into().expect("64");
     orbyn_crypto::verify(
         &p.a.public(),
         auth::DEVICE_APPROVAL_CONTEXT,
-        &auth::approval_message(p.account_id.as_bytes(), b_id.as_bytes(), &p.b.public()),
-        &signature,
+        &run.message(),
+        &stored,
     )
     .expect("the approval verifies");
 
-    // The same session is now trusted, and a used approval does not work again.
-    let (status, _) = server
-        .call(Method::GET, "/v1/devices", Some(token(&p.b_session)), None)
-        .await;
-    assert_eq!(status, StatusCode::OK);
+    // A used approval does not work again, nor does its id.
     let (status, body) = server
-        .submit_code(token(&p.b_session), &approval["id"], code)
+        .step(token(&p.b_session), &run, "code", json!({"code": sas}))
         .await;
     assert_eq!(
         (status, &body["code"]),
@@ -800,37 +984,26 @@ async fn a_trusted_device_approves_a_new_one_with_a_signature_and_code() {
 
 #[tokio::test]
 #[ignore = "needs DATABASE_URL"]
-async fn five_wrong_codes_close_the_approval() {
+async fn one_wrong_code_closes_the_approval_and_a_new_one_is_needed() {
     let _turn = TURN.lock().await;
     let server = server().await;
     let p = pair(&server).await;
-    let b_id = uuid_of(&p.b_session["device_id"]);
-    let (_, approval) = server
-        .approve(token(&p.a_session), &p.a, p.account_id, b_id, &p.b.public())
-        .await;
-    let right = approval["code"].as_str().expect("code");
+    let (_, _, run) = server.start_approval(&p).await;
+    let right = server.exchange(&p, &run).await;
     let wrong = if right == "000000" {
         "000001"
     } else {
         "000000"
     };
-    for left in (0..5).rev() {
-        let (status, body) = server
-            .submit_code(token(&p.b_session), &approval["id"], wrong)
-            .await;
-        assert_eq!(
-            (status, &body["code"]),
-            (StatusCode::BAD_REQUEST, &json!("wrong_code"))
-        );
-        assert!(
-            body["message"]
-                .as_str()
-                .expect("message")
-                .contains(&left.to_string())
-        );
-    }
     let (status, body) = server
-        .submit_code(token(&p.b_session), &approval["id"], right)
+        .step(token(&p.b_session), &run, "code", json!({"code": wrong}))
+        .await;
+    assert_eq!(
+        (status, &body["code"]),
+        (StatusCode::BAD_REQUEST, &json!("wrong_code"))
+    );
+    let (status, body) = server
+        .step(token(&p.b_session), &run, "code", json!({"code": right}))
         .await;
     assert_eq!(
         (status, &body["code"]),
@@ -846,6 +1019,151 @@ async fn five_wrong_codes_close_the_approval() {
         .await;
     assert_eq!(current["device"]["state"], "pending");
     assert_eq!(current["approval"], Value::Null);
+
+    // A cancel closes one too; a new approval then works.
+    let (_, _, run) = server.start_approval(&p).await;
+    let (status, _) = server
+        .step(token(&p.b_session), &run, "cancel", json!({}))
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = server
+        .step(
+            token(&p.b_session),
+            &run,
+            "nonce",
+            json!({"nonce": b64(&rand32())}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::GONE);
+    let device = server.approve_fully(&p).await;
+    assert_eq!(device["state"], "trusted");
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_bad_reveal_signature_or_time_is_refused() {
+    let _turn = TURN.lock().await;
+    let server = server().await;
+    let p = pair(&server).await;
+
+    // A reveal that does not match the commitment closes the approval.
+    let (_, _, run) = server.start_approval(&p).await;
+    let (status, _) = server
+        .step(
+            token(&p.b_session),
+            &run,
+            "nonce",
+            json!({"nonce": b64(&rand32())}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, body) = server
+        .step(
+            token(&p.a_session),
+            &run,
+            "reveal",
+            json!({"nonce": b64(&rand32())}),
+        )
+        .await;
+    assert_eq!(
+        (status, &body["code"]),
+        (StatusCode::BAD_REQUEST, &json!("invalid_commitment"))
+    );
+    let (status, _) = server
+        .step(
+            token(&p.a_session),
+            &run,
+            "reveal",
+            json!({"nonce": b64(&run.nonce)}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::GONE);
+
+    // A signature from another key closes the approval.
+    let (_, _, run) = server.start_approval(&p).await;
+    let (status, _) = server
+        .step(
+            token(&p.b_session),
+            &run,
+            "nonce",
+            json!({"nonce": b64(&rand32())}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = server
+        .step(
+            token(&p.a_session),
+            &run,
+            "reveal",
+            json!({"nonce": b64(&run.nonce)}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let forger = DeviceKeys::generate().expect("keys");
+    let forged = forger.sign(auth::DEVICE_APPROVAL_CONTEXT, &run.message());
+    let (status, body) = server
+        .step(
+            token(&p.a_session),
+            &run,
+            "confirm",
+            json!({"signature": b64(&forged)}),
+        )
+        .await;
+    assert_eq!(
+        (status, &body["code"]),
+        (StatusCode::BAD_REQUEST, &json!("invalid_signature"))
+    );
+
+    // A time far from the server's clock, a reused id and a pending approver
+    // are refused.
+    let (status, body) = server
+        .call(
+            Method::POST,
+            "/v1/devices/approvals",
+            Some(token(&p.a_session)),
+            Some(json!({
+                "approval_id": Uuid::new_v4().to_string(),
+                "device_id": p.b_session["device_id"],
+                "created_at": chrono_now() - 3600,
+                "commitment": b64(&[0; 32]),
+            })),
+        )
+        .await;
+    assert_eq!(
+        (status, &body["code"]),
+        (StatusCode::BAD_REQUEST, &json!("invalid_request"))
+    );
+    let (status, _) = server
+        .call(
+            Method::POST,
+            "/v1/devices/approvals",
+            Some(token(&p.a_session)),
+            Some(json!({
+                "approval_id": run.id.to_string(),
+                "device_id": p.b_session["device_id"],
+                "created_at": chrono_now(),
+                "commitment": b64(&[0; 32]),
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, body) = server
+        .call(
+            Method::POST,
+            "/v1/devices/approvals",
+            Some(token(&p.b_session)),
+            Some(json!({
+                "approval_id": Uuid::new_v4().to_string(),
+                "device_id": p.b_session["device_id"],
+                "created_at": chrono_now(),
+                "commitment": b64(&[0; 32]),
+            })),
+        )
+        .await;
+    assert_eq!(
+        (status, &body["code"]),
+        (StatusCode::FORBIDDEN, &json!("device_not_trusted"))
+    );
 }
 
 #[tokio::test]
@@ -854,23 +1172,17 @@ async fn an_expired_approval_is_refused() {
     let _turn = TURN.lock().await;
     let server = server().await;
     let p = pair(&server).await;
-    let b_id = uuid_of(&p.b_session["device_id"]);
-    let (_, approval) = server
-        .approve(token(&p.a_session), &p.a, p.account_id, b_id, &p.b.public())
-        .await;
+    let (_, _, run) = server.start_approval(&p).await;
+    let sas = server.exchange(&p, &run).await;
     orbyn_core::sqlx::query(
         "UPDATE device_approvals SET expires_at = now() - interval '1 second' WHERE id = $1",
     )
-    .bind(uuid_of(&approval["id"]))
+    .bind(run.id)
     .execute(server.db.pool())
     .await
     .expect("expire");
     let (status, body) = server
-        .submit_code(
-            token(&p.b_session),
-            &approval["id"],
-            approval["code"].as_str().expect("code"),
-        )
+        .step(token(&p.b_session), &run, "code", json!({"code": sas}))
         .await;
     assert_eq!(
         (status, &body["code"]),
@@ -880,16 +1192,18 @@ async fn an_expired_approval_is_refused() {
 
 #[tokio::test]
 #[ignore = "needs DATABASE_URL"]
-async fn an_approval_without_the_trusted_devices_signature_is_refused() {
+async fn removing_a_device_needs_a_signature_and_ends_its_sessions() {
     let _turn = TURN.lock().await;
     let server = server().await;
     let p = pair(&server).await;
+    let a_id = uuid_of(&p.a_session["device_id"]);
     let b_id = uuid_of(&p.b_session["device_id"]);
+    server.approve_fully(&p).await;
 
-    // Signed by a key that is not the trusted device's, as a server would have to.
+    // A removal signed by another key, or over other keys, is refused.
     let forger = DeviceKeys::generate().expect("keys");
     let (status, body) = server
-        .approve(
+        .remove(
             token(&p.a_session),
             &forger,
             p.account_id,
@@ -901,95 +1215,21 @@ async fn an_approval_without_the_trusted_devices_signature_is_refused() {
         (status, &body["code"]),
         (StatusCode::BAD_REQUEST, &json!("invalid_signature"))
     );
-
-    // Signed by the trusted device, but over other keys.
-    let other = DeviceKeys::generate().expect("keys");
     let (status, _) = server
-        .approve(
+        .remove(
             token(&p.a_session),
             &p.a,
             p.account_id,
             b_id,
-            &other.public(),
+            &forger.public(),
         )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
-    // An approval whose stored signature was replaced, as a server writing its
-    // own approval would, is refused even with the right code.
-    let (status, approval) = server
-        .approve(token(&p.a_session), &p.a, p.account_id, b_id, &p.b.public())
-        .await;
-    assert_eq!(status, StatusCode::CREATED);
-    let forged = forger.sign(
-        auth::DEVICE_APPROVAL_CONTEXT,
-        &auth::approval_message(p.account_id.as_bytes(), b_id.as_bytes(), &p.b.public()),
-    );
-    orbyn_core::sqlx::query("UPDATE device_approvals SET signature = $2 WHERE id = $1")
-        .bind(uuid_of(&approval["id"]))
-        .bind(forged.as_slice())
-        .execute(server.db.pool())
-        .await
-        .expect("tamper");
-    let (status, body) = server
-        .submit_code(
-            token(&p.b_session),
-            &approval["id"],
-            approval["code"].as_str().expect("code"),
-        )
-        .await;
-    assert_eq!(
-        (status, &body["code"]),
-        (StatusCode::BAD_REQUEST, &json!("invalid_signature"))
-    );
-    let (_, current) = server
-        .call(
-            Method::GET,
-            "/v1/devices/current",
-            Some(token(&p.b_session)),
-            None,
-        )
-        .await;
-    assert_eq!(current["device"]["state"], "pending");
-
-    // A pending device cannot approve anyone, itself included.
-    let (status, body) = server
-        .approve(token(&p.b_session), &p.b, p.account_id, b_id, &p.b.public())
-        .await;
-    assert_eq!(
-        (status, &body["code"]),
-        (StatusCode::FORBIDDEN, &json!("device_not_trusted"))
-    );
-}
-
-#[tokio::test]
-#[ignore = "needs DATABASE_URL"]
-async fn removing_a_device_ends_its_sessions() {
-    let _turn = TURN.lock().await;
-    let server = server().await;
-    let p = pair(&server).await;
-    let a_id = p.a_session["device_id"].as_str().expect("id").to_owned();
-    let b_id = uuid_of(&p.b_session["device_id"]);
-    let (_, approval) = server
-        .approve(token(&p.a_session), &p.a, p.account_id, b_id, &p.b.public())
-        .await;
+    // A trusted device removes the other; its session ends at once, and the
+    // list carries the signed removal.
     let (status, _) = server
-        .submit_code(
-            token(&p.b_session),
-            &approval["id"],
-            approval["code"].as_str().expect("code"),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK);
-
-    // A trusted device removes the other; its session ends at once.
-    let (status, _) = server
-        .call(
-            Method::DELETE,
-            &format!("/v1/devices/{b_id}"),
-            Some(token(&p.a_session)),
-            None,
-        )
+        .remove(token(&p.a_session), &p.a, p.account_id, b_id, &p.b.public())
         .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     let (status, _) = server
@@ -1000,15 +1240,21 @@ async fn removing_a_device_ends_its_sessions() {
         .call(Method::GET, "/v1/devices", Some(token(&p.a_session)), None)
         .await;
     assert_eq!(list["devices"].as_array().map(Vec::len), Some(1));
+    let removal = &list["removals"][0];
+    assert_eq!(removal["device_id"], b_id.to_string());
+    assert_eq!(removal["removed_by"], a_id.to_string());
+    let signature: [u8; 64] = unb64(&removal["signature"]).try_into().expect("64");
+    orbyn_crypto::verify(
+        &p.a.public(),
+        auth::DEVICE_REMOVAL_CONTEXT,
+        &auth::removal_message(p.account_id.as_bytes(), b_id.as_bytes(), &p.b.public()),
+        &signature,
+    )
+    .expect("the removal verifies");
 
     // The last trusted device stays.
     let (status, body) = server
-        .call(
-            Method::DELETE,
-            &format!("/v1/devices/{a_id}"),
-            Some(token(&p.a_session)),
-            None,
-        )
+        .remove(token(&p.a_session), &p.a, p.account_id, a_id, &p.a.public())
         .await;
     assert_eq!(
         (status, &body["code"]),
@@ -1051,32 +1297,29 @@ async fn the_audit_log_records_actions_without_addresses_or_emails() {
 
 #[tokio::test]
 #[ignore = "needs DATABASE_URL"]
-async fn approval_codes_are_limited_per_account() {
+async fn approval_codes_are_limited_per_device() {
     let _turn = TURN.lock().await;
     let server = server_with(Limits {
-        approval_code_per_device: Limit::new(2, Duration::from_secs(60)),
+        approval_code_per_device: Limit::new(1, Duration::from_secs(60)),
         ..Limits::default()
     })
     .await;
     let p = pair(&server).await;
-    let b_id = uuid_of(&p.b_session["device_id"]);
-    let (_, approval) = server
-        .approve(token(&p.a_session), &p.a, p.account_id, b_id, &p.b.public())
-        .await;
-    let right = approval["code"].as_str().expect("code");
+    let (_, _, run) = server.start_approval(&p).await;
+    let right = server.exchange(&p, &run).await;
     let wrong = if right == "000000" {
         "000001"
     } else {
         "000000"
     };
-    for _ in 0..2 {
-        let (status, _) = server
-            .submit_code(token(&p.b_session), &approval["id"], wrong)
-            .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-    }
+    let (status, _) = server
+        .step(token(&p.b_session), &run, "code", json!({"code": wrong}))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (_, _, run) = server.start_approval(&p).await;
+    let right = server.exchange(&p, &run).await;
     let (status, body) = server
-        .submit_code(token(&p.b_session), &approval["id"], right)
+        .step(token(&p.b_session), &run, "code", json!({"code": right}))
         .await;
     assert_eq!(
         (status, &body["code"]),

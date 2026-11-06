@@ -4,6 +4,6 @@ import type { PendingApproval } from "./PendingApproval";
 
 /**
  * `GET /v1/devices/current`: the device making the request, and the approval it
- * can answer with a code, if a trusted device started one.
+ * can answer, if a trusted device started one.
  */
 export type CurrentDevice = { device: Device, approval: PendingApproval | null, };

@@ -1,27 +1,47 @@
-//! Trusted devices and approvals.
+//! Trusted devices, approvals and removals.
 //!
-//! A trusted device approves a pending one by signing the pending device's
-//! keys; the server checks the signature, makes a six-digit code and gives it
-//! to the trusted device to show. The person types it on the new device. Five
-//! wrong codes or ten minutes close the approval. The signature is checked
-//! again when the code is used, and every device can check it later, so the
-//! server cannot add a device on its own.
+//! An approval is a two-way comparison between a trusted device (the approver)
+//! and a pending one, so neither has to take the server's word for the other's
+//! keys. In order, each step once:
+//!
+//! 1. The approver creates the approval with an id and time it chose and a
+//!    commitment to a random nonce, bound to both devices' keys.
+//! 2. The pending device, holding the commitment, sends its own nonce.
+//! 3. The approver, holding that nonce, reveals its own; the server checks it
+//!    against the commitment.
+//! 4. Both devices show six digits computed from both nonces and both keys.
+//!    When the person confirms on the approver that they match, it signs the
+//!    approval (and its list of trusted devices).
+//! 5. When the person confirms on the new device, it sends the digits; the
+//!    server checks them once and trusts the device. A mismatch or a cancel
+//!    closes the approval, and a new one is needed.
+//!
+//! Removing a device carries the remover's signature, which every device checks.
 
 use super::{
-    AccountError, Accounts, Approval, AuditAction, Client, Device, DeviceState, PendingApproval,
-    Platform, Result, Session, limits, public_keys,
+    AccountError, Accounts, Approval, ApprovalView, AuditAction, Client, Device, DeviceState,
+    Platform, Removal, Result, Session, limits, public_keys,
 };
 use chrono::{DateTime, Utc};
-use orbyn_auth_client::{DEVICE_APPROVAL_CONTEXT, approval_message};
+use orbyn_auth_client::{
+    DEVICE_APPROVAL_CONTEXT, DEVICE_REMOVAL_CONTEXT, Pairing, approval_commitment,
+    approval_message, approval_sas, removal_message,
+};
 use orbyn_crypto::DevicePublic;
 use sqlx::{Postgres, Transaction};
 use std::time::Duration;
 use uuid::Uuid;
 
-/// How long an approval code works.
+/// How long an approval stays open.
 pub const APPROVAL_TTL: Duration = Duration::from_secs(10 * 60);
-/// How many codes an approval accepts before it closes.
-pub const APPROVAL_ATTEMPTS: i32 = 5;
+/// How far an approver's clock may be from the server's, in seconds.
+pub const CLOCK_SLACK_SECS: i64 = 5 * 60;
+/// The largest endorsement an approver may attach.
+pub const MAX_ENDORSEMENT: usize = 16 * 1024;
+
+fn fresh(created_at: i64, now: i64) -> bool {
+    (created_at - now).abs() <= CLOCK_SLACK_SECS
+}
 
 #[derive(sqlx::FromRow)]
 struct DeviceRow {
@@ -34,14 +54,30 @@ struct DeviceRow {
     created_at: DateTime<Utc>,
     approved_by: Option<Uuid>,
     approval_signature: Option<Vec<u8>>,
+    approval_id: Option<Uuid>,
+    approval_created_at: Option<i64>,
 }
+
+/// id, signing key, agreement key, removed by, removal signature.
+type RemovalRow = (Uuid, Vec<u8>, Vec<u8>, Uuid, Vec<u8>);
 
 #[derive(sqlx::FromRow)]
 struct ApprovalRow {
+    id: Uuid,
+    account_id: Uuid,
+    expires_at: DateTime<Utc>,
+    approval_created_at: Option<i64>,
     approver_id: Uuid,
-    signature: Vec<u8>,
-    code_digest: Vec<u8>,
-    attempts: i32,
+    approver_signing: Vec<u8>,
+    approver_agreement: Vec<u8>,
+    device_id: Uuid,
+    device_signing: Vec<u8>,
+    device_agreement: Vec<u8>,
+    commitment: Option<Vec<u8>>,
+    device_nonce: Option<Vec<u8>>,
+    approver_nonce: Option<Vec<u8>>,
+    signature: Option<Vec<u8>>,
+    endorsement: Option<Vec<u8>>,
     state: String,
     expired: bool,
 }
@@ -51,11 +87,21 @@ macro_rules! select_devices {
     ($tail:literal) => {
         concat!(
             "SELECT id, name, platform, state, signing_key, agreement_key, created_at, ",
-            "approved_by, approval_signature FROM devices ",
+            "approved_by, approval_signature, approval_id, approval_created_at FROM devices ",
             $tail
         )
     };
 }
+
+const SELECT_APPROVAL: &str = "SELECT a.id, a.account_id, a.expires_at, a.approval_created_at,
+        a.approver_id, ad.signing_key AS approver_signing, ad.agreement_key AS approver_agreement,
+        a.device_id, d.signing_key AS device_signing, d.agreement_key AS device_agreement,
+        a.commitment, a.device_nonce, a.approver_nonce, a.signature, a.endorsement, a.state,
+        a.expires_at <= now() AS expired
+     FROM device_approvals a
+     JOIN devices ad ON ad.id = a.approver_id
+     JOIN devices d ON d.id = a.device_id
+     WHERE a.id = $1 AND a.account_id = $2 FOR UPDATE OF a";
 
 impl TryFrom<DeviceRow> for Device {
     type Error = AccountError;
@@ -73,20 +119,38 @@ impl TryFrom<DeviceRow> for Device {
                 .approval_signature
                 .map(|s| s.as_slice().try_into().map_err(|_| AccountError::Internal))
                 .transpose()?,
+            approval_id: row.approval_id,
+            approval_created_at: row.approval_created_at,
         })
     }
 }
 
-/// Six random digits, uniform: values that would bias the remainder are drawn again.
-fn new_code() -> Result<String> {
-    const LIMIT: u32 = u32::MAX - (u32::MAX % 1_000_000);
-    loop {
-        let mut bytes = [0u8; 4];
-        getrandom::fill(&mut bytes).map_err(|_| AccountError::Internal)?;
-        let value = u32::from_be_bytes(bytes);
-        if value < LIMIT {
-            return Ok(format!("{:06}", value % 1_000_000));
-        }
+fn fixed<const N: usize>(bytes: Option<Vec<u8>>) -> Result<Option<[u8; N]>> {
+    bytes
+        .map(|b| b.as_slice().try_into().map_err(|_| AccountError::Internal))
+        .transpose()
+}
+
+impl TryFrom<ApprovalRow> for ApprovalView {
+    type Error = AccountError;
+
+    fn try_from(row: ApprovalRow) -> Result<Self> {
+        Ok(Self {
+            id: row.id,
+            expires_at: row.expires_at,
+            created_at: row
+                .approval_created_at
+                .ok_or(AccountError::ApprovalExpired)?,
+            approver_id: row.approver_id,
+            approver_keys: public_keys(&row.approver_signing, &row.approver_agreement)?,
+            device_id: row.device_id,
+            device_keys: public_keys(&row.device_signing, &row.device_agreement)?,
+            commitment: fixed(row.commitment)?.ok_or(AccountError::ApprovalExpired)?,
+            device_nonce: fixed(row.device_nonce)?,
+            approver_nonce: fixed(row.approver_nonce)?,
+            signature: fixed(row.signature)?,
+            endorsement: row.endorsement,
+        })
     }
 }
 
@@ -98,29 +162,33 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     std::hint::black_box(diff) == 0
 }
 
-fn verify_approval(
-    approver: &DevicePublic,
-    account_id: Uuid,
-    device_id: Uuid,
-    device: &DevicePublic,
+fn pairing_of<'a>(
+    account_id: &'a [u8; 16],
+    view: &'a ApprovalView,
+    ids: &'a ([u8; 16], [u8; 16], [u8; 16]),
+) -> Pairing<'a> {
+    Pairing {
+        account_id,
+        approval_id: &ids.0,
+        created_at: view.created_at,
+        approver_id: &ids.1,
+        approver: &view.approver_keys,
+        device_id: &ids.2,
+        device: &view.device_keys,
+    }
+}
+
+fn verify_signed(
+    signer: &DevicePublic,
+    context: &str,
+    message: &[u8],
     signature: &[u8; 64],
 ) -> Result<()> {
-    orbyn_crypto::verify(
-        approver,
-        DEVICE_APPROVAL_CONTEXT,
-        &approval_message(account_id.as_bytes(), device_id.as_bytes(), device),
-        signature,
-    )
-    .map_err(|_| AccountError::InvalidSignature)
+    orbyn_crypto::verify(signer, context, message, signature)
+        .map_err(|_| AccountError::InvalidSignature)
 }
 
 impl Accounts {
-    fn code_digest(&self, approval_id: Uuid, code: &str) -> [u8; 32] {
-        let mut data = approval_id.as_bytes().to_vec();
-        data.extend_from_slice(code.as_bytes());
-        self.secrets.digest("approval-code", &data)
-    }
-
     async fn device(
         &self,
         tx: &mut Transaction<'_, Postgres>,
@@ -137,8 +205,9 @@ impl Accounts {
         row.map(Device::try_from).transpose()
     }
 
-    /// The account's devices, for a trusted device.
-    pub async fn list_devices(&self, session: &Session) -> Result<Vec<Device>> {
+    /// The account's devices, for a trusted device, and the signed records of
+    /// devices removed from it.
+    pub async fn list_devices(&self, session: &Session) -> Result<(Vec<Device>, Vec<Removal>)> {
         let mut tx = self.pool.begin().await?;
         self.require_trusted(&mut tx, session).await?;
         let rows: Vec<DeviceRow> = sqlx::query_as(select_devices!(
@@ -147,79 +216,156 @@ impl Accounts {
         .bind(session.account_id)
         .fetch_all(&mut *tx)
         .await?;
+        let removed: Vec<RemovalRow> = sqlx::query_as(
+            "SELECT id, signing_key, agreement_key, removed_by, removal_signature FROM devices
+             WHERE account_id = $1 AND state = 'removed' AND removal_signature IS NOT NULL
+             ORDER BY removed_at, id",
+        )
+        .bind(session.account_id)
+        .fetch_all(&mut *tx)
+        .await?;
         tx.commit().await?;
-        rows.into_iter().map(Device::try_from).collect()
+        let devices = rows
+            .into_iter()
+            .map(Device::try_from)
+            .collect::<Result<_>>()?;
+        let removals = removed
+            .into_iter()
+            .map(|(device_id, signing, agreement, removed_by, signature)| {
+                Ok(Removal {
+                    device_id,
+                    keys: public_keys(&signing, &agreement)?,
+                    removed_by,
+                    signature: signature
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| AccountError::Internal)?,
+                })
+            })
+            .collect::<Result<_>>()?;
+        Ok((devices, removals))
     }
 
     /// The calling device, and its open approval if a trusted device made one.
     pub async fn current_device(
         &self,
         session: &Session,
-    ) -> Result<(Device, Option<PendingApproval>)> {
+    ) -> Result<(Device, Option<ApprovalView>)> {
         let mut tx = self.pool.begin().await?;
         let device = self
             .device(&mut tx, session.account_id, session.device_id)
             .await?
             .ok_or(AccountError::Unauthorized)?;
-        let approval: Option<(Uuid, DateTime<Utc>)> = sqlx::query_as(
-            "SELECT id, expires_at FROM device_approvals
-             WHERE device_id = $1 AND account_id = $2 AND state = 'open' AND expires_at > now()",
+        let id: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM device_approvals
+             WHERE device_id = $1 AND account_id = $2 AND state = 'open' AND expires_at > now()
+               AND commitment IS NOT NULL",
         )
         .bind(session.device_id)
         .bind(session.account_id)
         .fetch_optional(&mut *tx)
         .await?;
+        let approval = match id {
+            Some(id) => Some(self.approval_row(&mut tx, session, id).await?.try_into()?),
+            None => None,
+        };
         tx.commit().await?;
-        Ok((
-            device,
-            approval.map(|(id, expires_at)| PendingApproval { id, expires_at }),
-        ))
+        Ok((device, approval))
     }
 
-    /// A trusted device approves the pending device `device_id`. `signature` is
-    /// its signature over [`approval_message`]. Any earlier open approval for the
-    /// same device closes.
+    async fn approval_row(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        session: &Session,
+        approval_id: Uuid,
+    ) -> Result<ApprovalRow> {
+        let row: Option<ApprovalRow> = sqlx::query_as(SELECT_APPROVAL)
+            .bind(approval_id)
+            .bind(session.account_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+        let row = row.ok_or(AccountError::NotFound)?;
+        if row.account_id != session.account_id {
+            return Err(AccountError::NotFound);
+        }
+        Ok(row)
+    }
+
+    /// The open approval `approval_id` locked for a step by one of its two
+    /// devices. `as_approver` says which side the session must be.
+    async fn open_approval(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        session: &Session,
+        approval_id: Uuid,
+        as_approver: bool,
+    ) -> Result<ApprovalView> {
+        let row = self.approval_row(tx, session, approval_id).await?;
+        let side = if as_approver {
+            row.approver_id
+        } else {
+            row.device_id
+        };
+        if side != session.device_id {
+            return Err(AccountError::NotFound);
+        }
+        if row.state != "open" {
+            return Err(AccountError::ApprovalExpired);
+        }
+        if row.expired {
+            close(tx, approval_id).await?;
+            return Err(AccountError::ApprovalExpired);
+        }
+        row.try_into()
+    }
+
+    /// Step 1, from a trusted device: opens approval `approval_id` (chosen by
+    /// the approver) for the pending `device_id`, made at `created_at` (Unix
+    /// seconds, near the server's clock), with its commitment. Any earlier
+    /// open approval for the device closes.
     pub async fn create_approval(
         &self,
         client: &Client,
         session: &Session,
         device_id: Uuid,
-        signature: &[u8; 64],
+        approval_id: Uuid,
+        created_at: i64,
+        commitment: &[u8; 32],
     ) -> Result<Approval> {
+        if !fresh(created_at, Utc::now().timestamp()) {
+            return Err(AccountError::InvalidRequest);
+        }
         let mut tx = self.pool.begin().await?;
-        let approver = self.require_trusted(&mut tx, session).await?;
-        let pending = self
-            .device(&mut tx, session.account_id, device_id)
+        self.require_trusted(&mut tx, session).await?;
+        self.device(&mut tx, session.account_id, device_id)
             .await?
             .filter(|d| d.state == DeviceState::Pending)
             .ok_or(AccountError::NotFound)?;
-        verify_approval(
-            &approver,
-            session.account_id,
-            device_id,
-            &pending.keys,
-            signature,
-        )?;
+        let taken: Option<i32> = sqlx::query_scalar("SELECT 1 FROM device_approvals WHERE id = $1")
+            .bind(approval_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if taken.is_some() {
+            return Err(AccountError::ApprovalOutOfOrder);
+        }
         sqlx::query(
             "UPDATE device_approvals SET state = 'closed' WHERE device_id = $1 AND state = 'open'",
         )
         .bind(device_id)
         .execute(&mut *tx)
         .await?;
-        let id = Uuid::new_v4();
-        let code = new_code()?;
         let expires_at: DateTime<Utc> = sqlx::query_scalar(
             "INSERT INTO device_approvals
-                 (id, account_id, device_id, approver_id, signature, code_digest, expires_at)
+                 (id, account_id, device_id, approver_id, approval_created_at, commitment, expires_at)
              VALUES ($1, $2, $3, $4, $5, $6, now() + make_interval(secs => $7))
              RETURNING expires_at",
         )
-        .bind(id)
+        .bind(approval_id)
         .bind(session.account_id)
         .bind(device_id)
         .bind(session.device_id)
-        .bind(signature.as_slice())
-        .bind(self.code_digest(id, &code).as_slice())
+        .bind(created_at)
+        .bind(commitment.as_slice())
         .bind(APPROVAL_TTL.as_secs_f64())
         .fetch_one(&mut *tx)
         .await?;
@@ -233,13 +379,147 @@ impl Accounts {
         .await?;
         tx.commit().await?;
         Ok(Approval {
-            id,
-            code,
+            id: approval_id,
             expires_at,
         })
     }
 
-    /// The pending device answers approval `approval_id` with the code. On the
+    /// The approval as the approver sees it, to read the new device's nonce.
+    pub async fn approval(&self, session: &Session, approval_id: Uuid) -> Result<ApprovalView> {
+        let mut tx = self.pool.begin().await?;
+        self.require_trusted(&mut tx, session).await?;
+        let view = self
+            .open_approval(&mut tx, session, approval_id, true)
+            .await?;
+        tx.commit().await?;
+        Ok(view)
+    }
+
+    /// Step 2, from the pending device, once: its nonce.
+    pub async fn submit_device_nonce(
+        &self,
+        session: &Session,
+        approval_id: Uuid,
+        nonce: &[u8; 32],
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let view = self
+            .open_approval(&mut tx, session, approval_id, false)
+            .await?;
+        if view.device_nonce.is_some() {
+            return Err(AccountError::ApprovalOutOfOrder);
+        }
+        sqlx::query("UPDATE device_approvals SET device_nonce = $2 WHERE id = $1")
+            .bind(approval_id)
+            .bind(nonce.as_slice())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Step 3, from the approver, once and only after the new device's nonce:
+    /// its own nonce, checked against the commitment. A wrong one closes the
+    /// approval.
+    pub async fn reveal_approver_nonce(
+        &self,
+        session: &Session,
+        approval_id: Uuid,
+        nonce: &[u8; 32],
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        self.require_trusted(&mut tx, session).await?;
+        let view = self
+            .open_approval(&mut tx, session, approval_id, true)
+            .await?;
+        if view.device_nonce.is_none() || view.approver_nonce.is_some() {
+            return Err(AccountError::ApprovalOutOfOrder);
+        }
+        let ids = (
+            *view.id.as_bytes(),
+            *view.approver_id.as_bytes(),
+            *view.device_id.as_bytes(),
+        );
+        let account = *session.account_id.as_bytes();
+        let expected = approval_commitment(&pairing_of(&account, &view, &ids), nonce);
+        if !constant_time_eq(&expected, &view.commitment) {
+            close(&mut tx, approval_id).await?;
+            tx.commit().await?;
+            return Err(AccountError::InvalidCommitment);
+        }
+        sqlx::query("UPDATE device_approvals SET approver_nonce = $2 WHERE id = $1")
+            .bind(approval_id)
+            .bind(nonce.as_slice())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Step 4, from the approver after the person confirmed the codes match:
+    /// its signature over the approval and its endorsement. A bad signature
+    /// closes the approval.
+    pub async fn confirm_approval(
+        &self,
+        session: &Session,
+        approval_id: Uuid,
+        signature: &[u8; 64],
+        endorsement: Option<&[u8]>,
+    ) -> Result<()> {
+        if endorsement.is_some_and(|e| e.is_empty() || e.len() > MAX_ENDORSEMENT) {
+            return Err(AccountError::InvalidRequest);
+        }
+        let mut tx = self.pool.begin().await?;
+        self.require_trusted(&mut tx, session).await?;
+        let view = self
+            .open_approval(&mut tx, session, approval_id, true)
+            .await?;
+        if view.approver_nonce.is_none() || view.signature.is_some() {
+            return Err(AccountError::ApprovalOutOfOrder);
+        }
+        let ids = (
+            *view.id.as_bytes(),
+            *view.approver_id.as_bytes(),
+            *view.device_id.as_bytes(),
+        );
+        let account = *session.account_id.as_bytes();
+        let message = approval_message(&pairing_of(&account, &view, &ids));
+        if verify_signed(
+            &view.approver_keys,
+            DEVICE_APPROVAL_CONTEXT,
+            &message,
+            signature,
+        )
+        .is_err()
+        {
+            close(&mut tx, approval_id).await?;
+            tx.commit().await?;
+            return Err(AccountError::InvalidSignature);
+        }
+        sqlx::query("UPDATE device_approvals SET signature = $2, endorsement = $3 WHERE id = $1")
+            .bind(approval_id)
+            .bind(signature.as_slice())
+            .bind(endorsement)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Either device cancels the approval, for example when the codes differ.
+    pub async fn cancel_approval(&self, session: &Session, approval_id: Uuid) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let row = self.approval_row(&mut tx, session, approval_id).await?;
+        if row.approver_id != session.device_id && row.device_id != session.device_id {
+            return Err(AccountError::NotFound);
+        }
+        close(&mut tx, approval_id).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Step 5, from the pending device after the person confirmed: the six
+    /// digits it shows. One try: a wrong code closes the approval. On the
     /// right code, with the approver still trusted and its signature still
     /// valid, the device becomes trusted.
     pub async fn submit_approval_code(
@@ -249,13 +529,11 @@ impl Accounts {
         approval_id: Uuid,
         code: &str,
     ) -> Result<Device> {
-        // Counted per pending device, so one device cannot use up the tries of
-        // another device waiting on the same account.
         let device_subject = self
             .secrets
             .digest("approval-device", session.device_id.as_bytes());
         let ip_subject = self.ip_digest(client);
-        let by_account = limits::allow(
+        let by_device = limits::allow(
             &self.pool,
             "approval-code",
             &device_subject,
@@ -269,50 +547,31 @@ impl Accounts {
             self.limits.approval_code_per_ip,
         )
         .await?;
-        if !(by_account && by_ip) {
+        if !(by_device && by_ip) {
             return Err(AccountError::TooManyAttempts);
         }
 
         let mut tx = self.pool.begin().await?;
-        let row: Option<ApprovalRow> = sqlx::query_as(
-            "SELECT approver_id, signature, code_digest, attempts, state, expires_at <= now() AS expired
-             FROM device_approvals
-             WHERE id = $1 AND account_id = $2 AND device_id = $3 FOR UPDATE",
-        )
-        .bind(approval_id)
-        .bind(session.account_id)
-        .bind(session.device_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let ApprovalRow {
-            approver_id,
-            signature,
-            code_digest,
-            attempts,
-            state,
-            expired,
-        } = row.ok_or(AccountError::NotFound)?;
-        if state != "open" {
-            return Err(AccountError::ApprovalExpired);
-        }
-        if expired {
-            close(&mut tx, approval_id).await?;
-            tx.commit().await?;
-            return Err(AccountError::ApprovalExpired);
-        }
-        let code = code.trim();
-        if !constant_time_eq(&self.code_digest(approval_id, code), &code_digest) {
-            let attempts = attempts + 1;
-            sqlx::query(
-                "UPDATE device_approvals
-                 SET attempts = $2, state = CASE WHEN $2 >= $3 THEN 'closed' ELSE state END
-                 WHERE id = $1",
-            )
-            .bind(approval_id)
-            .bind(attempts)
-            .bind(APPROVAL_ATTEMPTS)
-            .execute(&mut *tx)
+        let view = self
+            .open_approval(&mut tx, session, approval_id, false)
             .await?;
+        let (Some(device_nonce), Some(approver_nonce)) = (view.device_nonce, view.approver_nonce)
+        else {
+            return Err(AccountError::ApprovalOutOfOrder);
+        };
+        let Some(signature) = view.signature else {
+            return Err(AccountError::ApprovalNotConfirmed);
+        };
+        let ids = (
+            *view.id.as_bytes(),
+            *view.approver_id.as_bytes(),
+            *view.device_id.as_bytes(),
+        );
+        let account = *session.account_id.as_bytes();
+        let pairing = pairing_of(&account, &view, &ids);
+        let sas = approval_sas(&pairing, &approver_nonce, &device_nonce);
+        if !constant_time_eq(sas.as_bytes(), code.trim().as_bytes()) {
+            close(&mut tx, approval_id).await?;
             self.audit(
                 &mut *tx,
                 client,
@@ -322,38 +581,23 @@ impl Accounts {
             )
             .await?;
             tx.commit().await?;
-            return Err(AccountError::WrongCode {
-                remaining: (APPROVAL_ATTEMPTS - attempts).max(0),
-            });
+            return Err(AccountError::WrongCode { remaining: 0 });
         }
-
-        // The right code. Check the approval again against the devices as they
-        // are now: the approver must still be trusted and its signature must
-        // cover this device's keys.
-        let approver = self
-            .device(&mut tx, session.account_id, approver_id)
+        // Check the approval again against the devices as they are now.
+        let approver_trusted = self
+            .device(&mut tx, session.account_id, view.approver_id)
             .await?
-            .filter(|d| d.state == DeviceState::Trusted);
-        let pending = self
-            .device(&mut tx, session.account_id, session.device_id)
-            .await?
-            .filter(|d| d.state == DeviceState::Pending)
-            .ok_or(AccountError::NotFound)?;
-        let signature: [u8; 64] = signature
-            .as_slice()
-            .try_into()
-            .map_err(|_| AccountError::InvalidSignature)?;
-        let valid = approver.as_ref().is_some_and(|approver| {
-            verify_approval(
-                &approver.keys,
-                session.account_id,
-                pending.id,
-                &pending.keys,
+            .is_some_and(|d| d.state == DeviceState::Trusted && d.keys == view.approver_keys);
+        let message = approval_message(&pairing);
+        if !approver_trusted
+            || verify_signed(
+                &view.approver_keys,
+                DEVICE_APPROVAL_CONTEXT,
+                &message,
                 &signature,
             )
-            .is_ok()
-        });
-        if !valid {
+            .is_err()
+        {
             close(&mut tx, approval_id).await?;
             tx.commit().await?;
             return Err(AccountError::InvalidSignature);
@@ -364,37 +608,41 @@ impl Accounts {
             .await?;
         sqlx::query(
             "UPDATE devices SET state = 'trusted', approved_by = $2, approval_signature = $3,
-                    approved_at = now()
-             WHERE id = $1",
+                    approval_id = $4, approval_created_at = $5, approved_at = now()
+             WHERE id = $1 AND state = 'pending'",
         )
-        .bind(pending.id)
-        .bind(approver_id)
+        .bind(view.device_id)
+        .bind(view.approver_id)
         .bind(signature.as_slice())
+        .bind(view.id)
+        .bind(view.created_at)
         .execute(&mut *tx)
         .await?;
         self.audit(
             &mut *tx,
             client,
             Some(session.account_id),
-            Some(pending.id),
+            Some(view.device_id),
             AuditAction::DeviceApproved,
         )
         .await?;
         let device = self
-            .device(&mut tx, session.account_id, pending.id)
+            .device(&mut tx, session.account_id, view.device_id)
             .await?
             .ok_or(AccountError::Internal)?;
         tx.commit().await?;
         Ok(device)
     }
 
-    /// A trusted device removes `device_id`, which may be itself. Its sessions
-    /// end and its open approvals close. The last trusted device stays.
+    /// A trusted device removes `device_id`, which may be itself, with its
+    /// signature over [`removal_message`]. Its sessions end and its open
+    /// approvals close. The last trusted device stays.
     pub async fn remove_device(
         &self,
         client: &Client,
         session: &Session,
         device_id: Uuid,
+        signature: &[u8; 64],
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         // Lock the account so two removals cannot each leave the other device last.
@@ -402,11 +650,17 @@ impl Accounts {
             .bind(session.account_id)
             .execute(&mut *tx)
             .await?;
-        self.require_trusted(&mut tx, session).await?;
+        let remover = self.require_trusted(&mut tx, session).await?;
         let target = self
             .device(&mut tx, session.account_id, device_id)
             .await?
             .ok_or(AccountError::NotFound)?;
+        let message = removal_message(
+            session.account_id.as_bytes(),
+            device_id.as_bytes(),
+            &target.keys,
+        );
+        verify_signed(&remover, DEVICE_REMOVAL_CONTEXT, &message, signature)?;
         if target.state == DeviceState::Trusted {
             let trusted: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM devices WHERE account_id = $1 AND state = 'trusted'",
@@ -418,10 +672,16 @@ impl Accounts {
                 return Err(AccountError::LastTrustedDevice);
             }
         }
-        sqlx::query("UPDATE devices SET state = 'removed', removed_at = now() WHERE id = $1")
-            .bind(device_id)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "UPDATE devices SET state = 'removed', removed_at = now(), removed_by = $2,
+                    removal_signature = $3
+             WHERE id = $1",
+        )
+        .bind(device_id)
+        .bind(session.device_id)
+        .bind(signature.as_slice())
+        .execute(&mut *tx)
+        .await?;
         sqlx::query(
             "UPDATE sessions SET revoked_at = now() WHERE device_id = $1 AND revoked_at IS NULL",
         )
@@ -461,12 +721,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn codes_are_six_digits() -> Result<()> {
-        for _ in 0..100 {
-            let code = new_code()?;
-            assert_eq!(code.len(), 6);
-            assert!(code.bytes().all(|b| b.is_ascii_digit()));
-        }
-        Ok(())
+    fn approval_times_must_be_near_the_server_clock() {
+        assert!(fresh(1_000, 1_000));
+        assert!(fresh(1_000 - CLOCK_SLACK_SECS, 1_000));
+        assert!(fresh(1_000 + CLOCK_SLACK_SECS, 1_000));
+        assert!(!fresh(1_000 - CLOCK_SLACK_SECS - 1, 1_000));
+        assert!(!fresh(1_000 + CLOCK_SLACK_SECS + 1, 1_000));
     }
 }
