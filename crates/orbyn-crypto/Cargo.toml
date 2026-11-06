@@ -13,6 +13,7 @@ ed25519-dalek.workspace = true
 getrandom.workspace = true
 hkdf.workspace = true
 sha2.workspace = true
+subtle.workspace = true
 thiserror.workspace = true
 x25519-dalek.workspace = true
 zeroize.workspace = true

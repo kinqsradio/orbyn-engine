@@ -153,12 +153,45 @@ impl Fields {
     }
 }
 
+/// The value as JSON text. serde_json keeps object keys sorted (its
+/// `preserve_order` feature is off), so equal values always give equal text;
+/// a test below pins that.
 fn canonical(value: &serde_json::Value) -> String {
     serde_json::to_string(value).unwrap_or_default()
 }
 
+/// Merges a copy that arrived from another device or the server. Any field
+/// stamped more than [`MAX_SKEW_MILLIS`] ahead of `now_millis` is left out and
+/// named in the result, so one bad clock cannot win a field forever. Data from
+/// outside this device must always go through this, never through [`merge`].
+pub fn merge_remote(ours: &Fields, theirs: &Fields, now_millis: u64) -> Merged {
+    let limit = now_millis.saturating_add(MAX_SKEW_MILLIS);
+    let mut accepted = Fields::default();
+    let mut rejected = Vec::new();
+    for (name, field) in &theirs.0 {
+        if field.stamp.millis > limit {
+            rejected.push(name.clone());
+        } else {
+            accepted.0.insert(name.clone(), field.clone());
+        }
+    }
+    Merged {
+        fields: merge(ours, &accepted),
+        rejected,
+    }
+}
+
+/// The result of [`merge_remote`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct Merged {
+    pub fields: Fields,
+    /// Fields refused because their stamp was too far in the future.
+    pub rejected: Vec<String>,
+}
+
 /// Merges two copies of a record. The result is the same whichever copy is
-/// `ours`, and merging a copy into itself changes nothing.
+/// `ours`, and merging a copy into itself changes nothing. Both copies must
+/// already be trusted; use [`merge_remote`] for anything received.
 pub fn merge(ours: &Fields, theirs: &Fields) -> Fields {
     let mut out = ours.clone();
     for (name, field) in &theirs.0 {
@@ -341,5 +374,32 @@ mod tests {
             );
             assert_eq!(merge(&a, &a), a, "idempotent, case {case}");
         }
+    }
+
+    #[test]
+    fn a_field_stamped_far_in_the_future_is_refused_on_merge() {
+        let now = 1_000_000;
+        let mut ours = Fields::default();
+        ours.set("title", json!("Bread"), stamp(now, 1));
+        let mut hostile = Fields::default();
+        hostile.set("title", json!("Owned"), stamp(u64::MAX, 9));
+        hostile.set("list", json!("home"), stamp(now + 5, 9));
+        let merged = merge_remote(&ours, &hostile, now);
+        assert_eq!(merged.fields.get("title"), Some(&json!("Bread")));
+        assert_eq!(merged.fields.get("list"), Some(&json!("home")));
+        assert_eq!(merged.rejected, vec!["title".to_owned()]);
+        // The person can still edit the field afterwards.
+        let mut later = merged.fields;
+        later.set("title", json!("Rye bread"), stamp(now + 10, 1));
+        assert_eq!(later.get("title"), Some(&json!("Rye bread")));
+    }
+
+    #[test]
+    fn canonical_json_ignores_key_order() {
+        let a: serde_json::Value =
+            serde_json::from_str(r#"{"b":1,"a":{"y":2,"x":3}}"#).expect("json");
+        let b: serde_json::Value =
+            serde_json::from_str(r#"{"a":{"x":3,"y":2},"b":1}"#).expect("json");
+        assert_eq!(canonical(&a), canonical(&b));
     }
 }

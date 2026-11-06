@@ -1198,6 +1198,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hkdf",
  "sha2 0.11.1",
+ "subtle",
  "thiserror",
  "x25519-dalek",
  "zeroize",
