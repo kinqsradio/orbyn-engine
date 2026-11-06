@@ -1,0 +1,64 @@
+# Local stack: Postgres, migrations, the API and a worker.
+#   docker compose up -d         everything
+#   docker compose up -d postgres  only the database, for `cargo test`
+# Postgres trusts connections without a password and listens on 127.0.0.1 only:
+# it is for local development, never for a shared machine.
+name: orbyn-engine
+
+services:
+  postgres:
+    image: postgres:17-bookworm@sha256:665dc7b37ac52a17e298511414c21d23ffa4e6a6ef6225b3e5d59c7afb35e994
+    environment:
+      POSTGRES_USER: orbyn
+      POSTGRES_HOST_AUTH_METHOD: trust
+      POSTGRES_DB: orbyn
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orbyn -d orbyn"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  migrate:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: orbyn-engine:dev
+    command: ["migrate"]
+    healthcheck:
+      disable: true
+    environment:
+      DATABASE_URL: postgres://orbyn@postgres:5432/orbyn
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  server:
+    image: orbyn-engine:dev
+    command: ["serve"]
+    environment:
+      DATABASE_URL: postgres://orbyn@postgres:5432/orbyn
+      ORBYN_ALLOWED_ORIGINS: http://localhost:5173
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    image: orbyn-engine:dev
+    command: ["worker"]
+    # The worker serves no HTTP, so the image's /health check does not apply.
+    healthcheck:
+      disable: true
+    environment:
+      DATABASE_URL: postgres://orbyn@postgres:5432/orbyn
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  postgres:
