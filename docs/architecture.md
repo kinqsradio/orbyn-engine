@@ -43,7 +43,9 @@ Each field carries a hybrid-logical-clock stamp (milliseconds, counter, device).
 
 ## Jobs
 
-Jobs live in Postgres. A worker claims one with `FOR UPDATE SKIP LOCKED` and a 60-second lease; an expired lease returns the job to the queue. Only the lease holder can complete or fail a job. Failures retry after 2, 4, 8 … seconds (at most 10 minutes) until `max_attempts`, then the job is `failed`. An idempotency key makes enqueueing the same effect twice a no-op.
+Jobs live in Postgres. A worker claims one with `FOR UPDATE SKIP LOCKED` and a 60-second lease; an expired lease returns the job to the queue. Only the lease holder can complete or fail a job. Failures retry after 2, 4, 8 … seconds (at most 10 minutes) until `max_attempts`, then the job is `failed`. A lease that expires after the job's last attempt marks it `failed` instead of reclaiming it. While a handler runs, the worker renews the lease every third of its length; if a renewal finds the lease lost, the worker abandons the result and does not complete the job. An idempotency key, unique per job kind, makes enqueueing the same effect twice a no-op.
+
+Delivery is at least once: a crash or a lost lease runs a job again. Handlers must be idempotent, passing the job id or its idempotency key to every provider as the operation identity.
 
 ## Running
 

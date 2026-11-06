@@ -6,3 +6,4 @@ pub mod jobs;
 
 pub use config::Config;
 pub use db::Database;
+pub use sqlx;
