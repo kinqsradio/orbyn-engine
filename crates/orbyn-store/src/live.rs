@@ -5,24 +5,30 @@
 //! Notices can be missed: while the listener reconnects, or when a slow device
 //! falls behind. Both turn into [`Notice::Resync`], which tells the device to
 //! compare every zone's token. A device also does that each time it connects.
+//!
+//! Every account has its own bounded queue, made when its first device
+//! connects and dropped with its last. The listener puts a notice only in its
+//! account's queue, so what one account does can only make that account's own
+//! slow devices fall behind, never another account's.
 
 use crate::{CHANGES_CHANNEL, ChangeToken};
 use orbyn_core::accounts::Session;
 use serde::Deserialize;
 use sqlx::PgPool;
 use sqlx::postgres::PgListener;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 use tokio::sync::{broadcast, watch};
 use uuid::Uuid;
 
-/// Notices a slow device may fall behind by before it is told to resync.
-const BUFFER: usize = 1024;
+/// Notices a slow device may fall behind by before it is told to resync. Each
+/// account has its own queue, so this bounds one account's memory, not the replica's.
+const BUFFER: usize = 128;
 
 #[derive(Clone, Debug)]
 enum Event {
     Changed {
-        account: Uuid,
         device: Uuid,
         zone: String,
         token: ChangeToken,
@@ -47,9 +53,17 @@ pub enum Notice {
     Resync,
 }
 
+/// The queue of every account that has a device connected here.
+type Queues = Mutex<HashMap<Uuid, broadcast::Sender<Event>>>;
+
+fn queues(queues: &Queues) -> MutexGuard<'_, HashMap<Uuid, broadcast::Sender<Event>>> {
+    // A poisoned lock still holds valid queues; never stop the listener for it.
+    queues.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 #[derive(Debug)]
 struct Inner {
-    events: broadcast::Sender<Event>,
+    queues: Arc<Queues>,
     listening: watch::Receiver<bool>,
     task: tokio::task::AbortHandle,
 }
@@ -57,6 +71,8 @@ struct Inner {
 impl Drop for Inner {
     fn drop(&mut self) {
         self.task.abort();
+        // Closes every feed, as a stopped hub always did.
+        queues(&self.queues).clear();
     }
 }
 
@@ -71,12 +87,12 @@ impl Hub {
     /// Starts listening in the background. Needs a Tokio runtime. If Postgres
     /// is down it keeps trying, waiting up to 30 seconds between attempts.
     pub fn start(pool: PgPool) -> Self {
-        let (events, _) = broadcast::channel(BUFFER);
+        let queues = Arc::new(Queues::default());
         let (listening_tx, listening) = watch::channel(false);
-        let task = tokio::spawn(listen(pool, events.clone(), listening_tx)).abort_handle();
+        let task = tokio::spawn(listen(pool, queues.clone(), listening_tx)).abort_handle();
         Self {
             inner: Arc::new(Inner {
-                events,
+                queues,
                 listening,
                 task,
             }),
@@ -89,16 +105,37 @@ impl Hub {
         let _ = listening.wait_for(|on| *on).await;
     }
 
-    pub(crate) fn feed(&self, session: &Session) -> Feed {
-        Feed {
-            events: self.inner.events.subscribe(),
+    /// A feed for the session's device, or `None` when its account already has
+    /// `max` feeds open on this replica.
+    pub(crate) fn feed(&self, session: &Session, max: usize) -> Option<Feed> {
+        let mut map = queues(&self.inner.queues);
+        let open = map
+            .get(&session.account_id)
+            .map_or(0, broadcast::Sender::receiver_count);
+        if open >= max {
+            return None;
+        }
+        let events = map
+            .entry(session.account_id)
+            .or_insert_with(|| broadcast::channel(BUFFER).0)
+            .subscribe();
+        Some(Feed {
+            events,
+            queues: self.inner.queues.clone(),
             account: session.account_id,
             device: session.device_id,
-        }
+        })
     }
 }
 
-async fn listen(pool: PgPool, events: broadcast::Sender<Event>, listening: watch::Sender<bool>) {
+/// Puts a notice in its account's queue, if any device of the account is connected.
+fn deliver(queues_: &Queues, account: Uuid, event: Event) {
+    if let Some(queue) = queues(queues_).get(&account) {
+        let _ = queue.send(event);
+    }
+}
+
+async fn listen(pool: PgPool, queues_: Arc<Queues>, listening: watch::Sender<bool>) {
     let mut first = true;
     let mut delay = Duration::from_secs(1);
     loop {
@@ -121,7 +158,9 @@ async fn listen(pool: PgPool, events: broadcast::Sender<Event>, listening: watch
         delay = Duration::from_secs(1);
         if !first {
             // Anything sent while this replica was not listening is lost.
-            let _ = events.send(Event::Resync);
+            for queue in queues(&queues_).values() {
+                let _ = queue.send(Event::Resync);
+            }
         }
         first = false;
         listening.send_replace(true);
@@ -131,12 +170,12 @@ async fn listen(pool: PgPool, events: broadcast::Sender<Event>, listening: watch
                     match serde_json::from_str::<Payload>(notification.payload()) {
                         Ok(p) => match ChangeToken::parse(&p.token) {
                             Some(token) => {
-                                let _ = events.send(Event::Changed {
-                                    account: p.account,
+                                let event = Event::Changed {
                                     device: p.device,
                                     zone: p.zone,
                                     token,
-                                });
+                                };
+                                deliver(&queues_, p.account, event);
                             }
                             None => tracing::warn!("a zone change notice has a bad token"),
                         },
@@ -161,8 +200,23 @@ async fn listen(pool: PgPool, events: broadcast::Sender<Event>, listening: watch
 #[derive(Debug)]
 pub struct Feed {
     events: broadcast::Receiver<Event>,
+    queues: Arc<Queues>,
     account: Uuid,
     device: Uuid,
+}
+
+impl Drop for Feed {
+    fn drop(&mut self) {
+        // This feed's receiver is still counted, so one means it is the last.
+        // Subscribing takes the same lock, so nobody joins in between.
+        let mut map = queues(&self.queues);
+        if map
+            .get(&self.account)
+            .is_some_and(|queue| queue.receiver_count() <= 1)
+        {
+            map.remove(&self.account);
+        }
+    }
 }
 
 impl Feed {
@@ -171,12 +225,11 @@ impl Feed {
         loop {
             match self.events.recv().await {
                 Ok(Event::Changed {
-                    account,
                     device,
                     zone,
                     token,
                 }) => {
-                    if account == self.account && device != self.device {
+                    if device != self.device {
                         return Some(Notice::ZoneChanged { zone, token });
                     }
                 }
@@ -186,5 +239,46 @@ impl Feed {
                 Err(broadcast::error::RecvError::Closed) => return None,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orbyn_core::accounts::DeviceState;
+
+    fn session(account: Uuid) -> Session {
+        Session {
+            id: Uuid::new_v4(),
+            account_id: account,
+            device_id: Uuid::new_v4(),
+            device_state: DeviceState::Trusted,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_accounts_queue_lives_exactly_as_long_as_its_feeds() {
+        // The listener cannot connect and keeps retrying; the queues don't need it.
+        let pool = PgPool::connect_lazy("postgres://orbyn@127.0.0.1:1/none").expect("pool");
+        let hub = Hub::start(pool);
+        let account = Uuid::new_v4();
+        let first = hub.feed(&session(account), 2).expect("first");
+        let second = hub.feed(&session(account), 2).expect("second");
+        assert!(hub.feed(&session(account), 2).is_none(), "capped at two");
+        let other = hub.feed(&session(Uuid::new_v4()), 2).expect("other");
+        assert_eq!(queues(&hub.inner.queues).len(), 2);
+        drop(first);
+        assert_eq!(queues(&hub.inner.queues).len(), 2, "one feed still open");
+        assert!(
+            hub.feed(&session(account), 2).is_some(),
+            "a place came back"
+        );
+        drop(second);
+        drop(other);
+        assert_eq!(
+            queues(&hub.inner.queues).len(),
+            0,
+            "queues of closed accounts are dropped"
+        );
     }
 }

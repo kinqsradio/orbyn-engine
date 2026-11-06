@@ -1128,3 +1128,306 @@ async fn a_tombstone_keeps_the_deleting_devices_proof() {
         .expect("fetch");
     assert_eq!(changes.records[0].delete_proof, None);
 }
+
+fn limit(max: i64) -> orbyn_core::accounts::Limit {
+    orbyn_core::accounts::Limit::new(max, Duration::from_secs(60))
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn uploads_are_limited_per_device_and_per_account() {
+    let (store, db) = store_with(Limits {
+        uploads_per_device: limit(3),
+        uploads_per_account: limit(4),
+        ..Limits::default()
+    })
+    .await;
+    let laptop = trusted(&db).await;
+    let phone = device(&db, laptop.account_id, "trusted").await;
+    let pending = device(&db, laptop.account_id, "pending").await;
+    let other = trusted(&db).await;
+    for session in [&laptop, &other] {
+        store.create_zone(session, "inbox").await.expect("zone");
+    }
+    let put = |session: &Session, id: &str| {
+        let (store, session, id) = (store.clone(), *session, id.to_owned());
+        async move {
+            store
+                .upload(&session, "inbox", &batch(vec![save(&id, None, b"x")]))
+                .await
+        }
+    };
+
+    // A burst up to the device limit, then a clear refusal with a wait.
+    for n in 0..3 {
+        put(&laptop, &format!("l{n}")).await.expect("within burst");
+    }
+    match put(&laptop, "l3").await {
+        Err(StoreError::TooManyUploads { retry_after }) => {
+            assert!((1..=60).contains(&retry_after.as_secs()), "{retry_after:?}");
+        }
+        other => panic!("expected too many uploads, got {other:?}"),
+    }
+
+    // The account's other device has its own budget, until the account's runs out.
+    put(&phone, "p0").await.expect("phone, account 4 of 4");
+    assert!(matches!(
+        put(&phone, "p1").await,
+        Err(StoreError::TooManyUploads { .. })
+    ));
+
+    // A pending device is refused as untrusted and uses nothing up.
+    assert!(matches!(
+        put(&pending, "x").await,
+        Err(StoreError::DeviceNotTrusted)
+    ));
+
+    // Another account is untouched by all of it.
+    for n in 0..3 {
+        put(&other, &format!("o{n}"))
+            .await
+            .expect("other account within its own burst");
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn an_account_may_open_only_so_many_sockets() {
+    let (store, db) = store_with(Limits {
+        max_sockets_per_account: 2,
+        ..Limits::default()
+    })
+    .await;
+    let me = trusted(&db).await;
+    let stranger = trusted(&db).await;
+    let first = store.feed(&me).await.expect("first");
+    let _second = store.feed(&me).await.expect("second");
+    assert!(matches!(
+        store.feed(&me).await,
+        Err(StoreError::TooManyConnections)
+    ));
+    // Another account has its own sockets.
+    let _theirs = store.feed(&stranger).await.expect("other account");
+    // A closed socket gives its place back.
+    drop(first);
+    store.feed(&me).await.expect("a place came back");
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn one_accounts_flood_does_not_push_another_account_into_resync() {
+    let (store, db) = store_with(Limits {
+        uploads_per_device: limit(10_000),
+        uploads_per_account: limit(10_000),
+        ..Limits::default()
+    })
+    .await;
+    let noisy = trusted(&db).await;
+    let noisy_phone = device(&db, noisy.account_id, "trusted").await;
+    let quiet = trusted(&db).await;
+    let quiet_phone = device(&db, quiet.account_id, "trusted").await;
+    // Neither listener reads while the flood runs, so both queues are tested.
+    let mut noisy_feed = store.feed(&noisy_phone).await.expect("feed");
+    let mut quiet_feed = store.feed(&quiet_phone).await.expect("feed");
+
+    store.create_zone(&noisy, "inbox").await.expect("zone");
+    store.create_zone(&quiet, "inbox").await.expect("zone");
+    // Far more notices than one account's queue holds.
+    for n in 0..400 {
+        store
+            .upload(
+                &noisy,
+                "inbox",
+                &batch(vec![save(&format!("n{n}"), None, b"x")]),
+            )
+            .await
+            .expect("flood upload");
+    }
+    let result = store
+        .upload(&quiet, "inbox", &batch(vec![save("q", None, b"x")]))
+        .await
+        .expect("quiet upload");
+
+    // The quiet account's phone hears its laptop's zone creation and upload, no resync.
+    let wait = Duration::from_secs(5);
+    let created = tokio::time::timeout(wait, quiet_feed.next()).await;
+    assert!(
+        matches!(created, Ok(Some(Notice::ZoneChanged { ref zone, .. })) if zone == "inbox"),
+        "{created:?}"
+    );
+    let saved = tokio::time::timeout(wait, quiet_feed.next()).await;
+    assert_eq!(
+        saved,
+        Ok(Some(Notice::ZoneChanged {
+            zone: "inbox".into(),
+            token: result.token
+        }))
+    );
+
+    // The flooding account's own slow phone did fall behind: that is the resync's job.
+    let behind = tokio::time::timeout(wait, noisy_feed.next()).await;
+    assert_eq!(behind, Ok(Some(Notice::Resync)));
+}
+
+/// How many attempts the upload limiter holds for a device.
+async fn device_attempts(db: &Database, device: Uuid) -> i64 {
+    use sha2::{Digest, Sha256};
+    let subject: [u8; 32] = Sha256::new()
+        .chain_update(b"orbyn/upload-limit/v1")
+        .chain_update(b"device")
+        .chain_update(device.as_bytes())
+        .finalize()
+        .into();
+    sqlx::query_scalar(
+        "SELECT count(*) FROM auth_attempts WHERE action = 'upload-device' AND subject = $1",
+    )
+    .bind(subject.as_slice())
+    .fetch_one(db.pool())
+    .await
+    .expect("count")
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_device_refused_by_its_account_keeps_its_own_budget() {
+    let (store, db) = store_with(Limits {
+        uploads_per_device: limit(5),
+        uploads_per_account: limit(1),
+        ..Limits::default()
+    })
+    .await;
+    let laptop = trusted(&db).await;
+    let phone = device(&db, laptop.account_id, "trusted").await;
+    store.create_zone(&laptop, "inbox").await.expect("zone");
+    store
+        .upload(&laptop, "inbox", &batch(vec![save("a", None, b"x")]))
+        .await
+        .expect("the account's only upload");
+    assert_eq!(device_attempts(&db, laptop.device_id).await, 1);
+    for n in 0..3 {
+        let refused = store
+            .upload(
+                &phone,
+                "inbox",
+                &batch(vec![save(&format!("p{n}"), None, b"x")]),
+            )
+            .await;
+        assert!(matches!(refused, Err(StoreError::TooManyUploads { .. })));
+    }
+    assert_eq!(
+        device_attempts(&db, phone.device_id).await,
+        0,
+        "refusals by the account cost the phone nothing"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs DATABASE_URL"]
+async fn a_pending_device_cannot_take_the_accounts_upload_slots() {
+    let (store, db) = store_with(Limits {
+        uploads_per_device: limit(100_000),
+        uploads_per_account: limit(100_000),
+        ..Limits::default()
+    })
+    .await;
+    let owner = trusted(&db).await;
+    store.create_zone(&owner, "inbox").await.expect("zone");
+    let pending = device(&db, owner.account_id, "pending").await;
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flood: Vec<_> = (0..64)
+        .map(|n| {
+            let (store, stop) = (store.clone(), stop.clone());
+            tokio::spawn(async move {
+                let mut i = 0;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let err = store
+                        .upload(
+                            &pending,
+                            "inbox",
+                            &batch(vec![save(&format!("p{n}-{i}"), None, b"x")]),
+                        )
+                        .await
+                        .expect_err("pending");
+                    assert!(matches!(err, StoreError::DeviceNotTrusted), "{err:?}");
+                    i += 1;
+                    tokio::task::yield_now().await;
+                }
+            })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    for n in 0..20 {
+        store
+            .upload(
+                &owner,
+                "inbox",
+                &batch(vec![save(&format!("o{n}"), None, b"x")]),
+            )
+            .await
+            .expect("the owner's uploads are not blocked by a pending device");
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for task in flood {
+        task.await.expect("task");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs DATABASE_URL"]
+async fn a_flood_from_one_account_leaves_the_pool_to_others() {
+    // Rate limits out of the way: this tests the pool, not the limiter.
+    let (store, db) = store_with(Limits {
+        uploads_per_device: limit(100_000),
+        uploads_per_account: limit(100_000),
+        ..Limits::default()
+    })
+    .await;
+    let flooder = trusted(&db).await;
+    let other = trusted(&db).await;
+    for session in [&flooder, &other] {
+        store.create_zone(session, "inbox").await.expect("zone");
+    }
+    // Far more concurrent uploads than the pool has connections.
+    let flood = db.pool().options().get_max_connections() as usize * 300;
+    let tasks: Vec<_> = (0..flood)
+        .map(|n| {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .upload(
+                        &flooder,
+                        "inbox",
+                        &batch(vec![save(&format!("f{n}"), None, b"x")]),
+                    )
+                    .await
+            })
+        })
+        .collect();
+    // Let the flood start, then the other account uploads.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let started = std::time::Instant::now();
+    store
+        .upload(&other, "inbox", &batch(vec![save("o", None, b"x")]))
+        .await
+        .expect("the other account is not starved");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    let (mut saved, mut limited) = (0, 0);
+    for task in tasks {
+        match task.await.expect("task") {
+            Ok(_) => saved += 1,
+            Err(StoreError::TooManyUploads { retry_after }) => {
+                assert!(retry_after >= Duration::from_secs(1));
+                limited += 1;
+            }
+            Err(other) => panic!("the flood must only be limited, got {other:?}"),
+        }
+    }
+    assert!(
+        saved >= 1 && limited >= 1,
+        "{saved} saved, {limited} limited"
+    );
+}

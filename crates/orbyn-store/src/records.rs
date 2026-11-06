@@ -1,5 +1,6 @@
 //! Uploading and fetching records.
 
+use crate::inflight;
 use crate::zones::find;
 use crate::{
     Change, ChangeToken, Changes, Conflict, Record, Result, Saved, Store, StoreError, Upload,
@@ -7,9 +8,11 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use orbyn_core::accounts::Session;
+use orbyn_core::accounts::limits::{self, Queued};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 use uuid::Uuid;
 
 /// How long an operation id is remembered.
@@ -106,6 +109,54 @@ fn digest(upload: &Upload) -> [u8; 32] {
 }
 
 impl Store {
+    /// Admits an upload, or refuses it with a wait. First, before any pool
+    /// connection is taken, the account's running uploads are capped in memory:
+    /// each waiter on a limit's lock holds a connection, so without the cap one
+    /// account's flood would use up the pool. Then the upload counts against its
+    /// device and then its account, narrowest first. A device's attempt is given
+    /// back when the account refuses, so a flooded account does not also spend
+    /// its devices' budgets. Only a trusted device is counted: a pending device
+    /// of the account must not use up what the real devices may upload.
+    async fn admit_upload(&self, session: &Session) -> Result<inflight::Slot> {
+        // Refused in memory before taking a slot, so a pending device of the
+        // account cannot hold the account's slots while its trust is checked.
+        // The database check below still decides for a session that says trusted.
+        if session.device_state != orbyn_core::accounts::DeviceState::Trusted {
+            return Err(StoreError::DeviceNotTrusted);
+        }
+        let slot = self
+            .in_flight
+            .enter(session.account_id, self.limits.max_uploads_in_flight)
+            .ok_or(StoreError::TooManyUploads {
+                retry_after: Duration::from_secs(1),
+            })?;
+        require_trusted(&self.pool, session, false).await?;
+        let device = (
+            "upload-device",
+            subject("device", session.device_id),
+            self.limits.uploads_per_device,
+        );
+        let account = (
+            "upload-account",
+            subject("account", session.account_id),
+            self.limits.uploads_per_account,
+        );
+        for (action, subject, limit) in [device, account] {
+            let answer = limits::allow_queued(&self.pool, action, &subject, limit).await?;
+            if answer != Queued::Allowed {
+                if action == account.0 {
+                    limits::give_back(&self.pool, device.0, &device.1).await?;
+                }
+                let retry_after = match answer {
+                    Queued::Busy => Duration::from_secs(1),
+                    _ => limits::retry_after(&self.pool, action, &subject, limit).await?,
+                };
+                return Err(StoreError::TooManyUploads { retry_after });
+            }
+        }
+        Ok(slot)
+    }
+
     fn check_upload(&self, upload: &Upload) -> Result<()> {
         let limits = &self.limits;
         if upload.changes.is_empty() || upload.changes.len() > limits.max_batch {
@@ -168,6 +219,8 @@ impl Store {
     ) -> Result<UploadResult> {
         check_zone_name(zone)?;
         self.check_upload(upload)?;
+        // Held to the end: counts this upload until its connections are given back.
+        let _slot = self.admit_upload(session).await?;
         let request_digest = digest(upload);
 
         let mut tx = self.pool.begin().await?;
@@ -489,6 +542,16 @@ fn record_bytes(record: &Record) -> i64 {
     let c = record.ciphertext.as_ref().map_or(0, Vec::len);
     let k = record.wrapped_key.as_ref().map_or(0, Vec::len);
     (c + k) as i64
+}
+
+/// The rate-limit subject for an id: a digest, so the table never holds the id itself.
+fn subject(kind: &str, id: Uuid) -> [u8; 32] {
+    Sha256::new()
+        .chain_update(b"orbyn/upload-limit/v1")
+        .chain_update(kind.as_bytes())
+        .chain_update(id.as_bytes())
+        .finalize()
+        .into()
 }
 
 #[cfg(test)]

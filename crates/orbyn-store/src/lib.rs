@@ -18,6 +18,7 @@
 //! Every operation checks in the database that the session's account owns the
 //! zone and that its device is trusted, not only the route.
 
+mod inflight;
 mod keychain;
 mod live;
 mod records;
@@ -29,8 +30,10 @@ pub use live::{Feed, Hub, Notice};
 pub use token::ChangeToken;
 
 use chrono::{DateTime, Utc};
-use orbyn_core::accounts::Session;
+use orbyn_core::accounts::{Limit, Session};
 use sqlx::PgPool;
+use std::sync::Arc;
+use std::time::Duration;
 use uuid::Uuid;
 
 /// The `pg_notify` channel for committed zone changes.
@@ -66,6 +69,18 @@ pub struct Limits {
     pub max_envelope: usize,
     /// Envelopes kept for one recipient device.
     pub max_envelopes_per_device: i64,
+    /// Uploads one device may make: a burst of `max`, refilling as attempts age
+    /// out of the window. Counted whether or not the upload succeeds.
+    pub uploads_per_device: Limit,
+    /// Uploads all of one account's devices may make together, so a flood
+    /// cannot be spread over devices.
+    pub uploads_per_account: Limit,
+    /// Uploads of one account running at once on a replica. More are refused
+    /// at once, before they take a pool connection, so one account cannot hold
+    /// the pool while others wait.
+    pub max_uploads_in_flight: usize,
+    /// `/v1/sync` sockets one account may have open on a replica.
+    pub max_sockets_per_account: usize,
 }
 
 impl Default for Limits {
@@ -84,6 +99,10 @@ impl Default for Limits {
             max_envelope_batch: 100,
             max_envelope: 1024,
             max_envelopes_per_device: 5000,
+            uploads_per_device: Limit::new(30, Duration::from_secs(60)),
+            uploads_per_account: Limit::new(60, Duration::from_secs(60)),
+            max_uploads_in_flight: 4,
+            max_sockets_per_account: 16,
         }
     }
 }
@@ -126,6 +145,11 @@ pub enum StoreError {
     TooManyEnvelopes,
     #[error("the account stores as many bytes as it may")]
     QuotaExceeded,
+    /// The device or account uploaded faster than its limit; try again after `retry_after`.
+    #[error("too many uploads; try again later")]
+    TooManyUploads { retry_after: Duration },
+    #[error("the account has too many open connections")]
+    TooManyConnections,
     #[error("the database failed")]
     Database(#[from] sqlx::Error),
     #[error("an internal step failed")]
@@ -252,6 +276,7 @@ pub struct Store {
     pool: PgPool,
     hub: Hub,
     limits: Limits,
+    in_flight: Arc<inflight::InFlight>,
 }
 
 impl Store {
@@ -260,6 +285,7 @@ impl Store {
             pool,
             hub,
             limits: Limits::default(),
+            in_flight: Arc::default(),
         }
     }
 
@@ -276,7 +302,9 @@ impl Store {
     /// device's changes. Trusted devices only.
     pub async fn feed(&self, session: &Session) -> Result<Feed> {
         require_trusted(&self.pool, session, false).await?;
-        Ok(self.hub.feed(session))
+        self.hub
+            .feed(session, self.limits.max_sockets_per_account)
+            .ok_or(StoreError::TooManyConnections)
     }
 }
 
