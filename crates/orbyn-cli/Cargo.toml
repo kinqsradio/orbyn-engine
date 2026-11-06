@@ -15,6 +15,7 @@ axum.workspace = true
 clap.workspace = true
 orbyn-core.workspace = true
 orbyn-server.workspace = true
+orbyn-store.workspace = true
 orbyn-worker.workspace = true
 tokio.workspace = true
 tracing.workspace = true
