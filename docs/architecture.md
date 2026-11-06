@@ -19,12 +19,13 @@ The plan lives in the [Orbyn platform plan](https://claude.ai/artifact/BBhxZSmXR
 | `orbyn-contracts` | Wire types; generates TypeScript into `bindings/` | Everywhere |
 | `orbyn-crypto` | Symmetric sealing, device keys, key wrapping, signatures, recovery keys | Devices (native and WebAssembly) |
 | `orbyn-sync` | Hybrid logical clocks and field-by-field merge | Devices |
+| `orbyn-planner` | Tasks, events, lists, repeat rules and their record fields | Devices |
 | `orbyn-core` | Configuration, Postgres, migrations, job queue | Server |
 | `orbyn-server` | HTTP API | Server |
 | `orbyn-worker` | Job runner | Server |
 | `orbyn-cli` | The `orbyn` binary with every role | Server |
 
-Later phases add `orbyn-planner` (planner rules), `orbyn-client` (the device engine with SQLite), `orbyn-keychain`, `orbyn-store` (the CloudKit-style record store) and `orbyn-keyservice` (HSM-held keys), as the plan describes.
+Later phases add `orbyn-client` (the device engine with SQLite), `orbyn-keychain`, `orbyn-store` (the CloudKit-style record store) and `orbyn-keyservice` (HSM-held keys), as the plan describes.
 
 ## Cryptography
 
@@ -56,3 +57,11 @@ Delivery is at least once: a crash or a lost lease runs a job again. Handlers mu
 `docker compose up -d` starts Postgres, runs `orbyn migrate`, then `orbyn serve` on `127.0.0.1:8080` and one `orbyn worker`. The image is distroless and runs as a non-root user; `orbyn health` is its health check. Logs are JSON in the image and never include request bodies.
 
 The compose Postgres trusts every connection without a password, and any container on the compose network can reach it. That is for local development only: no deployment may use `compose.yaml` or trust auth.
+
+## Repeat rules
+
+Daily, weekly (on chosen weekdays), monthly and yearly, every N periods, ending never, on a date or after a count. A monthly rule on a day a month lacks skips that month, and 29 February repeats only in leap years, as RFC 5545 does. "This one only" adds the date to the series' skipped dates. "This and following" ends the series the day before and starts a new one; a count is shared between the two so the total stays the same. One query returns at most 1000 occurrences.
+
+## Records
+
+A task or event is stored as fields (`kind`, `title`, `notes`, `list_id`, `due`, `priority`, `done_at`, `deleted_at`, `checklist`, `repeat`), each stamped for merging. A record with a missing or malformed field is refused, never guessed.

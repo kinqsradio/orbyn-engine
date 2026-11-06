@@ -1,0 +1,17 @@
+[package]
+name = "orbyn-planner"
+description = "Planner rules: tasks, events, lists and repeat rules. Runs on every device."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+jiff.workspace = true
+orbyn-sync.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
