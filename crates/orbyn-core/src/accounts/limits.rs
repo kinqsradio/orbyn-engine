@@ -69,17 +69,39 @@ pub async fn allow(
     admit(pool, action, subject, limit, false).await
 }
 
-/// Like [`allow`], but waits for the subject's lock instead of refusing. The
-/// lock is held only for a count and an insert, so the wait is short. For
-/// limits on honest traffic, where two requests of one subject at the same
-/// moment (a retry, two devices) must not count as a flood.
+/// How long [`allow_queued`] waits for a subject's lock before giving up.
+pub const LOCK_WAIT: Duration = Duration::from_secs(2);
+
+/// The answer of [`allow_queued`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Queued {
+    /// Within the limit; the attempt is recorded.
+    Allowed,
+    /// Over the limit; nothing is recorded.
+    Refused,
+    /// The subject's lock stayed taken for [`LOCK_WAIT`]; nothing is recorded.
+    Busy,
+}
+
+/// Like [`allow`], but waits up to [`LOCK_WAIT`] for the subject's lock instead
+/// of refusing at once. The lock is held only for a count and an insert, so the
+/// wait is short. For limits on honest traffic, where two requests of one
+/// subject at the same moment (a retry, two devices) must not count as a flood.
+/// Each waiter holds a pool connection while it waits, so callers must bound
+/// how many of one subject call this at once.
 pub async fn allow_queued(
     pool: &PgPool,
     action: &str,
     subject: &[u8; 32],
     limit: Limit,
-) -> Result<bool, sqlx::Error> {
-    admit(pool, action, subject, limit, true).await
+) -> Result<Queued, sqlx::Error> {
+    match admit(pool, action, subject, limit, true).await {
+        Ok(true) => Ok(Queued::Allowed),
+        Ok(false) => Ok(Queued::Refused),
+        // lock_not_available: the wait timed out.
+        Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("55P03") => Ok(Queued::Busy),
+        Err(err) => Err(err),
+    }
 }
 
 async fn admit(
@@ -91,6 +113,11 @@ async fn admit(
 ) -> Result<bool, sqlx::Error> {
     let mut tx = pool.begin().await?;
     if wait {
+        // Local to this transaction, like SET LOCAL.
+        sqlx::query("SELECT set_config('lock_timeout', $1, true)")
+            .bind(format!("{}ms", LOCK_WAIT.as_millis()))
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
             .bind(lock_key(action, subject))
             .execute(&mut *tx)
@@ -144,11 +171,7 @@ pub async fn retry_after(
 
 /// Gives back the newest attempt by `subject` at `action`, as when a sign-in
 /// that was counted succeeds.
-pub(crate) async fn give_back(
-    pool: &PgPool,
-    action: &str,
-    subject: &[u8; 32],
-) -> Result<(), sqlx::Error> {
+pub async fn give_back(pool: &PgPool, action: &str, subject: &[u8; 32]) -> Result<(), sqlx::Error> {
     sqlx::query(
         "DELETE FROM auth_attempts WHERE id = (
              SELECT id FROM auth_attempts WHERE action = $1 AND subject = $2
@@ -215,4 +238,84 @@ pub async fn prune(pool: &PgPool) -> Result<u64, sqlx::Error> {
         }
     }
     Ok(removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn pool() -> PgPool {
+        let url =
+            std::env::var("DATABASE_URL").expect("set DATABASE_URL to run the Postgres tests");
+        PgPool::connect(&url).await.expect("connect")
+    }
+
+    #[tokio::test]
+    #[ignore = "needs DATABASE_URL"]
+    async fn a_waiter_gives_up_when_the_lock_stays_taken() {
+        let pool = pool().await;
+        let subject = *uuid::Uuid::new_v4()
+            .as_bytes()
+            .repeat(2)
+            .first_chunk()
+            .expect("32");
+        let limit = Limit::new(5, Duration::from_secs(60));
+        let mut holder = pool.begin().await.expect("tx");
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(lock_key("test-busy", &subject))
+            .execute(&mut *holder)
+            .await
+            .expect("lock");
+        let started = std::time::Instant::now();
+        let answer = allow_queued(&pool, "test-busy", &subject, limit).await;
+        assert_eq!(answer.expect("answer"), Queued::Busy);
+        assert!(started.elapsed() < LOCK_WAIT * 3, "{:?}", started.elapsed());
+        // Without the holder it is allowed again.
+        holder.rollback().await.expect("release");
+        let answer = allow_queued(&pool, "test-busy", &subject, limit).await;
+        assert_eq!(answer.expect("answer"), Queued::Allowed);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs DATABASE_URL"]
+    async fn retry_after_tracks_the_oldest_attempt_in_the_window() {
+        let pool = pool().await;
+        let subject = *uuid::Uuid::new_v4()
+            .as_bytes()
+            .repeat(2)
+            .first_chunk()
+            .expect("32");
+        let limit = Limit::new(2, Duration::from_secs(60));
+        // Two attempts, the oldest 40 seconds ago: it ages out in about 20.
+        for age in [40, 10] {
+            sqlx::query(
+                "INSERT INTO auth_attempts (action, subject, at)
+                 VALUES ('test-retry', $1, now() - make_interval(secs => $2))",
+            )
+            .bind(subject.as_slice())
+            .bind(f64::from(age))
+            .execute(&pool)
+            .await
+            .expect("insert");
+        }
+        assert!(
+            !allow(&pool, "test-retry", &subject, limit)
+                .await
+                .expect("allow")
+        );
+        let wait = retry_after(&pool, "test-retry", &subject, limit)
+            .await
+            .expect("wait");
+        assert!((19..=21).contains(&wait.as_secs()), "{wait:?}");
+        // No attempts at all: at least a second, never the whole window.
+        let none = *uuid::Uuid::new_v4()
+            .as_bytes()
+            .repeat(2)
+            .first_chunk()
+            .expect("32");
+        let wait = retry_after(&pool, "test-retry", &none, limit)
+            .await
+            .expect("wait");
+        assert_eq!(wait, Duration::from_secs(1));
+    }
 }

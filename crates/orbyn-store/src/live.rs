@@ -241,3 +241,44 @@ impl Feed {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orbyn_core::accounts::DeviceState;
+
+    fn session(account: Uuid) -> Session {
+        Session {
+            id: Uuid::new_v4(),
+            account_id: account,
+            device_id: Uuid::new_v4(),
+            device_state: DeviceState::Trusted,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_accounts_queue_lives_exactly_as_long_as_its_feeds() {
+        // The listener cannot connect and keeps retrying; the queues don't need it.
+        let pool = PgPool::connect_lazy("postgres://orbyn@127.0.0.1:1/none").expect("pool");
+        let hub = Hub::start(pool);
+        let account = Uuid::new_v4();
+        let first = hub.feed(&session(account), 2).expect("first");
+        let second = hub.feed(&session(account), 2).expect("second");
+        assert!(hub.feed(&session(account), 2).is_none(), "capped at two");
+        let other = hub.feed(&session(Uuid::new_v4()), 2).expect("other");
+        assert_eq!(queues(&hub.inner.queues).len(), 2);
+        drop(first);
+        assert_eq!(queues(&hub.inner.queues).len(), 2, "one feed still open");
+        assert!(
+            hub.feed(&session(account), 2).is_some(),
+            "a place came back"
+        );
+        drop(second);
+        drop(other);
+        assert_eq!(
+            queues(&hub.inner.queues).len(),
+            0,
+            "queues of closed accounts are dropped"
+        );
+    }
+}

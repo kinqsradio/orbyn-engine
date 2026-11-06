@@ -1268,3 +1268,115 @@ async fn one_accounts_flood_does_not_push_another_account_into_resync() {
     let behind = tokio::time::timeout(wait, noisy_feed.next()).await;
     assert_eq!(behind, Ok(Some(Notice::Resync)));
 }
+
+/// How many attempts the upload limiter holds for a device.
+async fn device_attempts(db: &Database, device: Uuid) -> i64 {
+    use sha2::{Digest, Sha256};
+    let subject: [u8; 32] = Sha256::new()
+        .chain_update(b"orbyn/upload-limit/v1")
+        .chain_update(b"device")
+        .chain_update(device.as_bytes())
+        .finalize()
+        .into();
+    sqlx::query_scalar(
+        "SELECT count(*) FROM auth_attempts WHERE action = 'upload-device' AND subject = $1",
+    )
+    .bind(subject.as_slice())
+    .fetch_one(db.pool())
+    .await
+    .expect("count")
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_device_refused_by_its_account_keeps_its_own_budget() {
+    let (store, db) = store_with(Limits {
+        uploads_per_device: limit(5),
+        uploads_per_account: limit(1),
+        ..Limits::default()
+    })
+    .await;
+    let laptop = trusted(&db).await;
+    let phone = device(&db, laptop.account_id, "trusted").await;
+    store.create_zone(&laptop, "inbox").await.expect("zone");
+    store
+        .upload(&laptop, "inbox", &batch(vec![save("a", None, b"x")]))
+        .await
+        .expect("the account's only upload");
+    assert_eq!(device_attempts(&db, laptop.device_id).await, 1);
+    for n in 0..3 {
+        let refused = store
+            .upload(
+                &phone,
+                "inbox",
+                &batch(vec![save(&format!("p{n}"), None, b"x")]),
+            )
+            .await;
+        assert!(matches!(refused, Err(StoreError::TooManyUploads { .. })));
+    }
+    assert_eq!(
+        device_attempts(&db, phone.device_id).await,
+        0,
+        "refusals by the account cost the phone nothing"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs DATABASE_URL"]
+async fn a_flood_from_one_account_leaves_the_pool_to_others() {
+    // Rate limits out of the way: this tests the pool, not the limiter.
+    let (store, db) = store_with(Limits {
+        uploads_per_device: limit(100_000),
+        uploads_per_account: limit(100_000),
+        ..Limits::default()
+    })
+    .await;
+    let flooder = trusted(&db).await;
+    let other = trusted(&db).await;
+    for session in [&flooder, &other] {
+        store.create_zone(session, "inbox").await.expect("zone");
+    }
+    // Far more concurrent uploads than the pool has connections.
+    let flood = db.pool().options().get_max_connections() as usize * 300;
+    let tasks: Vec<_> = (0..flood)
+        .map(|n| {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .upload(
+                        &flooder,
+                        "inbox",
+                        &batch(vec![save(&format!("f{n}"), None, b"x")]),
+                    )
+                    .await
+            })
+        })
+        .collect();
+    // Let the flood start, then the other account uploads.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let started = std::time::Instant::now();
+    store
+        .upload(&other, "inbox", &batch(vec![save("o", None, b"x")]))
+        .await
+        .expect("the other account is not starved");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    let (mut saved, mut limited) = (0, 0);
+    for task in tasks {
+        match task.await.expect("task") {
+            Ok(_) => saved += 1,
+            Err(StoreError::TooManyUploads { retry_after }) => {
+                assert!(retry_after >= Duration::from_secs(1));
+                limited += 1;
+            }
+            Err(other) => panic!("the flood must only be limited, got {other:?}"),
+        }
+    }
+    assert!(
+        saved >= 1 && limited >= 1,
+        "{saved} saved, {limited} limited"
+    );
+}

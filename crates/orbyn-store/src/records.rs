@@ -1,15 +1,18 @@
 //! Uploading and fetching records.
 
+use crate::inflight;
 use crate::zones::find;
 use crate::{
     Change, ChangeToken, Changes, Conflict, Record, Result, Saved, Store, StoreError, Upload,
     UploadResult, announce, check_zone_name, require_trusted, valid_name,
 };
 use chrono::{DateTime, Utc};
-use orbyn_core::accounts::{Session, limits};
+use orbyn_core::accounts::Session;
+use orbyn_core::accounts::limits::{self, Queued};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 use uuid::Uuid;
 
 /// How long an operation id is remembered.
@@ -106,11 +109,21 @@ fn digest(upload: &Upload) -> [u8; 32] {
 }
 
 impl Store {
-    /// Counts this upload against its device and then its account, narrowest
-    /// first, so a device that is refused never uses up the account's share.
-    /// Only a trusted device is counted: a pending device of the account must
-    /// not be able to use up what the account's real devices may upload.
-    async fn admit_upload(&self, session: &Session) -> Result<()> {
+    /// Admits an upload, or refuses it with a wait. First, before any pool
+    /// connection is taken, the account's running uploads are capped in memory:
+    /// each waiter on a limit's lock holds a connection, so without the cap one
+    /// account's flood would use up the pool. Then the upload counts against its
+    /// device and then its account, narrowest first. A device's attempt is given
+    /// back when the account refuses, so a flooded account does not also spend
+    /// its devices' budgets. Only a trusted device is counted: a pending device
+    /// of the account must not use up what the real devices may upload.
+    async fn admit_upload(&self, session: &Session) -> Result<inflight::Slot> {
+        let slot = self
+            .in_flight
+            .enter(session.account_id, self.limits.max_uploads_in_flight)
+            .ok_or(StoreError::TooManyUploads {
+                retry_after: Duration::from_secs(1),
+            })?;
         require_trusted(&self.pool, session, false).await?;
         let device = (
             "upload-device",
@@ -123,12 +136,19 @@ impl Store {
             self.limits.uploads_per_account,
         );
         for (action, subject, limit) in [device, account] {
-            if !limits::allow_queued(&self.pool, action, &subject, limit).await? {
-                let retry_after = limits::retry_after(&self.pool, action, &subject, limit).await?;
+            let answer = limits::allow_queued(&self.pool, action, &subject, limit).await?;
+            if answer != Queued::Allowed {
+                if action == account.0 {
+                    limits::give_back(&self.pool, device.0, &device.1).await?;
+                }
+                let retry_after = match answer {
+                    Queued::Busy => Duration::from_secs(1),
+                    _ => limits::retry_after(&self.pool, action, &subject, limit).await?,
+                };
                 return Err(StoreError::TooManyUploads { retry_after });
             }
         }
-        Ok(())
+        Ok(slot)
     }
 
     fn check_upload(&self, upload: &Upload) -> Result<()> {
@@ -193,7 +213,8 @@ impl Store {
     ) -> Result<UploadResult> {
         check_zone_name(zone)?;
         self.check_upload(upload)?;
-        self.admit_upload(session).await?;
+        // Held to the end: counts this upload until its connections are given back.
+        let _slot = self.admit_upload(session).await?;
         let request_digest = digest(upload);
 
         let mut tx = self.pool.begin().await?;
