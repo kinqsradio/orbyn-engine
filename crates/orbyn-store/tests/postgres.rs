@@ -1007,3 +1007,46 @@ async fn key_envelopes_reach_only_trusted_devices_of_the_account() {
         .expect("remove");
     assert!(store.list_envelopes(&phone).await.expect("list").is_empty());
 }
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn sending_envelopes_never_deadlocks_with_removing_a_device() {
+    let (store, db) = store().await;
+    let laptop = trusted(&db).await;
+    let phone = device(&db, laptop.account_id, "trusted").await;
+    let hammer = {
+        let store = store.clone();
+        tokio::spawn(async move {
+            let mut errors = Vec::new();
+            for n in 0..200u8 {
+                let sent = store
+                    .put_envelopes(&laptop, &[envelope(&phone, "inbox", n % 5, b"x")])
+                    .await;
+                match sent {
+                    Ok(()) | Err(StoreError::DeviceNotTrusted) => {}
+                    Err(err) => errors.push(format!("{err:?}")),
+                }
+            }
+            errors
+        })
+    };
+    // The lock order removing a device uses: the account, then the device.
+    for n in 0..20 {
+        let target = if n % 2 == 0 { &laptop } else { &phone };
+        let mut tx = db.pool().begin().await.expect("begin");
+        sqlx::query("SELECT 1 FROM accounts WHERE id = $1 FOR UPDATE")
+            .bind(laptop.account_id)
+            .execute(&mut *tx)
+            .await
+            .expect("lock account");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        sqlx::query("UPDATE devices SET state = 'trusted' WHERE id = $1")
+            .bind(target.device_id)
+            .execute(&mut *tx)
+            .await
+            .expect("update device without deadlock");
+        tx.commit().await.expect("commit");
+    }
+    let errors = hammer.await.expect("join");
+    assert!(errors.is_empty(), "{errors:?}");
+}
