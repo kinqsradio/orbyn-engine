@@ -207,7 +207,7 @@ A cancel is a statement signed by a device (`orbyn/recovery-cancel/v1`: account,
   - identity and KEK rotations.
 - **A map, not only a list.** As in key-transparency systems, the log is two parts:
   - an append-only Merkle log of entries;
-  - a verifiable map from account digest to that account's own hash chain of entries.
+  - a verifiable map from map key (below) to that account's own hash chain of entries.
 
   Devices ask for their account's lookup proof. It proves the full chain for the account, or proves there is none, so "nothing for your account" can be checked, not just asserted.
 - **The map key.** It is `SHA-256(orbyn/log-account/v1 ‖ the account's certified service public key)`. The key service computes it from the service key it holds for the account id, so neither the record server nor anyone else chooses where an entry is filed. A device computes the same value from the service key it verified. The map does not list accounts by id, but anyone who holds an account's service public key can look it up, and that key is given only to the account's own sessions. A service-key rotation is itself logged under the old key and links to the new one.
