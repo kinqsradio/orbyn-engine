@@ -1,0 +1,149 @@
+//! `orbyn`: one binary for every server role, chosen by subcommand, so one Docker
+//! image runs them all.
+
+use clap::{Parser, Subcommand};
+use orbyn_core::{Config, Database};
+use std::process::ExitCode;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::watch;
+
+#[derive(Parser)]
+#[command(name = "orbyn", version, about = "orbyn-engine")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Serve the HTTP API.
+    Serve,
+    /// Run background jobs.
+    Worker,
+    /// Apply database migrations and exit.
+    Migrate,
+    /// Exit 0 if the API at ADDRESS answers /health, for container health checks.
+    Health {
+        #[arg(default_value = "127.0.0.1:8080")]
+        address: String,
+    },
+}
+
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_env("ORBYN_LOG")
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let json = std::env::var("ORBYN_LOG_FORMAT").is_ok_and(|v| v == "json");
+    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+    if json {
+        builder.json().init();
+    } else {
+        builder.init();
+    }
+}
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    let cli = Cli::parse();
+    if let Command::Health { address } = &cli.command {
+        return health(address).await;
+    }
+    init_tracing();
+    let config = match Config::from_env() {
+        Ok(config) => config,
+        Err(err) => {
+            tracing::error!(error = %err, "configuration");
+            return ExitCode::from(2);
+        }
+    };
+    let result = match cli.command {
+        Command::Serve => serve(config).await,
+        Command::Worker => worker(config).await,
+        Command::Migrate => migrate(config).await,
+        Command::Health { .. } => Ok(()),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(message) => {
+            tracing::error!(error = %message, "stopped");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn serve(config: Config) -> Result<(), String> {
+    let db = Database::connect_lazy(&config.database_url).map_err(|e| e.to_string())?;
+    let state = orbyn_server::AppState::new(Arc::new(db));
+    let app = orbyn_server::router(state, &config.allowed_origins);
+    let listener = tokio::net::TcpListener::bind(config.bind)
+        .await
+        .map_err(|e| e.to_string())?;
+    tracing::info!(address = %config.bind, "serving");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+async fn worker(config: Config) -> Result<(), String> {
+    let db = Database::connect(&config.database_url)
+        .await
+        .map_err(|e| e.to_string())?;
+    let (tx, rx) = watch::channel(false);
+    let id = format!("worker-{}", uuid::Uuid::new_v4());
+    let task = tokio::spawn(orbyn_worker::run(db, id, rx));
+    shutdown_signal().await;
+    let _ = tx.send(true);
+    task.await.map_err(|e| e.to_string())
+}
+
+async fn migrate(config: Config) -> Result<(), String> {
+    let db = Database::connect(&config.database_url)
+        .await
+        .map_err(|e| e.to_string())?;
+    db.migrate().await.map_err(|e| e.to_string())?;
+    tracing::info!("migrations applied");
+    Ok(())
+}
+
+/// A tiny HTTP/1.0 GET, so the distroless image needs no curl.
+async fn health(address: &str) -> ExitCode {
+    let attempt = async {
+        let mut stream = tokio::net::TcpStream::connect(address).await.ok()?;
+        stream
+            .write_all(format!("GET /health HTTP/1.0\r\nHost: {address}\r\n\r\n").as_bytes())
+            .await
+            .ok()?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.ok()?;
+        let text = String::from_utf8_lossy(&response);
+        Some(text.starts_with("HTTP/1.0 200") || text.starts_with("HTTP/1.1 200"))
+    };
+    match tokio::time::timeout(Duration::from_secs(3), attempt).await {
+        Ok(Some(true)) => ExitCode::SUCCESS,
+        _ => ExitCode::FAILURE,
+    }
+}
+
+/// Ctrl+C everywhere, and SIGTERM on Unix, which is how containers stop.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        () = ctrl_c => {},
+        () = terminate => {},
+    }
+}
