@@ -329,12 +329,22 @@ async fn list_zones(
     }))
 }
 
+/// The body is optional: a `DeleteZone` with the deleting device's proof.
 async fn delete_zone(
     State(state): State<AppState>,
     Authed(session): Authed,
     Path(zone): Path<String>,
+    body: axum::body::Bytes,
 ) -> Answer<Json<wire::ZoneDeleted>> {
-    let token = store(&state)?.delete_zone(&session, &zone).await?;
+    let body: wire::DeleteZone = if body.is_empty() {
+        wire::DeleteZone::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|_| Refusal::BadRequest)?
+    };
+    let proof = body.proof.as_deref().map(bytes).transpose()?;
+    let token = store(&state)?
+        .delete_zone(&session, &zone, proof.as_deref())
+        .await?;
     Ok(Json(wire::ZoneDeleted {
         token: token.encode(),
     }))

@@ -264,14 +264,17 @@ async fn tombstones_appear_in_changes_and_a_deleted_zone_comes_back_empty() {
         .await
         .expect("fetch")
         .token;
-    let token = store.delete_zone(&me, "list").await.expect("delete zone");
+    let token = store
+        .delete_zone(&me, "list", Some(&[2; 73]))
+        .await
+        .expect("delete zone");
     assert_eq!(
         token.seq(),
         before.seq() + 3,
         "two tombstones and the deletion"
     );
     assert_eq!(
-        store.delete_zone(&me, "list").await.expect("again"),
+        store.delete_zone(&me, "list", None).await.expect("again"),
         token,
         "deleting twice changes nothing"
     );
@@ -285,7 +288,7 @@ async fn tombstones_appear_in_changes_and_a_deleted_zone_comes_back_empty() {
         changes
             .records
             .iter()
-            .all(|r| r.deleted && r.ciphertext.is_none())
+            .all(|r| r.deleted && r.ciphertext.is_none() && r.delete_proof == Some(vec![2; 73]))
     );
     assert_eq!(changes.token, token);
     let err = store
@@ -451,7 +454,7 @@ async fn another_account_cannot_see_or_write_the_zone() {
         .expect_err("hidden");
     assert!(matches!(err, StoreError::ZoneNotFound));
     let err = store
-        .delete_zone(&them, "private")
+        .delete_zone(&them, "private", None)
         .await
         .expect_err("hidden");
     assert!(matches!(err, StoreError::ZoneNotFound));
@@ -511,7 +514,7 @@ async fn a_pending_or_removed_device_cannot_read_or_write() {
             .upload(&pending, "inbox", &batch(vec![save("a", None, b"x")]))
             .await
             .err(),
-        store.delete_zone(&pending, "inbox").await.err(),
+        store.delete_zone(&pending, "inbox", None).await.err(),
         store.feed(&pending).await.err(),
     ];
     for err in checks {
@@ -548,7 +551,7 @@ async fn limits_are_enforced() {
     assert!(matches!(err, StoreError::TooManyZones));
     // A deleted zone still counts until it is purged, so its slot is not free
     // for a new name, but it can be brought back.
-    store.delete_zone(&me, "two").await.expect("delete");
+    store.delete_zone(&me, "two", None).await.expect("delete");
     let err = store
         .create_zone(&me, "three")
         .await
@@ -807,7 +810,7 @@ async fn deleted_zones_and_tombstones_count_towards_the_limits() {
     for name in ["a", "b", "c"] {
         store.create_zone(&me, name).await.expect("zone");
     }
-    store.delete_zone(&me, "a").await.expect("delete");
+    store.delete_zone(&me, "a", None).await.expect("delete");
     // A deleted zone still counts, so a new name is refused...
     assert!(matches!(
         store.create_zone(&me, "d").await,
@@ -824,7 +827,7 @@ async fn deleted_zones_and_tombstones_count_towards_the_limits() {
         )
         .await
         .expect("two");
-    let token = store.delete_zone(&me, "b").await.expect("delete b");
+    let token = store.delete_zone(&me, "b", None).await.expect("delete b");
     let _ = token;
     store.create_zone(&me, "b").await.expect("recreate b");
     // The two tombstones still count, so a third record is refused.
@@ -865,7 +868,7 @@ async fn an_account_cannot_store_more_bytes_than_its_quota() {
     // Deleting frees the space again.
     let (zones, _) = store.list_zones(&me, None).await.expect("list");
     assert_eq!(zones.len(), 2);
-    store.delete_zone(&me, "a").await.expect("delete");
+    store.delete_zone(&me, "a", None).await.expect("delete");
     store.create_zone(&me, "a").await.expect("recreate");
     store
         .upload(&me, "a", &batch(vec![save("3", None, &[1; 900])]))
