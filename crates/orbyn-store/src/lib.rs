@@ -28,6 +28,8 @@ mod zones;
 
 pub use keychain::{Envelope, KEY_ID_LEN, NewEnvelope, Rotation};
 pub use live::{Feed, Hub, Notice};
+#[cfg(feature = "test-support")]
+pub use purge::purge_accounts;
 pub use purge::{Purged, purge};
 pub use token::ChangeToken;
 

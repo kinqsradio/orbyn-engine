@@ -48,9 +48,33 @@ pub async fn purge(
     batch: i64,
     max_steps: usize,
 ) -> Result<Purged> {
+    run(pool, None, retention, batch, max_steps).await
+}
+
+/// The same purge, limited to the zones of `owners`: every selection carries the filter. Only
+/// for tests that share a database, so one test's purge cannot take another's rows; the
+/// `test-support` feature keeps it out of any build the server uses.
+#[cfg(feature = "test-support")]
+pub async fn purge_accounts(
+    pool: &PgPool,
+    owners: &[Uuid],
+    retention: Duration,
+    batch: i64,
+    max_steps: usize,
+) -> Result<Purged> {
+    run(pool, Some(owners), retention, batch, max_steps).await
+}
+
+async fn run(
+    pool: &PgPool,
+    owners: Option<&[Uuid]>,
+    retention: Duration,
+    batch: i64,
+    max_steps: usize,
+) -> Result<Purged> {
     let mut total = Purged::default();
     for _ in 0..max_steps {
-        let step = purge_step(pool, retention, batch.max(1)).await?;
+        let step = purge_step(pool, owners, retention, batch.max(1)).await?;
         if step.is_empty() {
             break;
         }
@@ -61,7 +85,12 @@ pub async fn purge(
 }
 
 /// One bounded step: part of one deleted zone, then part of one live zone.
-async fn purge_step(pool: &PgPool, retention: Duration, batch: i64) -> Result<Purged> {
+async fn purge_step(
+    pool: &PgPool,
+    owners: Option<&[Uuid]>,
+    retention: Duration,
+    batch: i64,
+) -> Result<Purged> {
     let secs = retention.as_secs_f64();
     let mut done = Purged::default();
 
@@ -73,9 +102,11 @@ async fn purge_step(pool: &PgPool, retention: Duration, batch: i64) -> Result<Pu
         "SELECT id, seq FROM zones
          WHERE deleted_at IS NOT NULL
            AND (purging OR deleted_at < now() - make_interval(secs => $1))
+           AND ($2::uuid[] IS NULL OR owner_id = ANY($2))
          ORDER BY purging DESC, deleted_at LIMIT 1 FOR UPDATE SKIP LOCKED",
     )
     .bind(secs)
+    .bind(owners)
     .fetch_optional(&mut *tx)
     .await?;
     if let Some((zone, seq)) = zone {
@@ -126,10 +157,12 @@ async fn purge_step(pool: &PgPool, retention: Duration, batch: i64) -> Result<Pu
             "SELECT r.zone_id FROM records r JOIN zones z ON z.id = r.zone_id
              WHERE r.deleted AND r.modified_at < now() - make_interval(secs => $1)
                AND z.deleted_at IS NULL AND r.zone_id <> ALL($2)
+               AND ($3::uuid[] IS NULL OR z.owner_id = ANY($3))
              ORDER BY r.modified_at LIMIT 1",
         )
         .bind(secs)
         .bind(&busy)
+        .bind(owners)
         .fetch_optional(&mut *tx)
         .await?;
         let Some(zone) = oldest else {
@@ -137,9 +170,12 @@ async fn purge_step(pool: &PgPool, retention: Duration, batch: i64) -> Result<Pu
         };
         // The zone lock every write takes.
         let locked: Option<Uuid> = sqlx::query_scalar(
-            "SELECT id FROM zones WHERE id = $1 AND deleted_at IS NULL FOR UPDATE SKIP LOCKED",
+            "SELECT id FROM zones
+             WHERE id = $1 AND deleted_at IS NULL AND ($2::uuid[] IS NULL OR owner_id = ANY($2))
+             FOR UPDATE SKIP LOCKED",
         )
         .bind(zone)
+        .bind(owners)
         .fetch_optional(&mut *tx)
         .await?;
         if locked.is_none() {
