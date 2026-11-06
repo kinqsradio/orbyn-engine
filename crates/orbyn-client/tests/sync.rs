@@ -1930,3 +1930,107 @@ fn a_record_reports_its_stored_type_and_a_deleted_one_has_none() -> R {
     assert_eq!(a.engine.record_type(ZONE, "note-1"), None);
     Ok(())
 }
+
+#[test]
+fn the_restart_count_starts_over_when_a_refetch_finishes() -> R {
+    let mut store = FakeStore::new(10);
+    let (mut a, mut b, _) = pair(&mut store);
+    a.edit("r1", "title", json!("r1"));
+    settle(&mut a, &mut b, &mut store);
+
+    // A refetch that restarts twice, then finishes.
+    b.engine.token_expired(ZONE)?;
+    b.engine.token_expired(ZONE)?;
+    b.engine.token_expired(ZONE)?;
+    let (_, expiries) = fetch_all_restarting(&mut b, &store).expect("finishes");
+    assert_eq!(expiries, 0);
+
+    // The next refetch gets its full three restarts; the fourth expiry is the error.
+    b.engine.token_expired(ZONE)?;
+    for restart in 1..=3 {
+        assert_eq!(b.engine.token_expired(ZONE), Ok(()), "restart {restart}");
+    }
+    assert_eq!(b.engine.token_expired(ZONE), Err(ClientError::ExpiredAgain));
+    Ok(())
+}
+
+#[test]
+fn what_a_restarted_refetch_has_to_check_is_the_original_set_and_not_only_what_it_saw() -> R {
+    let mut store = FakeStore::new(1);
+    let (mut a, mut b, _) = pair(&mut store);
+    for id in ["r1", "r2", "r3"] {
+        a.edit(id, "title", json!(id));
+    }
+    settle(&mut a, &mut b, &mut store);
+
+    // B's refetch starts and sees the first record, so that one is checked off.
+    b.engine.token_expired(ZONE)?;
+    let page = store.try_changes(ZONE, None).expect("start");
+    assert!(page.more);
+    let seen = page.records[0].record_id.clone();
+    b.engine.apply_changes_from(ZONE, None, &page, b.now)?;
+
+    // That record is deleted on the server and the tombstone purged before the
+    // refetch can finish. The restart must check it again, not trust that it
+    // was seen in the abandoned run.
+    a.engine.delete(ZONE, &seen)?;
+    a.sync(&mut store);
+    store.purge_tombstones(ZONE);
+    b.engine.token_expired(ZONE)?;
+    let (applied, _) = fetch_all_restarting(&mut b, &store).expect("converges");
+    assert_eq!(applied.trashed, vec![seen.clone()]);
+    assert!(b.engine.record(ZONE, &seen).is_none());
+    Ok(())
+}
+
+#[test]
+fn a_record_the_server_refused_during_a_refetch_is_still_checked_after_a_restart() -> R {
+    let mut store = FakeStore::new(10);
+    let (mut a, mut b, _) = pair(&mut store);
+    for id in ["r1", "r2"] {
+        a.edit(id, "title", json!(id));
+    }
+    settle(&mut a, &mut b, &mut store);
+    // r2 is gone from the server for good.
+    a.engine.delete(ZONE, "r2")?;
+    a.sync(&mut store);
+    store.purge_tombstones(ZONE);
+
+    // B edits r2, the refetch starts, and an upload in between is answered
+    // "no such record": r2 now has no server version.
+    b.edit("r2", "title", json!("edited"));
+    b.engine.token_expired(ZONE)?;
+    let upload = b.engine.build_upload(ZONE)?.expect("r2 is pending");
+    let conflict = wire::RecordChanged {
+        code: "record_changed".into(),
+        message: String::new(),
+        conflicts: upload
+            .changes
+            .iter()
+            .map(|change| wire::RecordConflict {
+                record_id: match change {
+                    wire::RecordChange::Save { record_id, .. }
+                    | wire::RecordChange::Delete { record_id, .. } => record_id.clone(),
+                },
+                server_record: None,
+            })
+            .collect(),
+    };
+    b.engine.upload_conflicted(ZONE, &conflict, b.now)?;
+    assert_eq!(
+        b.engine
+            .records(ZONE)
+            .find(|(id, _)| *id == "r2")
+            .map(|(_, l)| l.version),
+        Some(None)
+    );
+
+    // The refetch restarts; r2 was in the original set, though it no longer
+    // has a version, so it is still settled at the end: edits to the trash.
+    b.engine.token_expired(ZONE)?;
+    let (applied, _) = fetch_all_restarting(&mut b, &store).expect("converges");
+    assert_eq!(applied.trashed, vec!["r2".to_owned()]);
+    assert!(b.engine.record(ZONE, "r2").is_none());
+    assert!(!b.engine.has_pending(ZONE));
+    Ok(())
+}

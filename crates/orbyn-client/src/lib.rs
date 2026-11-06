@@ -939,8 +939,9 @@ impl Engine {
         let mut unseen = z.refetch.take().unwrap_or_default();
         unseen.extend(held);
         z.refetch = Some(unseen);
+        // A refetch that ends, or is given up with ExpiredAgain, resets the
+        // count, so a refetch that starts here always starts at zero.
         if !again {
-            z.refetch_restarts = 0;
             return Ok(());
         }
         if z.refetch_restarts >= MAX_REFETCH_RESTARTS {

@@ -1961,15 +1961,32 @@ async fn a_zone_being_purged_is_finished_even_if_the_window_grows() {
     let turn = PURGING.lock().await;
     // Older than any other test's zone, so the first step takes this one.
     age_zone(&db, &me, "list", 800).await;
-    // One step under the 30-day window starts the purge.
-    orbyn_store::purge(db.pool(), MONTH, 2, 1)
-        .await
-        .expect("first step");
+    // Steps under the 30-day window until this zone's purge has started. The
+    // purge is global and takes the oldest expired zone first, so a leftover
+    // zone from another test can come before this one; no test purges while
+    // this one holds the turn, so the loop ends once those are done.
+    let mut started = false;
+    for _ in 0..100 {
+        orbyn_store::purge(db.pool(), MONTH, 2, 1)
+            .await
+            .expect("step");
+        started =
+            sqlx::query_scalar("SELECT purging FROM zones WHERE owner_id = $1 AND name = 'list'")
+                .bind(me.account_id)
+                .fetch_optional(db.pool())
+                .await
+                .expect("purging")
+                .unwrap_or(false);
+        if started {
+            break;
+        }
+    }
+    assert!(started, "this zone's purge started");
     // The operator then raises the window far past the zone's age. A zone that
     // cannot be restored must still be finished, not left in `purging`.
     let decade = Duration::from_secs(3650 * 24 * 60 * 60);
     let mut finished = false;
-    for _ in 0..10 {
+    for _ in 0..100 {
         orbyn_store::purge(db.pool(), decade, 2, 1)
             .await
             .expect("step");
