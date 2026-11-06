@@ -89,7 +89,15 @@ async fn serve(config: Config) -> Result<(), String> {
                 .map_err(|e| e.to_string())?;
             state = state.with_accounts(orbyn_core::Accounts::new(db.pool().clone(), secrets));
             let hub = orbyn_store::Hub::start(db.pool().clone());
-            state = state.with_store(orbyn_store::Store::new(db.pool().clone(), hub));
+            let mut store = orbyn_store::Store::new(db.pool().clone(), hub);
+            if let Some(cap) = config.max_uploads_in_flight {
+                let limits = orbyn_store::Limits {
+                    max_uploads_in_flight_global: cap,
+                    ..*store.limits()
+                };
+                store = store.with_limits(limits);
+            }
+            state = state.with_store(store);
             state = state.with_feeds(
                 orbyn_core::feeds::Feeds::new(db.pool().clone()).map_err(|e| e.to_string())?,
             );

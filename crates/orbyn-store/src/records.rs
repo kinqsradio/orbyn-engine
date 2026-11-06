@@ -117,16 +117,25 @@ impl Store {
     /// back when the account refuses, so a flooded account does not also spend
     /// its devices' budgets. Only a trusted device is counted: a pending device
     /// of the account must not use up what the real devices may upload.
-    async fn admit_upload(&self, session: &Session) -> Result<inflight::Slot> {
+    async fn admit_upload(
+        &self,
+        session: &Session,
+        address: Option<[u8; 16]>,
+    ) -> Result<inflight::Slot> {
         // Refused in memory before taking a slot, so a pending device of the
         // account cannot hold the account's slots while its trust is checked.
         // The database check below still decides for a session that says trusted.
         if session.device_state != orbyn_core::accounts::DeviceState::Trusted {
             return Err(StoreError::DeviceNotTrusted);
         }
+        let caps = inflight::Caps {
+            account: self.limits.max_uploads_in_flight,
+            address: self.limits.max_uploads_in_flight_per_address,
+            global: self.limits.max_uploads_in_flight_global,
+        };
         let slot = self
             .in_flight
-            .enter(session.account_id, self.limits.max_uploads_in_flight)
+            .enter(session.account_id, address, caps)
             .ok_or(StoreError::TooManyUploads {
                 retry_after: Duration::from_secs(1),
             })?;
@@ -217,10 +226,23 @@ impl Store {
         zone: &str,
         upload: &Upload,
     ) -> Result<UploadResult> {
+        self.upload_from(session, None, zone, upload).await
+    }
+
+    /// Like [`Store::upload`], for a request that came from `address`: the key
+    /// of the client's address (an IPv4 address, or the /64 of an IPv6 one) that
+    /// the in-flight cap per address counts. `None` when it is not known.
+    pub async fn upload_from(
+        &self,
+        session: &Session,
+        address: Option<[u8; 16]>,
+        zone: &str,
+        upload: &Upload,
+    ) -> Result<UploadResult> {
         check_zone_name(zone)?;
         self.check_upload(upload)?;
         // Held to the end: counts this upload until its connections are given back.
-        let _slot = self.admit_upload(session).await?;
+        let _slot = self.admit_upload(session, address).await?;
         let request_digest = digest(upload);
 
         let mut tx = self.pool.begin().await?;
