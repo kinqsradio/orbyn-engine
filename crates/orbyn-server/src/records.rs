@@ -460,9 +460,10 @@ async fn sync(
             .into_response();
     };
     let (accounts, store) = (accounts.clone(), store.clone());
+    let keepalive = state.sync_keepalive;
     upgrade
         .max_message_size(16 * 1024)
-        .on_upgrade(move |socket| run_sync(socket, accounts, store, (waiting, address)))
+        .on_upgrade(move |socket| run_sync(socket, accounts, store, (waiting, address), keepalive))
 }
 
 /// Sends one message, giving up after [`SEND_WAIT`] so a peer that stops
@@ -475,6 +476,16 @@ async fn send(socket: &mut WebSocket, message: &wire::SyncServerMessage) -> bool
         tokio::time::timeout(SEND_WAIT, socket.send(Message::Text(text.into()))).await,
         Ok(Ok(()))
     )
+}
+
+/// Closes a silent socket with 1000 (normal), so its client reconnects and resyncs.
+async fn close_idle(mut socket: WebSocket) {
+    let _ = socket
+        .send(Message::Close(Some(CloseFrame {
+            code: 1000,
+            reason: "idle".into(),
+        })))
+        .await;
 }
 
 /// Sends an error and closes with 1008 (policy violation).
@@ -500,6 +511,7 @@ async fn run_sync(
     accounts: Accounts,
     store: Store,
     waiting: (tokio::sync::SemaphorePermit<'static>, AddressSlot),
+    keepalive: Duration,
 ) {
     let token = match tokio::time::timeout(AUTH_WAIT, socket.recv()).await {
         Ok(Some(Ok(Message::Text(text)))) => {
@@ -548,6 +560,13 @@ async fn run_sync(
         return;
     }
     let mut recheck = tokio::time::interval_at(tokio::time::Instant::now() + RECHECK, RECHECK);
+    // Keep-alive: a tunnel or proxy drops a connection that carries nothing for a while, and
+    // this server otherwise sends nothing until a change arrives. Ping every `keepalive`; a
+    // peer that has sent no frame at all (a pong or anything else) for two intervals is gone
+    // or cut off, and is closed normally so its client reconnects and resyncs. Every way out
+    // of this function drops the feed (the account's socket count) and the permits.
+    let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + keepalive, keepalive);
+    let mut last_heard = tokio::time::Instant::now();
     loop {
         tokio::select! {
             notice = feed.next() => {
@@ -565,7 +584,17 @@ async fn run_sync(
             incoming = socket.recv() => match incoming {
                 None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
                 // Pings are answered by the WebSocket layer; other messages are ignored.
-                Some(Ok(_)) => {}
+                // Any frame shows the peer is there.
+                Some(Ok(_)) => last_heard = tokio::time::Instant::now(),
+            },
+            _ = ping.tick() => {
+                if last_heard.elapsed() >= keepalive * 2 {
+                    return close_idle(socket).await;
+                }
+                let sent = tokio::time::timeout(SEND_WAIT, socket.send(Message::Ping(Default::default()))).await;
+                if !matches!(sent, Ok(Ok(()))) {
+                    break;
+                }
             },
             _ = recheck.tick() => match accounts.check_session(&token).await {
                 Ok(now) if now.device_id == session.device_id

@@ -17,6 +17,7 @@ use orbyn_store::Store;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
@@ -41,7 +42,12 @@ pub struct AppState {
     store: Option<Store>,
     feeds: Option<orbyn_core::feeds::Feeds>,
     client_ip_header: Option<HeaderName>,
+    sync_keepalive: Duration,
 }
+
+/// How often `/v1/sync` pings an idle socket, unless told otherwise. Tunnels and proxies drop
+/// connections that carry nothing for a minute or so; this is well inside that.
+pub const DEFAULT_SYNC_KEEPALIVE: Duration = Duration::from_secs(30);
 
 impl AppState {
     /// A state without accounts: the `/v1` account routes answer 503.
@@ -52,6 +58,7 @@ impl AppState {
             store: None,
             feeds: None,
             client_ip_header: None,
+            sync_keepalive: DEFAULT_SYNC_KEEPALIVE,
         }
     }
 
@@ -77,6 +84,13 @@ impl AppState {
     /// through that proxy.
     pub fn with_client_ip_header(mut self, header: HeaderName) -> Self {
         self.client_ip_header = Some(header);
+        self
+    }
+
+    /// The interval between WebSocket pings on `/v1/sync` (default 30 seconds). A socket that
+    /// sends nothing at all for two intervals is closed. Short values are for tests.
+    pub fn with_sync_keepalive(mut self, interval: Duration) -> Self {
+        self.sync_keepalive = interval;
         self
     }
 }

@@ -45,6 +45,11 @@ struct Server {
 }
 
 async fn server() -> Server {
+    server_with(None).await
+}
+
+/// A replica whose `/v1/sync` pings every `keepalive`, when given.
+async fn server_with(keepalive: Option<Duration>) -> Server {
     let url = std::env::var("DATABASE_URL").expect("set DATABASE_URL to run the Postgres tests");
     let db = Database::connect(&url).await.expect("connect to Postgres");
     db.migrate().await.expect("migrate");
@@ -53,9 +58,12 @@ async fn server() -> Server {
     let accounts = Accounts::new(db.pool().clone(), secrets);
     let hub = Hub::start(db.pool().clone());
     let store = Store::new(db.pool().clone(), hub.clone());
-    let state = AppState::new(Arc::new(Up))
+    let mut state = AppState::new(Arc::new(Up))
         .with_accounts(accounts)
         .with_store(store);
+    if let Some(interval) = keepalive {
+        state = state.with_sync_keepalive(interval);
+    }
     let b = Uuid::new_v4().into_bytes();
     Server {
         app: router(state, &[]),
@@ -647,4 +655,103 @@ async fn a_token_from_before_a_purge_is_answered_token_expired() {
         .call(Method::GET, "/v1/zones/inbox/changes", Some(token), None)
         .await;
     assert_eq!(status, StatusCode::OK);
+}
+
+/// Reads frames for `span`, counting the pings; the socket answers them as it is polled.
+/// Returns the pings seen and how the socket ended, if it did.
+async fn watch(socket: &mut Socket, span: Duration) -> (usize, Option<Message>) {
+    let mut pings = 0;
+    let end = tokio::time::Instant::now() + span;
+    while let Ok(next) = tokio::time::timeout_at(end, socket.next()).await {
+        match next {
+            Some(Ok(Message::Ping(_))) => pings += 1,
+            Some(Ok(Message::Close(frame))) => return (pings, Some(Message::Close(frame))),
+            Some(Ok(_)) => {}
+            Some(Err(_)) | None => return (pings, None),
+        }
+    }
+    (pings, None)
+}
+
+const INTERVAL: Duration = Duration::from_millis(150);
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn an_answering_client_gets_pings_and_stays_connected() {
+    let a = server_with(Some(INTERVAL)).await;
+    a.hub.listening().await;
+    let (email, laptop) = a.sign_up().await;
+    let (phone, phone_id) = a.sign_in_new_device(&email).await;
+    a.trust(phone_id).await;
+
+    let mut socket = connect(&a).await;
+    auth(&mut socket, &phone).await;
+    assert_eq!(next_json(&mut socket).await["type"], "ready");
+    // Six intervals, answering every ping as it is read: well past the two a silent
+    // client gets.
+    let (pings, ended) = watch(&mut socket, INTERVAL * 6).await;
+    assert!(pings >= 4, "{pings} pings in six intervals");
+    assert!(ended.is_none(), "still open: {ended:?}");
+
+    // And it still hears a change from the laptop.
+    let (status, _) = a
+        .call(Method::PUT, "/v1/zones/inbox", Some(&laptop), None)
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(next_json(&mut socket).await["type"], "zone_changed");
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_silent_client_is_closed_normally_after_two_intervals() {
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+    let a = server_with(Some(INTERVAL)).await;
+    let (_, token) = a.sign_up().await;
+    let mut socket = connect(&a).await;
+    auth(&mut socket, &token).await;
+    assert_eq!(next_json(&mut socket).await["type"], "ready");
+
+    // Say nothing and read nothing (so nothing answers the pings) for five intervals.
+    tokio::time::sleep(INTERVAL * 5).await;
+    let started = std::time::Instant::now();
+    let (pings, ended) = watch(&mut socket, Duration::from_secs(2)).await;
+    assert!(
+        pings <= 2,
+        "the server stopped pinging once it gave up: {pings}"
+    );
+    match ended {
+        Some(Message::Close(Some(frame))) => assert_eq!(frame.code, CloseCode::Normal),
+        other => panic!("expected a normal close, got {other:?}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "already closed when read"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_socket_closed_for_silence_gives_its_place_back() {
+    let a = server_with(Some(INTERVAL)).await;
+    let (_, token) = a.sign_up().await;
+    // Fill the account's 16 places with clients that then go silent.
+    let mut silent = Vec::new();
+    for _ in 0..16 {
+        let mut socket = connect(&a).await;
+        auth(&mut socket, &token).await;
+        assert_eq!(next_json(&mut socket).await["type"], "ready");
+        silent.push(socket);
+    }
+    let mut refused = connect(&a).await;
+    auth(&mut refused, &token).await;
+    assert_eq!(
+        next_json(&mut refused).await["code"],
+        "too_many_connections"
+    );
+
+    // After the silence is noticed, the places are free again.
+    tokio::time::sleep(INTERVAL * 5).await;
+    let mut again = connect(&a).await;
+    auth(&mut again, &token).await;
+    assert_eq!(next_json(&mut again).await["type"], "ready");
 }
