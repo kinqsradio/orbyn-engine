@@ -92,6 +92,17 @@ impl Server {
         token: Option<&str>,
         body: Option<Value>,
     ) -> (StatusCode, Value) {
+        let (status, _, json) = self.call_with_headers(method, path, token, body).await;
+        (status, json)
+    }
+
+    async fn call_with_headers(
+        &self,
+        method: Method,
+        path: &str,
+        token: Option<&str>,
+        body: Option<Value>,
+    ) -> (StatusCode, axum::http::HeaderMap, Value) {
         let mut request = Request::builder().method(method).uri(path);
         if let Some(token) = token {
             request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
@@ -109,6 +120,7 @@ impl Server {
             .insert(ConnectInfo(SocketAddr::new(self.ip, 40_000)));
         let response = self.app.clone().oneshot(request).await.expect("response");
         let status = response.status();
+        let headers = response.headers().clone();
         let bytes = to_bytes(response.into_body(), 16 << 20)
             .await
             .expect("body");
@@ -117,7 +129,7 @@ impl Server {
         } else {
             serde_json::from_slice(&bytes).expect("json")
         };
-        (status, json)
+        (status, headers, json)
     }
 
     /// Signs up a new account with a trusted first device. Returns its token.
@@ -479,4 +491,83 @@ async fn another_device_hears_an_upload_on_another_replica() {
     assert_eq!(status, StatusCode::OK);
     let quiet = tokio::time::timeout(Duration::from_millis(500), socket.next()).await;
     assert!(quiet.is_err(), "no echo: {quiet:?}");
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_flood_of_uploads_is_answered_with_a_wait_and_spares_other_accounts() {
+    let server = server().await;
+    let (_, token) = server.sign_up().await;
+    let (_, other) = server.sign_up().await;
+    for token in [&token, &other] {
+        let (status, _) = server
+            .call(Method::PUT, "/v1/zones/inbox", Some(token), None)
+            .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+    async fn post(
+        server: &Server,
+        token: &str,
+        n: usize,
+    ) -> (StatusCode, axum::http::HeaderMap, Value) {
+        server
+            .call_with_headers(
+                Method::POST,
+                "/v1/zones/inbox/changes",
+                Some(token),
+                Some(upload(vec![save(&format!("r{n}"), Value::Null, b"x")])),
+            )
+            .await
+    }
+    // The default allows a burst of 30 per device.
+    for n in 0..30 {
+        let (status, _, body) = post(&server, &token, n).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let (status, headers, body) = post(&server, &token, 30).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["code"], "too_many_uploads");
+    let wait: u64 = headers
+        .get(header::RETRY_AFTER)
+        .expect("Retry-After")
+        .to_str()
+        .expect("text")
+        .parse()
+        .expect("seconds");
+    assert!((1..=60).contains(&wait), "{wait}");
+
+    // Reads are not uploads, and another account still uploads.
+    let (status, _) = server
+        .call(Method::GET, "/v1/zones", Some(&token), None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, body) = post(&server, &other, 0).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn an_account_over_its_socket_cap_is_refused_with_a_code() {
+    let server = server().await;
+    server.hub.listening().await;
+    let (_, token) = server.sign_up().await;
+    let (_, other) = server.sign_up().await;
+    // The default allows 16 open sockets per account.
+    let mut open = Vec::new();
+    for _ in 0..16 {
+        let mut socket = connect(&server).await;
+        auth(&mut socket, &token).await;
+        assert_eq!(next_json(&mut socket).await["type"], "ready");
+        open.push(socket);
+    }
+    let mut socket = connect(&server).await;
+    auth(&mut socket, &token).await;
+    let refused = next_json(&mut socket).await;
+    assert_eq!(refused["type"], "error");
+    assert_eq!(refused["code"], "too_many_connections");
+
+    // Another account is not affected.
+    let mut socket = connect(&server).await;
+    auth(&mut socket, &other).await;
+    assert_eq!(next_json(&mut socket).await["type"], "ready");
 }

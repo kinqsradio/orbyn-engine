@@ -6,7 +6,7 @@ use crate::{
     UploadResult, announce, check_zone_name, require_trusted, valid_name,
 };
 use chrono::{DateTime, Utc};
-use orbyn_core::accounts::Session;
+use orbyn_core::accounts::{Session, limits};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -106,6 +106,31 @@ fn digest(upload: &Upload) -> [u8; 32] {
 }
 
 impl Store {
+    /// Counts this upload against its device and then its account, narrowest
+    /// first, so a device that is refused never uses up the account's share.
+    /// Only a trusted device is counted: a pending device of the account must
+    /// not be able to use up what the account's real devices may upload.
+    async fn admit_upload(&self, session: &Session) -> Result<()> {
+        require_trusted(&self.pool, session, false).await?;
+        let device = (
+            "upload-device",
+            subject("device", session.device_id),
+            self.limits.uploads_per_device,
+        );
+        let account = (
+            "upload-account",
+            subject("account", session.account_id),
+            self.limits.uploads_per_account,
+        );
+        for (action, subject, limit) in [device, account] {
+            if !limits::allow_queued(&self.pool, action, &subject, limit).await? {
+                let retry_after = limits::retry_after(&self.pool, action, &subject, limit).await?;
+                return Err(StoreError::TooManyUploads { retry_after });
+            }
+        }
+        Ok(())
+    }
+
     fn check_upload(&self, upload: &Upload) -> Result<()> {
         let limits = &self.limits;
         if upload.changes.is_empty() || upload.changes.len() > limits.max_batch {
@@ -168,6 +193,7 @@ impl Store {
     ) -> Result<UploadResult> {
         check_zone_name(zone)?;
         self.check_upload(upload)?;
+        self.admit_upload(session).await?;
         let request_digest = digest(upload);
 
         let mut tx = self.pool.begin().await?;
@@ -489,6 +515,16 @@ fn record_bytes(record: &Record) -> i64 {
     let c = record.ciphertext.as_ref().map_or(0, Vec::len);
     let k = record.wrapped_key.as_ref().map_or(0, Vec::len);
     (c + k) as i64
+}
+
+/// The rate-limit subject for an id: a digest, so the table never holds the id itself.
+fn subject(kind: &str, id: Uuid) -> [u8; 32] {
+    Sha256::new()
+        .chain_update(b"orbyn/upload-limit/v1")
+        .chain_update(kind.as_bytes())
+        .chain_update(id.as_bytes())
+        .finalize()
+        .into()
 }
 
 #[cfg(test)]

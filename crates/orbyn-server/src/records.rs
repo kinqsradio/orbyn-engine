@@ -167,6 +167,21 @@ impl IntoResponse for Refusal {
             StoreError::TooManyEnvelopes => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "too_many_envelopes")
             }
+            StoreError::TooManyUploads { retry_after } => {
+                let mut response = error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "too_many_uploads",
+                    "Too many uploads; try again shortly.",
+                );
+                response.headers_mut().insert(
+                    axum::http::header::RETRY_AFTER,
+                    axum::http::HeaderValue::from(retry_after.as_secs().max(1)),
+                );
+                return response;
+            }
+            StoreError::TooManyConnections => {
+                (StatusCode::TOO_MANY_REQUESTS, "too_many_connections")
+            }
             StoreError::QuotaExceeded => (StatusCode::UNPROCESSABLE_ENTITY, "quota_exceeded"),
             StoreError::RecordChanged(conflicts) => {
                 let body = wire::RecordChanged {
@@ -503,6 +518,14 @@ async fn run_sync(
                 socket,
                 "device_not_trusted",
                 "Only a trusted device can do this.",
+            )
+            .await;
+        }
+        Err(StoreError::TooManyConnections) => {
+            return refuse(
+                socket,
+                "too_many_connections",
+                "This account has too many open connections.",
             )
             .await;
         }

@@ -58,23 +58,52 @@ impl Default for Limits {
 /// says whether it was. A refused attempt is not recorded, so a flood of refused
 /// requests neither grows the table nor keeps the window full. Attempts for one
 /// subject are serialised with an advisory lock, so concurrent attempts cannot
-/// slip past the limit.
-pub(crate) async fn allow(
+/// slip past the limit. Never waits for that lock: a burst on one subject is
+/// refused rather than holding pool connections, which suits guessing limits.
+pub async fn allow(
     pool: &PgPool,
     action: &str,
     subject: &[u8; 32],
     limit: Limit,
 ) -> Result<bool, sqlx::Error> {
+    admit(pool, action, subject, limit, false).await
+}
+
+/// Like [`allow`], but waits for the subject's lock instead of refusing. The
+/// lock is held only for a count and an insert, so the wait is short. For
+/// limits on honest traffic, where two requests of one subject at the same
+/// moment (a retry, two devices) must not count as a flood.
+pub async fn allow_queued(
+    pool: &PgPool,
+    action: &str,
+    subject: &[u8; 32],
+    limit: Limit,
+) -> Result<bool, sqlx::Error> {
+    admit(pool, action, subject, limit, true).await
+}
+
+async fn admit(
+    pool: &PgPool,
+    action: &str,
+    subject: &[u8; 32],
+    limit: Limit,
+    wait: bool,
+) -> Result<bool, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    // Never wait for the lock: a burst on one subject is refused rather than
-    // holding pool connections.
-    let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
-        .bind(lock_key(action, subject))
-        .fetch_one(&mut *tx)
-        .await?;
-    if !locked {
-        tx.rollback().await?;
-        return Ok(false);
+    if wait {
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(lock_key(action, subject))
+            .execute(&mut *tx)
+            .await?;
+    } else {
+        let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+            .bind(lock_key(action, subject))
+            .fetch_one(&mut *tx)
+            .await?;
+        if !locked {
+            tx.rollback().await?;
+            return Ok(false);
+        }
     }
     let count = count_in(&mut *tx, action, subject, limit).await?;
     if count >= limit.max {
@@ -88,6 +117,29 @@ pub(crate) async fn allow(
         .await?;
     tx.commit().await?;
     Ok(true)
+}
+
+/// How long until `subject` may try `action` again, rounded up to whole
+/// seconds and at least one: when the oldest attempt in the window ages out.
+/// Meant for a caller that [`allow`] just refused.
+pub async fn retry_after(
+    pool: &PgPool,
+    action: &str,
+    subject: &[u8; 32],
+    limit: Limit,
+) -> Result<Duration, sqlx::Error> {
+    let seconds: Option<f64> = sqlx::query_scalar(
+        "SELECT extract(epoch FROM min(at) + make_interval(secs => $3) - now())::float8
+         FROM auth_attempts
+         WHERE action = $1 AND subject = $2 AND at > now() - make_interval(secs => $3)",
+    )
+    .bind(action)
+    .bind(subject.as_slice())
+    .bind(limit.window.as_secs_f64())
+    .fetch_one(pool)
+    .await?;
+    let wait = seconds.unwrap_or(1.0).ceil().max(1.0);
+    Ok(Duration::from_secs_f64(wait).min(limit.window.max(Duration::from_secs(1))))
 }
 
 /// Gives back the newest attempt by `subject` at `action`, as when a sign-in
