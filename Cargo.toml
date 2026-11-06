@@ -10,6 +10,7 @@ publish = false
 
 [workspace.dependencies]
 orbyn-auth-client = { path = "crates/orbyn-auth-client" }
+orbyn-client = { path = "crates/orbyn-client" }
 orbyn-contracts = { path = "crates/orbyn-contracts" }
 orbyn-crypto = { path = "crates/orbyn-crypto" }
 orbyn-sync = { path = "crates/orbyn-sync" }

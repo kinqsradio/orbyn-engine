@@ -107,7 +107,9 @@ impl IntoResponse for Refusal {
             StoreError::RecipientNotTrusted => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "recipient_not_trusted")
             }
-            StoreError::TooManyEnvelopes => (StatusCode::UNPROCESSABLE_ENTITY, "too_many_envelopes"),
+            StoreError::TooManyEnvelopes => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "too_many_envelopes")
+            }
             StoreError::QuotaExceeded => (StatusCode::UNPROCESSABLE_ENTITY, "quota_exceeded"),
             StoreError::RecordChanged(conflicts) => {
                 let body = wire::RecordChanged {

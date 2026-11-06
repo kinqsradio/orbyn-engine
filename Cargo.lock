@@ -1447,6 +1447,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "orbyn-client"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "getrandom 0.4.3",
+ "orbyn-contracts",
+ "orbyn-crypto",
+ "orbyn-planner",
+ "orbyn-sync",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
 name = "orbyn-contracts"
 version = "0.1.0"
 dependencies = [

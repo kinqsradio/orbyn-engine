@@ -21,13 +21,14 @@ The plan lives in the [Orbyn platform plan](https://claude.ai/artifact/BBhxZSmXR
 | `orbyn-auth-client` | The OPAQUE ciphersuite, the device side of sign-in, the messages devices sign | Devices (native and WebAssembly); the server uses its ciphersuite |
 | `orbyn-sync` | Hybrid logical clocks and field-by-field merge | Devices |
 | `orbyn-planner` | Tasks, events, lists, repeat rules and their record fields | Devices |
+| `orbyn-client` | The device sync engine: record encryption, uploads, merging incoming changes, zone keys and envelopes. No IO | Devices (native and WebAssembly) |
 | `orbyn-core` | Configuration, Postgres, migrations, job queue, accounts and devices | Server |
 | `orbyn-store` | The CloudKit-style record store: zones, encrypted records, change tokens, uploads, live notices | Server |
 | `orbyn-server` | HTTP API and the `/v1/sync` WebSocket | Server |
 | `orbyn-worker` | Job runner | Server |
 | `orbyn-cli` | The `orbyn` binary with every role | Server |
 
-Later phases add `orbyn-client` (the device engine with SQLite), `orbyn-keychain` and `orbyn-keyservice` (HSM-held keys), as the plan describes.
+Later phases add local storage for `orbyn-client` (SQLite on desktop and mobile), `orbyn-keychain` and `orbyn-keyservice` (HSM-held keys), as the plan describes.
 
 ## Cryptography
 
@@ -82,6 +83,19 @@ Modelled on CloudKit's private database. `orbyn-store` owns the behaviour; the r
 - **Silent push.** A device that subscribed to a zone (`subscriptions`, all zones when `zone_id` is null) gets a `zone_changed` job enqueued in the writing transaction, with the idempotency key `<zone id>:<sequence>`, unless it wrote the change itself. The worker's handler is the hook for APNs and FCM; until those exist it does nothing.
 - **Lock order.** Every transaction that locks both takes the account row before the device row, so creating zones and removing a device can never deadlock.
 - **Request limits.** The upload route accepts bodies up to 6 MiB; every other route 64 KiB. A WebSocket message from a device is at most 16 KiB.
+
+## Device sync engine
+
+`orbyn-client` is the device side of the record store. It does no IO: the host makes the requests, stores the engine's snapshot and passes in the wall clock, so the same code runs natively and in the browser.
+
+- **State.** Per zone: the zone keys, the change token, and a cache of records, each with its merged fields, record type, last server version seen, and whether the server lacks some of it (`dirty`). `Engine::snapshot` gives all of it to the host to store; it holds zone keys, so it is kept like the device keys.
+- **Sealing a record.** The fields are serialized as JSON with sorted keys and sealed with a new random record key (XChaCha20-Poly1305, context `orbyn/record/v1`, bound to the zone, record id and record type). The record key is sealed with the zone key (`orbyn/record-key/v1`, bound to the zone, record id and key id). The wrapped key is a format byte (1), the 16-byte key id and the sealed key. Every bound value is length-prefixed. Opening refuses changed bytes and bytes moved to another zone, id or type.
+- **Outgoing.** `stage` merges an edit (stamped by the engine's clock) into the cache and marks the record dirty. `build_upload` seals up to 200 dirty records, within 4 MiB, with their expected versions and a new operation id. Until the answer is applied it returns the same batch, so resending after a lost answer replays instead of writing twice. On success the new versions apply; a record edited while the batch was out stays dirty. On `record_changed` each server copy is merged with `merge_remote`, the batch is dropped and the records go in the next batch with the server's versions, so no local field is lost.
+- **Incoming.** `apply_changes` opens every record of a page before applying any, so a record that fails to open changes nothing and the token stays (the host fetches envelopes for a missing key and tries again). Each copy merges with `merge_remote` using the host's clock; far-future fields are left out and reported. A record whose merge differs from the server's copy is dirty, so the merge goes back up. The result lists changed and removed record ids for the host to show.
+- **Deletes are final.** A delete uploads as a store delete. A tombstone removes the record and its pending edits, and a delete wins over a concurrent edit, so every device ends the same. A planner item's soft delete (`deleted_at`) is an ordinary field.
+- **Zones.** `check_zones` compares a page of `GET /v1/zones` with the device's tokens and returns the stale zones and `next`; the host follows `next` until it is empty.
+- **Planner items** are records of type `item`, staged with `Item::to_fields` or `changed_fields` and read with `Item::from_fields`.
+- **Tests** run two devices against an in-memory store with the record store's rules: 500 random runs of concurrent edits, deletes, lost answers and paged fetches converge, and every field keeps its latest edit.
 
 ## Keychain
 
