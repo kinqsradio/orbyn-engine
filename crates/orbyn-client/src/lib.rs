@@ -11,29 +11,35 @@
 //!   server answers it returns the same batch, so a retry is idempotent.
 //!   [`Engine::upload_succeeded`] applies the new versions;
 //!   [`Engine::upload_conflicted`] merges each server copy with
-//!   `orbyn_sync::merge_remote`, leaves the records dirty and lets the next
-//!   batch try again, so no local field is lost.
-//! - **Incoming.** [`Engine::apply_changes`] opens and merges a page of changes,
-//!   moves the token on and returns what changed for the host to show.
-//! - **Deletes are final.** A server tombstone removes the record, local edits
-//!   included, and a delete wins over any concurrent edit, so every device ends
-//!   the same. Soft deletion (the planner's `deleted_at`) is an ordinary field.
-//! - **Keys.** See [`Engine::create_zone_key`], [`Engine::envelopes_for`] and
-//!   [`Engine::accept_envelopes`].
+//!   `orbyn_sync::merge_remote` and leaves the records dirty for the next batch,
+//!   so no local field is lost.
+//! - **Incoming.** [`Engine::apply_changes`] opens and merges a page of
+//!   changes, moves the token on and returns what changed. A record that does
+//!   not open is quarantined, never blocking the zone.
+//! - **Trust.** Devices are trusted only through approval signatures this
+//!   device checks itself ([`Engine::verify_devices`]); keys go only to them and
+//!   are taken only from them. A zone's key changes only through a rotation a
+//!   trusted device signed.
+//! - **Deletes** are signed by the deleting device and checked before a
+//!   tombstone removes anything.
 
 pub mod crypt;
 mod planner;
+mod trust;
 
 pub use crypt::KeyId;
 pub use planner::{ITEM_TYPE, item_fields, item_from_fields};
+pub use trust::{Peer, PinnedKeys, uuid_bytes};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use crypt::Place;
 use orbyn_contracts as wire;
 use orbyn_crypto::{CryptoError, DeviceKeys, DevicePublic, SymmetricKey};
 use orbyn_sync::{Clock, Fields, Stamp, merge, merge_remote};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use trust::Trust;
 
 /// Saves and deletes in one upload, as the store accepts.
 pub const MAX_BATCH: usize = 200;
@@ -41,6 +47,9 @@ pub const MAX_BATCH: usize = 200;
 pub const MAX_BATCH_BYTES: usize = 4 * 1024 * 1024;
 /// Ciphertext of one record.
 pub const MAX_CIPHERTEXT: usize = 256 * 1024;
+/// How long a record deleted by another device while it had local edits stays
+/// in the trash.
+pub const TRASH_MILLIS: u64 = 30 * 24 * 60 * 60 * 1000;
 
 /// What went wrong. Messages never include record content or keys.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -53,7 +62,7 @@ pub enum ClientError {
     NoZoneKey,
     #[error("a record is sealed with a zone key this device does not have")]
     MissingZoneKey { zone: String, key_id: String },
-    #[error("the data could not be opened: wrong key or changed bytes")]
+    #[error("the data could not be opened or verified: wrong key, signer or changed bytes")]
     Open,
     #[error("a record's contents are not valid")]
     Decode,
@@ -138,12 +147,32 @@ pub struct Local {
     pub version: Option<i64>,
     /// The server does not have everything here yet.
     pub dirty: bool,
-    /// Deleted on this device; uploads as a delete.
+    /// Deleted on this device; uploads as a signed delete.
     pub deleted: bool,
     /// Counts local changes, so an answer to an older batch does not mark
     /// newer edits as stored.
     #[serde(default)]
     edits: u64,
+}
+
+/// A server copy this device could not open or verify yet. It is kept as is
+/// and tried again when keys arrive ([`Engine::retry_quarantined`]); until
+/// then the record is left out of uploads.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Quarantined {
+    pub record: wire::Record,
+    /// `missing_zone_key`, `open_failed` or `invalid_record`.
+    pub reason: String,
+}
+
+/// A record another device deleted while this device had edits not yet stored.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Trashed {
+    pub record_type: String,
+    pub fields: Fields,
+    pub deleted_by: String,
+    /// This device's clock when the delete arrived; kept for [`TRASH_MILLIS`].
+    pub deleted_at_millis: u64,
 }
 
 /// An upload sent and not yet answered.
@@ -156,17 +185,47 @@ struct InFlight {
 
 #[derive(Clone, Debug, Default)]
 struct ZoneState {
+    /// Never overwritten: a key id, once known, keeps its key.
     keys: BTreeMap<KeyId, SymmetricKey>,
+    /// The key new records are sealed with: the first key accepted, then each
+    /// accepted rotation from it.
+    current: Option<KeyId>,
+    /// The signed record of each key that came from a rotation.
+    rotations: BTreeMap<KeyId, wire::KeyRotation>,
     token: Option<String>,
     records: BTreeMap<String, Local>,
     in_flight: Option<InFlight>,
+    quarantine: BTreeMap<String, Quarantined>,
+    trash: BTreeMap<String, Trashed>,
 }
 
 impl ZoneState {
-    /// The key new records are sealed with: the smallest id, so devices that
-    /// each made a key for the same zone agree once they have both.
-    fn current_key(&self) -> Option<(&KeyId, &SymmetricKey)> {
-        self.keys.iter().next()
+    fn current_key(&self) -> Option<(KeyId, &SymmetricKey)> {
+        let id = self.current?;
+        self.keys.get(&id).map(|k| (id, k))
+    }
+
+    /// Follows accepted rotations from the current key as far as they go.
+    fn advance(&mut self) {
+        let mut steps = 0;
+        while let Some(current) = self.current
+            && steps <= self.rotations.len()
+        {
+            let next = self
+                .rotations
+                .iter()
+                .filter(|(id, r)| {
+                    key_id_of(&r.previous_key_id).ok() == Some(current)
+                        && self.keys.contains_key(*id)
+                })
+                .map(|(id, _)| *id)
+                .min();
+            match next {
+                Some(next) => self.current = Some(next),
+                None => break,
+            }
+            steps += 1;
+        }
     }
 }
 
@@ -177,6 +236,14 @@ pub struct Applied {
     pub changed: Vec<String>,
     /// Records that are gone.
     pub removed: Vec<String>,
+    /// Records removed by another device's delete while they had local edits;
+    /// they are in the trash for 30 days.
+    pub trashed: Vec<String>,
+    /// Records that could not be opened yet.
+    pub quarantined: Vec<String>,
+    /// Tombstones without a valid signature from a trusted device. They were
+    /// ignored; the local copy is uploaded again.
+    pub unverified_deletes: Vec<String>,
     /// Fields left out because their stamp was too far ahead of this clock.
     pub rejected: Vec<RejectedFields>,
     /// More changes wait on the server; fetch again with [`Engine::token`].
@@ -198,19 +265,11 @@ pub struct ZoneCheck {
     pub next: Option<String>,
 }
 
-/// A device the host trusts, with its public keys.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Peer {
-    pub device_id: String,
-    pub public: DevicePublic,
-}
-
 /// The result of [`Engine::accept_envelopes`].
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Accepted {
-    /// Zones that got a new key.
+    /// Zones that got a new key; call [`Engine::retry_quarantined`] for them.
     pub zones: Vec<String>,
-    /// Envelopes refused: from a device the host does not trust, or not opening.
     pub refused: Vec<RefusedEnvelope>,
 }
 
@@ -219,14 +278,17 @@ pub struct RefusedEnvelope {
     pub zone: String,
     pub key_id: String,
     pub sender_device_id: String,
-    /// `untrusted_sender` or `invalid`.
+    /// `untrusted_sender`, `conflicting_key`, `invalid_rotation` or `invalid`.
     pub reason: String,
 }
 
-/// The engine's state for the host to store. It holds zone keys: keep it with
-/// the same care as the device keys.
+/// The engine's state for the host to store. It holds zone keys: a host must
+/// seal it before it leaves the process (`orbyn-wasm` does).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
+    pub account_id: String,
+    pub device_id: String,
+    pub pinned: BTreeMap<String, PinnedKeys>,
     pub zones: BTreeMap<String, ZoneSnapshot>,
 }
 
@@ -234,8 +296,12 @@ pub struct Snapshot {
 pub struct ZoneSnapshot {
     /// Key id to key, both base64url.
     pub keys: BTreeMap<String, String>,
+    pub current: Option<String>,
+    pub rotations: BTreeMap<String, wire::KeyRotation>,
     pub token: Option<String>,
     pub records: BTreeMap<String, Local>,
+    pub quarantine: BTreeMap<String, Quarantined>,
+    pub trash: BTreeMap<String, Trashed>,
     #[serde(default)]
     in_flight: Option<InFlight>,
 }
@@ -243,6 +309,7 @@ pub struct ZoneSnapshot {
 /// One device's sync engine.
 pub struct Engine {
     keys: DeviceKeys,
+    trust: Trust,
     clock: Clock,
     zones: BTreeMap<String, ZoneState>,
 }
@@ -254,20 +321,33 @@ pub fn stamp_device(public: &DevicePublic) -> u64 {
     u64::from_be_bytes(b)
 }
 
+enum Copy {
+    Never,
+    Tombstone { verified: bool, author: String },
+    Live(Fields, i64, String),
+    Unreadable(wire::Record, &'static str),
+}
+
 impl Engine {
-    pub fn new(keys: DeviceKeys) -> Self {
-        let clock = Clock::new(stamp_device(&keys.public()));
-        Self {
+    /// A new engine for the device `device_id` of `account_id` (both UUIDs, as
+    /// the server gave them at sign-up or sign-in).
+    pub fn new(keys: DeviceKeys, account_id: &str, device_id: &str) -> Result<Self> {
+        let account = uuid_bytes(account_id)?;
+        uuid_bytes(device_id)?;
+        let me = keys.public();
+        Ok(Self {
+            clock: Clock::new(stamp_device(&me)),
+            trust: Trust::new(account, device_id.to_owned(), me),
             keys,
-            clock,
             zones: BTreeMap::new(),
-        }
+        })
     }
 
     /// Restores an engine from [`Engine::snapshot`]. `now_millis` moves the
     /// clock past every stamp in the cache.
     pub fn restore(keys: DeviceKeys, snapshot: Snapshot, now_millis: u64) -> Result<Self> {
-        let mut engine = Self::new(keys);
+        let mut engine = Self::new(keys, &snapshot.account_id, &snapshot.device_id)?;
+        engine.trust.import(&snapshot.pinned)?;
         for (name, z) in snapshot.zones {
             let mut keys = BTreeMap::new();
             for (id, key) in &z.keys {
@@ -275,6 +355,10 @@ impl Engine {
                     .try_into()
                     .map_err(|_| ClientError::InvalidInput)?;
                 keys.insert(key_id_of(id)?, SymmetricKey::from_bytes(bytes));
+            }
+            let mut rotations = BTreeMap::new();
+            for (id, r) in z.rotations {
+                rotations.insert(key_id_of(&id)?, r);
             }
             for local in z.records.values() {
                 if let Some(latest) = local.fields.latest() {
@@ -285,9 +369,13 @@ impl Engine {
                 name,
                 ZoneState {
                     keys,
+                    current: z.current.as_deref().map(key_id_of).transpose()?,
+                    rotations,
                     token: z.token,
                     records: z.records,
                     in_flight: z.in_flight,
+                    quarantine: z.quarantine,
+                    trash: z.trash,
                 },
             );
         }
@@ -295,32 +383,58 @@ impl Engine {
     }
 
     pub fn snapshot(&self) -> Snapshot {
-        Snapshot {
-            zones: self
-                .zones
-                .iter()
-                .map(|(name, z)| {
-                    let keys = z
+        let zones = self
+            .zones
+            .iter()
+            .map(|(name, z)| {
+                let snapshot = ZoneSnapshot {
+                    keys: z
                         .keys
                         .iter()
                         .map(|(id, key)| (b64(id), b64(key.as_bytes())))
-                        .collect();
-                    (
-                        name.clone(),
-                        ZoneSnapshot {
-                            keys,
-                            token: z.token.clone(),
-                            records: z.records.clone(),
-                            in_flight: z.in_flight.clone(),
-                        },
-                    )
-                })
-                .collect(),
+                        .collect(),
+                    current: z.current.map(|id| b64(&id)),
+                    rotations: z
+                        .rotations
+                        .iter()
+                        .map(|(id, r)| (b64(id), r.clone()))
+                        .collect(),
+                    token: z.token.clone(),
+                    records: z.records.clone(),
+                    quarantine: z.quarantine.clone(),
+                    trash: z.trash.clone(),
+                    in_flight: z.in_flight.clone(),
+                };
+                (name.clone(), snapshot)
+            })
+            .collect();
+        Snapshot {
+            account_id: format_uuid(&self.trust.account),
+            device_id: self.trust.device_id.clone(),
+            pinned: self.trust.export(),
+            zones,
         }
     }
 
     pub fn device_keys(&self) -> &DeviceKeys {
         &self.keys
+    }
+
+    pub fn device_id(&self) -> &str {
+        &self.trust.device_id
+    }
+
+    /// The devices of `list` (`GET /v1/devices`) this device trusts: trusted
+    /// on the server and linked by approval signatures to a device it already
+    /// trusts. See the `trust` module.
+    pub fn verify_devices(&mut self, list: &wire::DeviceList) -> Vec<Peer> {
+        self.trust.verify(list)
+    }
+
+    /// Trusts a device the person checked another way, such as by comparing
+    /// keys on both screens.
+    pub fn pin_device(&mut self, device_id: &str, public: DevicePublic) -> Result<()> {
+        self.trust.pin(device_id, public)
     }
 
     /// The stamp for a new local edit at wall time `now_millis`.
@@ -359,11 +473,38 @@ impl Engine {
             .flat_map(|z| z.records.iter().map(|(id, l)| (id.as_str(), l)))
     }
 
-    /// True when the zone has local changes the server does not have yet.
-    pub fn has_pending(&self, zone: &str) -> bool {
+    pub fn quarantine(&self, zone: &str) -> impl Iterator<Item = (&str, &Quarantined)> {
         self.zones
             .get(zone)
-            .is_some_and(|z| z.in_flight.is_some() || z.records.values().any(|l| l.dirty))
+            .into_iter()
+            .flat_map(|z| z.quarantine.iter().map(|(id, q)| (id.as_str(), q)))
+    }
+
+    pub fn trash(&self, zone: &str) -> impl Iterator<Item = (&str, &Trashed)> {
+        self.zones
+            .get(zone)
+            .into_iter()
+            .flat_map(|z| z.trash.iter().map(|(id, t)| (id.as_str(), t)))
+    }
+
+    /// Takes a record out of the trash, for the host to keep under a new id.
+    pub fn take_from_trash(&mut self, zone: &str, record_id: &str) -> Option<Trashed> {
+        self.zones.get_mut(zone)?.trash.remove(record_id)
+    }
+
+    /// The id of the key new records of the zone are sealed with.
+    pub fn current_key_id(&self, zone: &str) -> Option<String> {
+        self.zones.get(zone)?.current.map(|id| b64(&id))
+    }
+
+    /// True when the zone has local changes the server does not have yet.
+    pub fn has_pending(&self, zone: &str) -> bool {
+        self.zones.get(zone).is_some_and(|z| {
+            z.in_flight.is_some()
+                || z.records
+                    .iter()
+                    .any(|(id, l)| l.dirty && !z.quarantine.contains_key(id))
+        })
     }
 
     /// Merges `changes` (stamped with [`Engine::tick`]) into the record and
@@ -424,8 +565,14 @@ impl Engine {
     /// The next upload for the zone, or `None` when nothing waits. Until
     /// [`Engine::upload_succeeded`] or [`Engine::upload_conflicted`] is called,
     /// it returns the same batch, so resending after a lost answer is safe.
+    /// Quarantined records wait until they open.
     pub fn build_upload(&mut self, zone: &str) -> Result<Option<wire::UploadChanges>> {
-        let z = self.zone_mut(zone)?;
+        let account = self.trust.account;
+        let keys = &self.keys;
+        if !valid_name(zone, 64) {
+            return Err(ClientError::InvalidZone);
+        }
+        let z = self.zones.entry(zone.to_owned()).or_default();
         if let Some(flight) = &z.in_flight {
             return Ok(Some(flight.upload.clone()));
         }
@@ -434,12 +581,13 @@ impl Engine {
         let dirty: Vec<String> = z
             .records
             .iter()
-            .filter(|(_, l)| l.dirty)
+            .filter(|(id, l)| l.dirty && !z.quarantine.contains_key(*id))
             .map(|(id, _)| id.clone())
             .collect();
         if dirty.is_empty() {
             return Ok(None);
         }
+        let (key_id, zone_key) = z.current_key().ok_or(ClientError::NoZoneKey)?;
         let mut changes = Vec::new();
         let mut edits = BTreeMap::new();
         let mut bytes = 0usize;
@@ -448,18 +596,30 @@ impl Engine {
                 break;
             }
             let local = &z.records[&id];
+            let place = Place {
+                account: &account,
+                zone,
+                record_id: &id,
+            };
             let change = if local.deleted {
                 let Some(expected_version) = local.version else {
                     continue;
                 };
+                let proof = crypt::sign_delete(keys, place, expected_version, &key_id);
                 wire::RecordChange::Delete {
                     record_id: id.clone(),
                     expected_version,
+                    proof: Some(b64(&proof)),
                 }
             } else {
-                let (key_id, key) = z.current_key().ok_or(ClientError::NoZoneKey)?;
-                let (ciphertext, wrapped_key) =
-                    crypt::seal_record(zone, &id, &local.record_type, &local.fields, key_id, key)?;
+                let (ciphertext, wrapped_key) = crypt::seal_record(
+                    place,
+                    &local.record_type,
+                    local.version,
+                    &local.fields,
+                    &key_id,
+                    zone_key,
+                )?;
                 if ciphertext.len() > MAX_CIPHERTEXT {
                     return Err(ClientError::RecordTooLarge);
                 }
@@ -532,18 +692,19 @@ impl Engine {
         Ok(())
     }
 
-    /// Applies a 409 `record_changed`: nothing was written. Each server copy is
-    /// merged into the cache and the batch is dropped; the merged records stay
-    /// dirty, so the next [`Engine::build_upload`] sends them with the server's
-    /// versions.
+    /// Applies a 409 `record_changed`: nothing was written. The batch is
+    /// dropped first, whatever happens next. Each server copy is merged into
+    /// the cache, and the merged records stay dirty for the next batch with the
+    /// server's versions. A copy that does not open is quarantined and its
+    /// record waits, so the same conflict is never sent again.
     pub fn upload_conflicted(
         &mut self,
         zone: &str,
         conflict: &wire::RecordChanged,
         now_millis: u64,
     ) -> Result<Applied> {
-        let z = self.zones.get(zone).ok_or(ClientError::NoUpload)?;
-        if z.in_flight.is_none() {
+        let z = self.zones.get_mut(zone).ok_or(ClientError::NoUpload)?;
+        if z.in_flight.take().is_none() {
             return Err(ClientError::NoUpload);
         }
         let records: Vec<(String, Option<wire::Record>)> = conflict
@@ -551,17 +712,11 @@ impl Engine {
             .iter()
             .map(|c| (c.record_id.clone(), c.server_record.clone()))
             .collect();
-        let mut applied = self.merge_server_records(zone, &records, now_millis)?;
-        if let Some(z) = self.zones.get_mut(zone) {
-            z.in_flight = None;
-        }
-        applied.more = false;
-        Ok(applied)
+        Ok(self.merge_server_records(zone, records, now_millis))
     }
 
-    /// Opens and merges one page of `GET /v1/zones/{zone}/changes`. Nothing is
-    /// applied if any record fails to open; the token stays, so the host can
-    /// fetch keys and try again.
+    /// Opens and merges one page of `GET /v1/zones/{zone}/changes` and moves
+    /// the token on. Records that do not open are quarantined.
     pub fn apply_changes(
         &mut self,
         zone: &str,
@@ -574,7 +729,7 @@ impl Engine {
             .iter()
             .map(|r| (r.record_id.clone(), Some(r.clone())))
             .collect();
-        let mut applied = self.merge_server_records(zone, &records, now_millis)?;
+        let mut applied = self.merge_server_records(zone, records, now_millis);
         if let Some(z) = self.zones.get_mut(zone) {
             z.token = Some(page.token.clone());
         }
@@ -582,49 +737,89 @@ impl Engine {
         Ok(applied)
     }
 
-    /// Merges server copies into the cache: all are opened first, so a failure
-    /// changes nothing.
+    /// Tries every quarantined record of the zone again, after new keys or
+    /// trusted devices arrived.
+    pub fn retry_quarantined(&mut self, zone: &str, now_millis: u64) -> Applied {
+        let Some(z) = self.zones.get_mut(zone) else {
+            return Applied::default();
+        };
+        let mut records: Vec<wire::Record> = std::mem::take(&mut z.quarantine)
+            .into_values()
+            .map(|q| q.record)
+            .collect();
+        records.sort_by_key(|r| r.version);
+        let records = records
+            .into_iter()
+            .map(|r| (r.record_id.clone(), Some(r)))
+            .collect();
+        self.merge_server_records(zone, records, now_millis)
+    }
+
+    fn classify(&self, zone: &str, id: &str, record: Option<wire::Record>) -> Option<Copy> {
+        let z = self.zones.get(zone)?;
+        let Some(r) = record else {
+            return Some(Copy::Never);
+        };
+        let place = Place {
+            account: &self.trust.account,
+            zone,
+            record_id: id,
+        };
+        // Anything not newer than what this device has is old news, a replayed
+        // tombstone included.
+        let known = z.records.get(id).and_then(|l| l.version);
+        if known.is_some_and(|v| v >= r.version) {
+            return None;
+        }
+        if r.deleted {
+            let verified = r
+                .delete_proof
+                .as_deref()
+                .and_then(|p| unb64(p).ok())
+                .zip(self.trust.pinned(&r.author_device_id))
+                .is_some_and(|(proof, author)| {
+                    crypt::verify_delete(author, place, r.version, &proof).is_ok()
+                });
+            return Some(Copy::Tombstone {
+                verified,
+                author: r.author_device_id,
+            });
+        }
+        let bytes = r
+            .ciphertext
+            .as_deref()
+            .zip(r.wrapped_key.as_deref())
+            .and_then(|(ct, wk)| Some((unb64(ct).ok()?, unb64(wk).ok()?)));
+        let Some((ct, wk)) = bytes else {
+            return Some(Copy::Unreadable(r, "invalid_record"));
+        };
+        match crypt::open_record(place, &r.record_type, r.version, &ct, &wk, &z.keys) {
+            Ok(fields) => Some(Copy::Live(fields, r.version, r.record_type)),
+            Err(ClientError::MissingZoneKey { .. }) => {
+                Some(Copy::Unreadable(r, "missing_zone_key"))
+            }
+            Err(ClientError::Decode) => Some(Copy::Unreadable(r, "invalid_record")),
+            Err(_) => Some(Copy::Unreadable(r, "open_failed")),
+        }
+    }
+
+    /// Merges server copies into the cache, one at a time; a copy that does
+    /// not open or verify never stops the others.
     fn merge_server_records(
         &mut self,
         zone: &str,
-        records: &[(String, Option<wire::Record>)],
+        records: Vec<(String, Option<wire::Record>)>,
         now_millis: u64,
-    ) -> Result<Applied> {
-        enum Copy {
-            Never,
-            Tombstone,
-            Live(Fields, i64, String),
-        }
-        let z = self.zones.get(zone).ok_or(ClientError::InvalidZone)?;
-        let mut opened = Vec::with_capacity(records.len());
-        for (id, record) in records {
-            let copy = match record {
-                None => Copy::Never,
-                Some(r) if r.deleted => Copy::Tombstone,
-                Some(r) => {
-                    let known = z.records.get(id).and_then(|l| l.version);
-                    if known.is_some_and(|v| v >= r.version) {
-                        continue;
-                    }
-                    let (Some(ct), Some(wk)) = (&r.ciphertext, &r.wrapped_key) else {
-                        return Err(ClientError::Decode);
-                    };
-                    let fields = crypt::open_record(
-                        zone,
-                        id,
-                        &r.record_type,
-                        &unb64(ct).map_err(|_| ClientError::Decode)?,
-                        &unb64(wk).map_err(|_| ClientError::Decode)?,
-                        &z.keys,
-                    )?;
-                    Copy::Live(fields, r.version, r.record_type.clone())
-                }
-            };
-            opened.push((id.clone(), copy));
-        }
+    ) -> Applied {
         let mut applied = Applied::default();
-        let z = self.zones.get_mut(zone).ok_or(ClientError::InvalidZone)?;
-        for (id, copy) in opened {
+        for (id, record) in records {
+            let version = record.as_ref().map(|r| r.version);
+            let Some(copy) = self.classify(zone, &id, record) else {
+                continue;
+            };
+            let Some(z) = self.zones.get_mut(zone) else {
+                break;
+            };
             match copy {
                 Copy::Never => {
                     if let Some(local) = z.records.get_mut(&id) {
@@ -633,12 +828,62 @@ impl Engine {
                         local.edits += 1;
                     }
                 }
-                Copy::Tombstone => {
-                    if z.records.remove(&id).is_some() {
+                Copy::Unreadable(record, reason) => {
+                    let newer = z
+                        .quarantine
+                        .get(&id)
+                        .is_none_or(|q| q.record.version <= record.version);
+                    if newer {
+                        z.quarantine.insert(
+                            id.clone(),
+                            Quarantined {
+                                record,
+                                reason: reason.to_owned(),
+                            },
+                        );
+                    }
+                    applied.quarantined.push(id);
+                }
+                Copy::Tombstone {
+                    verified: false, ..
+                } => {
+                    // Not proven by a trusted device: keep the record, and put
+                    // the local copy back on the server over the tombstone.
+                    if let Some(local) = z.records.get_mut(&id) {
+                        local.version = version;
+                        local.dirty = true;
+                        local.edits += 1;
+                    }
+                    applied.unverified_deletes.push(id);
+                }
+                Copy::Tombstone {
+                    verified: true,
+                    author,
+                } => {
+                    z.quarantine.remove(&id);
+                    if let Some(local) = z.records.remove(&id) {
+                        if local.dirty && !local.deleted {
+                            z.trash.insert(
+                                id.clone(),
+                                Trashed {
+                                    record_type: local.record_type,
+                                    fields: local.fields,
+                                    deleted_by: author,
+                                    deleted_at_millis: now_millis,
+                                },
+                            );
+                            applied.trashed.push(id.clone());
+                        }
                         applied.removed.push(id);
                     }
                 }
                 Copy::Live(theirs, version, record_type) => {
+                    if z.quarantine
+                        .get(&id)
+                        .is_some_and(|q| q.record.version <= version)
+                    {
+                        z.quarantine.remove(&id);
+                    }
                     let merged = merge_remote(&Fields::default(), &theirs, now_millis);
                     for field in merged.fields.0.values() {
                         let _ = self.clock.observe(field.stamp, now_millis);
@@ -653,7 +898,7 @@ impl Engine {
                         Some(local) => {
                             local.version = Some(version);
                             if local.deleted {
-                                // A delete wins; send it with the new version.
+                                // Our delete still wins; send it with the new version.
                                 local.dirty = true;
                                 local.edits += 1;
                                 continue;
@@ -688,7 +933,11 @@ impl Engine {
                 }
             }
         }
-        Ok(applied)
+        if let Some(z) = self.zones.get_mut(zone) {
+            z.trash
+                .retain(|_, t| now_millis.saturating_sub(t.deleted_at_millis) < TRASH_MILLIS);
+        }
+        applied
     }
 
     /// Compares one page of `GET /v1/zones` with this device's tokens. Follow
@@ -706,105 +955,198 @@ impl Engine {
     }
 
     /// Makes the first key for a zone and returns its id. A zone that already
-    /// has a key keeps it and returns that key's id.
+    /// has a key keeps it and returns the current key's id.
     pub fn create_zone_key(&mut self, zone: &str) -> Result<String> {
         let z = self.zone_mut(zone)?;
-        if let Some((id, _)) = z.current_key() {
-            return Ok(b64(id));
+        if let Some(id) = z.current {
+            return Ok(b64(&id));
         }
         let id: KeyId = random()?;
         z.keys.insert(id, SymmetricKey::generate()?);
+        z.current = Some(id);
         Ok(b64(&id))
     }
 
-    /// Envelopes of every key of the zone for each of `peers`, to send with
-    /// `POST /v1/keychain/envelopes`.
-    pub fn envelopes_for(&self, zone: &str, peers: &[Peer]) -> Result<Vec<wire::NewKeyEnvelope>> {
+    /// Replaces the zone's current key with a new one, signed by this device.
+    /// Send it to the other devices with [`Engine::envelopes_for`].
+    pub fn rotate_zone_key(&mut self, zone: &str) -> Result<String> {
+        let account = self.trust.account;
+        let device_id = self.trust.device_id.clone();
+        let keys = &self.keys;
+        let z = self.zones.get_mut(zone).ok_or(ClientError::NoZoneKey)?;
+        let previous = z.current.ok_or(ClientError::NoZoneKey)?;
+        let id: KeyId = random()?;
+        let signature = crypt::sign_rotation(keys, &account, zone, &id, &previous);
+        z.keys.insert(id, SymmetricKey::generate()?);
+        z.rotations.insert(
+            id,
+            wire::KeyRotation {
+                previous_key_id: b64(&previous),
+                signer_device_id: device_id,
+                signature: b64(&signature),
+            },
+        );
+        z.current = Some(id);
+        Ok(b64(&id))
+    }
+
+    /// Envelopes of every key of the zone, with their rotation records, for
+    /// each device of `devices` (`GET /v1/devices`) this device verifies. A
+    /// device it cannot verify gets nothing.
+    pub fn envelopes_for(
+        &mut self,
+        zone: &str,
+        devices: &wire::DeviceList,
+    ) -> Result<Vec<wire::NewKeyEnvelope>> {
+        let peers = self.verify_devices(devices);
         let z = self.zones.get(zone).ok_or(ClientError::NoZoneKey)?;
         if z.keys.is_empty() {
             return Err(ClientError::NoZoneKey);
         }
-        let me = self.keys.public();
         let mut out = Vec::new();
-        for peer in peers.iter().filter(|p| p.public != me) {
+        for peer in peers.iter().filter(|p| p.device_id != self.trust.device_id) {
             for (id, key) in &z.keys {
-                let envelope = crypt::seal_zone_key(&self.keys, &peer.public, zone, id, key)?;
+                let envelope = crypt::seal_zone_key(
+                    &self.keys,
+                    &peer.public,
+                    &self.trust.account,
+                    zone,
+                    id,
+                    key,
+                )?;
                 out.push(wire::NewKeyEnvelope {
                     recipient_device_id: peer.device_id.clone(),
                     zone: zone.to_owned(),
                     key_id: b64(id),
                     envelope: b64(&envelope),
+                    rotation: z.rotations.get(id).cloned(),
                 });
             }
         }
         Ok(out)
     }
 
-    /// Opens envelopes from `GET /v1/keychain/envelopes`. Only envelopes from
-    /// one of `trusted` (the devices the host trusts, by id) are opened; the
-    /// server's word about the sender is not enough.
+    /// Opens envelopes from `GET /v1/keychain/envelopes`. Only envelopes from a
+    /// device this device verifies in `devices` are opened. A key id already
+    /// held keeps its key. The first key of a zone becomes current; after that
+    /// the current key moves only along rotations signed by verified devices.
     pub fn accept_envelopes(
         &mut self,
         envelopes: &[wire::KeyEnvelope],
-        trusted: &[Peer],
+        devices: &wire::DeviceList,
     ) -> Accepted {
+        let peers = self.verify_devices(devices);
         let mut accepted = Accepted::default();
-        for e in envelopes {
-            let refuse = |reason: &str| RefusedEnvelope {
-                zone: e.zone.clone(),
-                key_id: e.key_id.clone(),
-                sender_device_id: e.sender_device_id.clone(),
-                reason: reason.to_owned(),
-            };
-            let Some(sender) = trusted.iter().find(|p| p.device_id == e.sender_device_id) else {
-                accepted.refused.push(refuse("untrusted_sender"));
-                continue;
-            };
-            let opened = key_id_of(&e.key_id).and_then(|id| {
-                let bytes = unb64(&e.envelope)?;
-                let key = crypt::open_zone_key(&self.keys, &sender.public, &e.zone, &id, &bytes)?;
-                Ok((id, key))
-            });
-            let Ok((id, key)) = opened else {
-                accepted.refused.push(refuse("invalid"));
-                continue;
-            };
-            let Ok(z) = self.zone_mut(&e.zone) else {
-                accepted.refused.push(refuse("invalid"));
-                continue;
-            };
-            if z.keys.insert(id, key).is_none() && !accepted.zones.contains(&e.zone) {
-                accepted.zones.push(e.zone.clone());
+        // Plain keys first, so the first key of a zone is pinned before any
+        // rotation from it.
+        let mut ordered: Vec<&wire::KeyEnvelope> = envelopes.iter().collect();
+        ordered.sort_by_key(|e| e.rotation.is_some());
+        for e in ordered {
+            let reason = self.accept_one(e, &peers);
+            match reason {
+                Ok(true) => {
+                    if !accepted.zones.contains(&e.zone) {
+                        accepted.zones.push(e.zone.clone());
+                    }
+                }
+                Ok(false) => {}
+                Err(reason) => accepted.refused.push(RefusedEnvelope {
+                    zone: e.zone.clone(),
+                    key_id: e.key_id.clone(),
+                    sender_device_id: e.sender_device_id.clone(),
+                    reason: reason.to_owned(),
+                }),
+            }
+        }
+        for zone in &accepted.zones {
+            if let Some(z) = self.zones.get_mut(zone) {
+                z.advance();
             }
         }
         accepted
     }
+
+    /// Ok(true) when a new key was stored.
+    fn accept_one(&mut self, e: &wire::KeyEnvelope, peers: &[Peer]) -> Result<bool, &'static str> {
+        let sender = peers
+            .iter()
+            .find(|p| p.device_id == e.sender_device_id)
+            .ok_or("untrusted_sender")?;
+        let id = key_id_of(&e.key_id).map_err(|_| "invalid")?;
+        let bytes = unb64(&e.envelope).map_err(|_| "invalid")?;
+        if !valid_name(&e.zone, 64) {
+            return Err("invalid");
+        }
+        let key = crypt::open_zone_key(
+            &self.keys,
+            &sender.public,
+            &self.trust.account,
+            &e.zone,
+            &id,
+            &bytes,
+        )
+        .map_err(|_| "invalid")?;
+        let rotation = match &e.rotation {
+            None => None,
+            Some(r) => {
+                let previous = key_id_of(&r.previous_key_id).map_err(|_| "invalid_rotation")?;
+                let signature: [u8; 64] = unb64(&r.signature)
+                    .ok()
+                    .and_then(|s| s.try_into().ok())
+                    .ok_or("invalid_rotation")?;
+                let signer = peers
+                    .iter()
+                    .find(|p| p.device_id == r.signer_device_id)
+                    .map(|p| p.public)
+                    .or_else(|| self.trust.pinned(&r.signer_device_id).copied())
+                    .ok_or("invalid_rotation")?;
+                crypt::verify_rotation(
+                    &signer,
+                    &self.trust.account,
+                    &e.zone,
+                    &id,
+                    &previous,
+                    &signature,
+                )
+                .map_err(|_| "invalid_rotation")?;
+                Some(r.clone())
+            }
+        };
+        let z = self.zones.entry(e.zone.clone()).or_default();
+        if let Some(existing) = z.keys.get(&id) {
+            return if *existing == key {
+                Ok(false)
+            } else {
+                Err("conflicting_key")
+            };
+        }
+        z.keys.insert(id, key);
+        match rotation {
+            Some(r) => {
+                z.rotations.insert(id, r);
+            }
+            None if z.current.is_none() => z.current = Some(id),
+            // A second plain key (another device made one at the same time)
+            // opens records but never becomes current.
+            None => {}
+        }
+        if z.current.is_none() {
+            z.current = Some(id);
+        }
+        Ok(true)
+    }
 }
 
-/// The trusted devices of a `GET /v1/devices` answer as [`Peer`]s.
-///
-/// This trusts the server's list. Until devices check approval signatures (see
-/// the architecture's Accounts section), a compromised server could list a
-/// device of its own.
-pub fn trusted_peers(list: &wire::DeviceList) -> Result<Vec<Peer>> {
-    list.devices
-        .iter()
-        .filter(|d| d.state == wire::DeviceState::Trusted)
-        .map(|d| {
-            let key = |text: &str| -> Result<[u8; 32]> {
-                unb64(text)?
-                    .try_into()
-                    .map_err(|_| ClientError::InvalidInput)
-            };
-            Ok(Peer {
-                device_id: d.id.clone(),
-                public: DevicePublic {
-                    signing: key(&d.signing_key)?,
-                    agreement: key(&d.agreement_key)?,
-                },
-            })
-        })
-        .collect()
+fn format_uuid(b: &[u8; 16]) -> String {
+    let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    )
 }
 
 #[cfg(test)]
@@ -818,6 +1160,7 @@ mod tests {
         assert_eq!(&id[14..15], "4");
         assert!(matches!(&id[19..20], "8" | "9" | "a" | "b"));
         assert_ne!(uuid_v4()?, id);
+        assert_eq!(format_uuid(&uuid_bytes(&id)?), id);
         Ok(())
     }
 }

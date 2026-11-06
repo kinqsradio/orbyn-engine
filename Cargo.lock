@@ -1452,6 +1452,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "getrandom 0.4.3",
+ "orbyn-auth-client",
  "orbyn-contracts",
  "orbyn-crypto",
  "orbyn-planner",

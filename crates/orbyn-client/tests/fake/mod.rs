@@ -63,6 +63,7 @@ impl FakeStore {
                 wire::RecordChange::Delete {
                     record_id,
                     expected_version,
+                    ..
                 } => (record_id, Some(*expected_version)),
             };
             let current = z.records.get(id);
@@ -99,8 +100,11 @@ impl FakeStore {
                     author_device_id: device.into(),
                     modified_at: String::new(),
                     deleted: false,
+                    delete_proof: None,
                 },
-                wire::RecordChange::Delete { record_id, .. } => {
+                wire::RecordChange::Delete {
+                    record_id, proof, ..
+                } => {
                     let record_type = z.records[record_id].record_type.clone();
                     wire::Record {
                         record_id: record_id.clone(),
@@ -111,6 +115,7 @@ impl FakeStore {
                         author_device_id: device.into(),
                         modified_at: String::new(),
                         deleted: true,
+                        delete_proof: proof.clone(),
                     }
                 }
             };
