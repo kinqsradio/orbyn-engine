@@ -244,10 +244,13 @@ pub async fn prune(pool: &PgPool) -> Result<u64, sqlx::Error> {
 mod tests {
     use super::*;
 
+    /// A pool on a migrated database, like the other Postgres tests.
     async fn pool() -> PgPool {
         let url =
             std::env::var("DATABASE_URL").expect("set DATABASE_URL to run the Postgres tests");
-        PgPool::connect(&url).await.expect("connect")
+        let db = crate::Database::connect(&url).await.expect("connect");
+        db.migrate().await.expect("migrate");
+        db.pool().clone()
     }
 
     #[tokio::test]
