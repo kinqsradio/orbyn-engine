@@ -30,7 +30,8 @@ Later phases add `orbyn-planner` (planner rules), `orbyn-client` (the device eng
 
 - Records, zone keys and service keys are 256-bit keys used with XChaCha20-Poly1305 and a random 192-bit nonce.
 - Every seal and signature binds a context string such as `orbyn/record/v1` with a length prefix, so a value made for one purpose cannot be accepted as another.
-- A key handed to another device is wrapped with a one-time X25519 key and HKDF-SHA256 over both public keys; the wrap is bound to a label such as the zone id.
+- A key handed to another device is wrapped with a one-time X25519 key and HKDF-SHA256 over both public keys, bound to a label such as the zone id, and signed by the sending device. The receiver names the sender it trusts; a wrap from anyone else, the server included, is refused before it is opened.
+- Secret keys compare in constant time, and intermediate key bytes are wiped.
 - Devices sign changes with Ed25519, verified strictly.
 - The recovery key is 28 Crockford base32 characters (140 bits), turned into a key with Argon2id (64 MiB, 3 passes).
 - Secret types wipe themselves on drop and never print their bytes.

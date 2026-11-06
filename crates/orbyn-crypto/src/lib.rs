@@ -4,8 +4,9 @@
 //!   zone keys and service keys are all symmetric keys.
 //! - [`DeviceKeys`] is a device's identity: an Ed25519 key that signs its changes and
 //!   an X25519 key that other devices wrap keys to.
-//! - [`wrap_key`] and [`unwrap_key`] seal a symmetric key to a device's public key, so
-//!   one trusted device can hand a zone key to another.
+//! - [`wrap_key`] and [`unwrap_key`] seal a symmetric key to a device's public key and
+//!   sign it, so one trusted device can hand a zone key to another and the receiver
+//!   knows which device it came from.
 //! - [`RecoveryKey`] is the code a person saves for Advanced protection.
 //!
 //! Every operation binds a context string into the authenticated data, so a value
@@ -18,7 +19,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use hkdf::Hkdf;
 use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// Length of a nonce for XChaCha20-Poly1305.
 pub const NONCE_LEN: usize = 24;
@@ -47,8 +48,15 @@ fn random<const N: usize>() -> Result<[u8; N], CryptoError> {
 }
 
 /// A 256-bit key for XChaCha20-Poly1305. It is wiped from memory when dropped.
-#[derive(Clone, Zeroize, ZeroizeOnDrop, PartialEq, Eq)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct SymmetricKey([u8; 32]);
+
+impl PartialEq for SymmetricKey {
+    fn eq(&self, other: &Self) -> bool {
+        constant_time_eq(&self.0, &other.0)
+    }
+}
+impl Eq for SymmetricKey {}
 
 impl std::fmt::Debug for SymmetricKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -192,12 +200,17 @@ pub fn verify(
         .map_err(|_| CryptoError::Signature)
 }
 
-/// A symmetric key sealed to one device. Only that device can unwrap it.
+/// A symmetric key sealed to one device and signed by the device that sealed it.
+/// Only the recipient can open it, and it only opens when it was signed by the
+/// sender the recipient expects, so a server cannot slip a device a key of its
+/// own choosing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WrappedKey {
     /// The one-time public key used for this wrap.
     pub ephemeral: [u8; 32],
     pub sealed: Sealed,
+    /// The sending device's Ed25519 signature over the wrap.
+    pub signature: [u8; 64],
 }
 
 const WRAP_CONTEXT: &str = "orbyn/wrap/v1";
@@ -211,15 +224,35 @@ fn wrapping_key(
     salt[..32].copy_from_slice(ephemeral);
     salt[32..].copy_from_slice(recipient);
     let hk = Hkdf::<Sha256>::new(Some(&salt), shared);
-    let mut okm = [0u8; 32];
-    hk.expand(WRAP_CONTEXT.as_bytes(), &mut okm)
+    let mut okm = Zeroizing::new([0u8; 32]);
+    hk.expand(WRAP_CONTEXT.as_bytes(), okm.as_mut())
         .map_err(|_| CryptoError::Derive)?;
-    Ok(SymmetricKey(okm))
+    Ok(SymmetricKey(*okm))
 }
 
-/// Seals `key` to `recipient`, with `label` naming what it is (for example a zone
-/// id). The same label is needed to unwrap it.
+/// What the sender signs: everything that identifies the wrap, so no part can
+/// be swapped.
+fn wrap_transcript(
+    ephemeral: &[u8; 32],
+    recipient: &DevicePublic,
+    label: &[u8],
+    sealed: &Sealed,
+) -> Vec<u8> {
+    let mut out =
+        Vec::with_capacity(32 + 64 + 8 + label.len() + NONCE_LEN + sealed.ciphertext.len());
+    out.extend_from_slice(ephemeral);
+    out.extend_from_slice(&recipient.agreement);
+    out.extend_from_slice(&recipient.signing);
+    out.extend_from_slice(&(label.len() as u64).to_be_bytes());
+    out.extend_from_slice(label);
+    out.extend_from_slice(&sealed.to_bytes());
+    out
+}
+
+/// Seals `key` from `sender` to `recipient`, with `label` naming what it is (for
+/// example a zone id). The same label and sender are needed to unwrap it.
 pub fn wrap_key(
+    sender: &DeviceKeys,
     recipient: &DevicePublic,
     label: &[u8],
     key: &SymmetricKey,
@@ -232,30 +265,55 @@ pub fn wrap_key(
     }
     let wrap = wrapping_key(shared.as_bytes(), &ephemeral, &recipient.agreement)?;
     let sealed = wrap.seal(WRAP_CONTEXT, label, key.as_bytes())?;
-    Ok(WrappedKey { ephemeral, sealed })
+    let signature = sender.sign(
+        WRAP_CONTEXT,
+        &wrap_transcript(&ephemeral, recipient, label, &sealed),
+    );
+    Ok(WrappedKey {
+        ephemeral,
+        sealed,
+        signature,
+    })
 }
 
-/// Opens a key from [`wrap_key`] with this device's keys.
+/// Opens a key from [`wrap_key`] with this device's keys. `sender` is the device
+/// the caller trusts to have sent it, such as one already in the person's
+/// keychain; a wrap signed by anyone else is refused before it is opened.
 pub fn unwrap_key(
     device: &DeviceKeys,
+    sender: &DevicePublic,
     label: &[u8],
     wrapped: &WrappedKey,
 ) -> Result<SymmetricKey, CryptoError> {
-    let recipient = PublicKey::from(&device.agreement).to_bytes();
+    let me = device.public();
+    verify(
+        sender,
+        WRAP_CONTEXT,
+        &wrap_transcript(&wrapped.ephemeral, &me, label, &wrapped.sealed),
+        &wrapped.signature,
+    )?;
     let shared = device
         .agreement
         .diffie_hellman(&PublicKey::from(wrapped.ephemeral));
     if !shared.was_contributory() {
         return Err(CryptoError::InvalidKey);
     }
-    let wrap = wrapping_key(shared.as_bytes(), &wrapped.ephemeral, &recipient)?;
-    let mut bytes = wrap.open(WRAP_CONTEXT, label, &wrapped.sealed)?;
+    let wrap = wrapping_key(shared.as_bytes(), &wrapped.ephemeral, &me.agreement)?;
+    let bytes = Zeroizing::new(wrap.open(WRAP_CONTEXT, label, &wrapped.sealed)?);
     let key: [u8; 32] = bytes
         .as_slice()
         .try_into()
         .map_err(|_| CryptoError::InvalidKey)?;
-    bytes.zeroize();
     Ok(SymmetricKey(key))
+}
+
+/// Compares secret bytes in time that does not depend on where they differ.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let diff = a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y));
+    std::hint::black_box(diff) == 0
 }
 
 /// Crockford base32 without the letters I, L, O and U, so a code reads aloud cleanly.
@@ -263,8 +321,15 @@ const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 /// The recovery key a person saves when they turn on Advanced protection: 140
 /// random bits shown as 28 characters in groups of four.
-#[derive(Clone, Zeroize, ZeroizeOnDrop, PartialEq, Eq)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct RecoveryKey([u8; 28]);
+
+impl PartialEq for RecoveryKey {
+    fn eq(&self, other: &Self) -> bool {
+        constant_time_eq(&self.0, &other.0)
+    }
+}
+impl Eq for RecoveryKey {}
 
 impl std::fmt::Debug for RecoveryKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -318,11 +383,16 @@ impl RecoveryKey {
     pub fn derive(&self, salt: &[u8; 16]) -> Result<SymmetricKey, CryptoError> {
         let params = Params::new(64 * 1024, 3, 1, Some(32)).map_err(|_| CryptoError::Derive)?;
         let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-        let mut out = [0u8; 32];
+        let mut out = Zeroizing::new([0u8; 32]);
         argon
-            .hash_password_into(&self.0, salt, &mut out)
+            .hash_password_into(&self.0, salt, out.as_mut())
             .map_err(|_| CryptoError::Derive)?;
-        Ok(SymmetricKey(out))
+        Ok(SymmetricKey(*out))
+    }
+
+    /// A new random salt to store with the account for [`RecoveryKey::derive`].
+    pub fn new_salt() -> Result<[u8; 16], CryptoError> {
+        random()
     }
 }
 
@@ -406,18 +476,75 @@ mod tests {
         let laptop = DeviceKeys::generate()?;
         let phone = DeviceKeys::generate()?;
         let zone_key = SymmetricKey::generate()?;
-        let wrapped = wrap_key(&phone.public(), b"zone:groceries", &zone_key)?;
-        assert_eq!(unwrap_key(&phone, b"zone:groceries", &wrapped)?, zone_key);
+        let wrapped = wrap_key(&laptop, &phone.public(), b"zone:groceries", &zone_key)?;
         assert_eq!(
-            unwrap_key(&laptop, b"zone:groceries", &wrapped),
-            Err(CryptoError::Open)
+            unwrap_key(&phone, &laptop.public(), b"zone:groceries", &wrapped)?,
+            zone_key
         );
+        let tablet = DeviceKeys::generate()?;
+        assert!(unwrap_key(&tablet, &laptop.public(), b"zone:groceries", &wrapped).is_err());
+        assert!(unwrap_key(&phone, &laptop.public(), b"zone:work", &wrapped).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_wrap_from_an_untrusted_sender_is_refused() -> R {
+        // The server, or anyone with the phone's public key, wraps a key it chose.
+        let laptop = DeviceKeys::generate()?;
+        let phone = DeviceKeys::generate()?;
+        let attacker = DeviceKeys::generate()?;
+        let chosen = SymmetricKey::generate()?;
+        let forged = wrap_key(&attacker, &phone.public(), b"zone:groceries", &chosen)?;
         assert_eq!(
-            unwrap_key(&phone, b"zone:work", &wrapped),
-            Err(CryptoError::Open)
+            unwrap_key(&phone, &laptop.public(), b"zone:groceries", &forged),
+            Err(CryptoError::Signature)
+        );
+        // Re-signing someone else's wrap does not help either: any change to
+        // the signed parts breaks the laptop's signature.
+        let genuine = wrap_key(&laptop, &phone.public(), b"zone:groceries", &chosen)?;
+        let mut swapped = genuine.clone();
+        swapped.ephemeral = forged.ephemeral;
+        assert_eq!(
+            unwrap_key(&phone, &laptop.public(), b"zone:groceries", &swapped),
+            Err(CryptoError::Signature)
+        );
+        let mut changed = genuine;
+        changed.sealed.ciphertext[0] ^= 1;
+        assert_eq!(
+            unwrap_key(&phone, &laptop.public(), b"zone:groceries", &changed),
+            Err(CryptoError::Signature)
         );
         Ok(())
     }
+
+    #[test]
+    fn secret_keys_compare_by_value() -> R {
+        let a = SymmetricKey::from_bytes([1; 32]);
+        assert_eq!(a, SymmetricKey::from_bytes([1; 32]));
+        assert_ne!(a, SymmetricKey::from_bytes([2; 32]));
+        assert_eq!(RecoveryKey::new_salt()?.len(), 16);
+        Ok(())
+    }
+
+    #[test]
+    fn argon2_output_is_stable_across_versions() -> R {
+        // A known-answer vector: if a dependency update changes the derived key,
+        // every saved recovery key would stop working.
+        let key = RecoveryKey::parse("0123-4567-89AB-CDEF-GHJK-MNPQ-RSTV")?;
+        let derived = key.derive(&[0u8; 16])?;
+        let hex: String = derived
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(hex, EXPECTED_ARGON2);
+        Ok(())
+    }
+
+    /// Checked against the reference Argon2 implementation (argon2-cffi
+    /// `hash_secret_raw`, Argon2id, t=3, m=65536, p=1, 32 bytes).
+    const EXPECTED_ARGON2: &str =
+        "77e15945510e87b60ad1208c74903795e1c99cf5c75ebddcad43264516d00921";
 
     #[test]
     fn recovery_keys_show_in_groups_and_parse_back_leniently() -> R {
