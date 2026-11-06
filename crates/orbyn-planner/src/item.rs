@@ -51,23 +51,11 @@ pub struct ChecklistEntry {
     pub id: String,
     pub title: String,
     pub done: bool,
-    /// Position among the steps, smallest first. New steps go between their
-    /// neighbours ([`order_between`]), so inserting one changes only that step.
-    #[serde(default)]
-    pub order: i64,
-}
-
-/// The gap left between steps, so many inserts fit before orders run out.
-pub const ORDER_GAP: i64 = 1 << 20;
-
-/// An order between two neighbouring steps (`None` for the ends of the list).
-pub fn order_between(before: Option<i64>, after: Option<i64>) -> i64 {
-    match (before, after) {
-        (None, None) => 0,
-        (Some(b), None) => b.saturating_add(ORDER_GAP),
-        (None, Some(a)) => a.saturating_sub(ORDER_GAP),
-        (Some(b), Some(a)) => b + (a - b) / 2,
-    }
+    /// Position among the steps, as a fractional key ([`crate::order`]): a new
+    /// step gets a key between its neighbours, so inserting one changes only
+    /// that step. Two devices inserting in the same place may pick the same key;
+    /// the id breaks that tie the same way everywhere.
+    pub order: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,7 +156,11 @@ impl Item {
                 .map_err(|_| ItemError::Invalid("repeat"))?;
         }
         let mut ids = std::collections::BTreeSet::new();
-        if !self.checklist.iter().all(|e| ids.insert(e.id.as_str())) {
+        let steps_ok = self
+            .checklist
+            .iter()
+            .all(|e| ids.insert(e.id.as_str()) && crate::order::is_valid_key(&e.order));
+        if !steps_ok {
             return Err(ItemError::Invalid("checklist"));
         }
         Ok(())
@@ -253,6 +245,8 @@ impl Item {
             out.push((format!("{base}.title"), json(&entry.title)));
             out.push((format!("{base}.done"), json(&entry.done)));
             out.push((format!("{base}.order"), json(&entry.order)));
+            // Written every time, so restoring a deleted step undoes `.removed`.
+            out.push((format!("{base}.removed"), serde_json::Value::Bool(false)));
         }
         match &self.repeat {
             Some(series) => {
@@ -329,21 +323,20 @@ impl Item {
             })
             .collect();
         checklist.sort_by(|a, b| a.order.cmp(&b.order).then_with(|| a.id.cmp(&b.id)));
-        let repeat: Option<Series> =
-            optional::<Option<Series>>(fields, "repeat")?
-                .flatten()
-                .map(|mut series| {
-                    // Skips live in their own fields; a skip written inside the rule by
-                    // an older writer still counts unless a field unskipped it.
-                    for (day, skip) in &skips {
-                        if *skip {
-                            series.skipped.insert(*day);
-                        } else {
-                            series.skipped.remove(day);
-                        }
-                    }
-                    series
-                });
+        let repeat: Option<Series> = match optional::<Option<Series>>(fields, "repeat")?.flatten() {
+            // Skips live only in their own fields; a rule carrying them inline
+            // would lose them on the next edit, so it is refused.
+            Some(series) if !series.skipped.is_empty() => return Err(ItemError::Invalid("repeat")),
+            Some(mut series) => {
+                series.skipped = skips
+                    .iter()
+                    .filter(|(_, skip)| **skip)
+                    .map(|(day, _)| *day)
+                    .collect();
+                Some(series)
+            }
+            None => None,
+        };
         let mut due: Option<Due> = optional(fields, "due")?.flatten();
         if let Some(series) = &repeat {
             due = roll_into_series(due, series);
@@ -373,20 +366,21 @@ const SKIP_PREFIX: &str = "repeat.skip.";
 struct StepFields {
     title: Option<String>,
     done: bool,
-    order: i64,
+    order: String,
     removed: bool,
 }
 
 /// A repeating item's due date is its current occurrence. When merged edits
-/// leave it before the series start (one device moved the series while another
-/// completed an occurrence), it moves to the first occurrence instead of making
-/// the record unreadable. The time of day is kept.
+/// leave it before the series start or on a date the rule no longer falls on
+/// (one device moved the series while another completed an occurrence), it
+/// moves to the next occurrence instead of making the record unreadable. The
+/// time of day is kept.
 fn roll_into_series(due: Option<Due>, series: &Series) -> Option<Due> {
-    let needs_roll = due.is_none_or(|d| d.date() < series.start);
-    if !needs_roll {
+    let from = due.map_or(series.start, |d| d.date().max(series.start));
+    if due.is_some_and(|d| d.date() == from && series.is_occurrence(from)) {
         return due;
     }
-    let Some(first) = series.next_on_or_after(series.start) else {
+    let Some(first) = series.next_on_or_after(from) else {
         return due;
     };
     Some(match due {
@@ -466,7 +460,7 @@ mod tests {
             id: "c1".into(),
             title: "Call".into(),
             done: false,
-            order: 0,
+            order: "V".into(),
         });
         let fields = task.to_fields(stamp(1, 1));
         assert_eq!(Item::from_fields("t1", &fields)?, task);
@@ -545,7 +539,7 @@ mod tests {
             id: "a".into(),
             title: "Passports".into(),
             done: false,
-            order: 0,
+            order: "V".into(),
         });
         let fields = base.to_fields(stamp(1, 1));
         let mut on_phone = base.clone();
@@ -553,7 +547,7 @@ mod tests {
             id: "b".into(),
             title: "Tickets".into(),
             done: false,
-            order: ORDER_GAP,
+            order: "k".into(),
         });
         let mut on_laptop = base.clone();
         on_laptop.checklist.clear();
@@ -561,7 +555,7 @@ mod tests {
             id: "c".into(),
             title: "Charger".into(),
             done: false,
-            order: 0,
+            order: "V".into(),
         });
         let phone = merge(&fields, &on_phone.changed_fields(&base, stamp(2, 1)));
         let laptop = merge(&fields, &on_laptop.changed_fields(&base, stamp(3, 2)));
@@ -625,19 +619,19 @@ mod tests {
             id: "a".into(),
             title: "Passports".into(),
             done: false,
-            order: 0,
+            order: "V".into(),
         });
         base.checklist.push(ChecklistEntry {
             id: "b".into(),
             title: "Tickets".into(),
             done: false,
-            order: ORDER_GAP,
+            order: "k".into(),
         });
         let fields = base.to_fields(stamp(1, 1));
         let mut ticked = base.clone();
         ticked.checklist[1].done = true;
         let mut inserted = base.clone();
-        let top = order_between(None, Some(0));
+        let top = crate::order::key_between(None, Some("V")).expect("key");
         inserted.checklist.insert(
             0,
             ChecklistEntry {
@@ -667,7 +661,7 @@ mod tests {
                 id: "a".into(),
                 title: "x".into(),
                 done: false,
-                order: 0,
+                order: "V".into(),
             });
         }
         assert_eq!(task.validate(), Err(ItemError::Invalid("checklist")));
@@ -675,10 +669,100 @@ mod tests {
     }
 
     #[test]
-    fn orders_fit_between_neighbours() {
-        assert_eq!(order_between(None, None), 0);
-        assert!(order_between(Some(0), Some(ORDER_GAP)) > 0);
-        assert!(order_between(None, Some(0)) < 0);
-        assert!(order_between(Some(5), None) > 5);
+    fn undoing_a_step_delete_brings_it_back() -> Result<(), ItemError> {
+        let mut base = Item::task("t1", "Trip", "home")?;
+        base.checklist.push(ChecklistEntry {
+            id: "a".into(),
+            title: "Passports".into(),
+            done: false,
+            order: "V".into(),
+        });
+        let mut fields = base.to_fields(stamp(1, 1));
+        let mut deleted = base.clone();
+        deleted.checklist.clear();
+        fields = merge(&fields, &deleted.changed_fields(&base, stamp(2, 1)));
+        assert!(Item::from_fields("t1", &fields)?.checklist.is_empty());
+        fields = merge(&fields, &base.changed_fields(&deleted, stamp(3, 1)));
+        assert_eq!(Item::from_fields("t1", &fields)?.checklist, base.checklist);
+        Ok(())
+    }
+
+    #[test]
+    fn many_steps_inserted_in_one_place_keep_their_order() -> Result<(), ItemError> {
+        let mut task = Item::task("t1", "Trip", "home")?;
+        let a = crate::order::key_between(None, None).expect("key");
+        let b = crate::order::key_between(Some(&a), None).expect("key");
+        task.checklist.push(ChecklistEntry {
+            id: "a".into(),
+            title: "first".into(),
+            done: false,
+            order: a.clone(),
+        });
+        task.checklist.push(ChecklistEntry {
+            id: "b".into(),
+            title: "last".into(),
+            done: false,
+            order: b.clone(),
+        });
+        // Each new step goes right after "a", so the newest sits second.
+        for n in 0..40 {
+            let next = task.checklist[1].order.clone();
+            let key = crate::order::key_between(Some(&a), Some(&next)).expect("key");
+            task.checklist.insert(
+                1,
+                ChecklistEntry {
+                    id: format!("0x{n:02}"),
+                    title: format!("{n}"),
+                    done: false,
+                    order: key,
+                },
+            );
+        }
+        let read = Item::from_fields("t1", &task.to_fields(stamp(1, 1)))?;
+        assert_eq!(read.checklist, task.checklist);
+        assert_eq!(read.checklist.first().map(|e| e.id.as_str()), Some("a"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_rule_carrying_inline_skips_is_refused() {
+        let mut fields = weekly_task().to_fields(stamp(1, 1));
+        let inline = serde_json::json!({"start":"2026-11-09","repeat":{"frequency":"weekly","interval":1,"weekdays":["mon"],"end":{"type":"never","value":null}},"skipped":["2026-11-16"]});
+        fields.set("repeat", inline, stamp(2, 1));
+        assert_eq!(
+            Item::from_fields("t1", &fields).err(),
+            Some(ItemError::Invalid("repeat"))
+        );
+    }
+
+    #[test]
+    fn a_due_date_off_the_moved_rule_rolls_to_its_next_occurrence() -> Result<(), ItemError> {
+        let base = weekly_task(); // Mondays from 11-09
+        let fields = base.to_fields(stamp(1, 1));
+        let mut moved = base.clone();
+        let mut rule = crate::Repeat::every(crate::Frequency::Weekly);
+        rule.weekdays = vec![crate::Day::Tue];
+        moved.repeat = Some(Series::new(date(2026, 11, 10), rule).expect("series"));
+        moved.due = Some(Due::Date(date(2026, 11, 10)));
+        let mut completed = base.clone();
+        completed.due = Some(Due::Date(date(2026, 11, 16)));
+        let a = merge(&fields, &moved.changed_fields(&base, stamp(2, 1)));
+        let b = merge(&fields, &completed.changed_fields(&base, stamp(3, 2)));
+        let merged = Item::from_fields("t1", &merge(&a, &b))?;
+        assert_eq!(merged.due, Some(Due::Date(date(2026, 11, 17))));
+        Ok(())
+    }
+
+    #[test]
+    fn a_step_with_a_bad_order_key_is_refused() -> Result<(), ItemError> {
+        let mut task = Item::task("t1", "Trip", "home")?;
+        task.checklist.push(ChecklistEntry {
+            id: "a".into(),
+            title: "x".into(),
+            done: false,
+            order: String::new(),
+        });
+        assert_eq!(task.validate(), Err(ItemError::Invalid("checklist")));
+        Ok(())
     }
 }
