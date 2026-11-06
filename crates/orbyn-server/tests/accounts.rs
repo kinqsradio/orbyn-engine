@@ -522,7 +522,8 @@ async fn sign_up_cannot_take_an_email_twice() {
 async fn sign_in_attempts_are_limited_per_email_and_per_address() {
     let _turn = TURN.lock().await;
     let server = server_with(Limits {
-        login_per_email: Limit::new(3, Duration::from_secs(60)),
+        login_per_email_and_ip: Limit::new(3, Duration::from_secs(60)),
+        login_failures_per_email: Limit::new(100, Duration::from_secs(60)),
         login_per_ip: Limit::new(8, Duration::from_secs(60)),
         ..Limits::default()
     })
@@ -558,6 +559,43 @@ async fn sign_in_attempts_are_limited_per_email_and_per_address() {
             Some(json!({"email": email(), "credential_request": b64(&request)})),
         )
         .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn knowing_an_email_is_not_enough_to_lock_its_owner_out() {
+    let _turn = TURN.lock().await;
+    let server = server_with(Limits {
+        login_per_email_and_ip: Limit::new(3, Duration::from_secs(60)),
+        login_failures_per_email: Limit::new(100, Duration::from_secs(60)),
+        login_per_ip: Limit::new(100, Duration::from_secs(60)),
+        ..Limits::default()
+    })
+    .await;
+    let victim = email();
+    server
+        .register(&victim, b"pw", &DeviceKeys::generate().expect("keys"))
+        .await;
+    // Someone floods sign-in starts for the victim's email from many addresses,
+    // well past the limit, including refused requests.
+    for _ in 0..4 {
+        let attacker = random_ip();
+        for _ in 0..6 {
+            let (_, request) = auth::start_login(b"guess").expect("start");
+            server
+                .call_from(
+                    attacker,
+                    Method::POST,
+                    "/v1/sessions/login/start",
+                    None,
+                    Some(json!({"email": victim, "credential_request": b64(&request)})),
+                )
+                .await;
+        }
+    }
+    // The owner, from their own address, can still sign in.
+    let (_, status, _) = server.login_start(&victim, b"pw").await;
     assert_eq!(status, StatusCode::OK);
 }
 
@@ -900,7 +938,7 @@ async fn the_audit_log_records_actions_without_addresses_or_emails() {
 async fn approval_codes_are_limited_per_account() {
     let _turn = TURN.lock().await;
     let server = server_with(Limits {
-        approval_code_per_account: Limit::new(2, Duration::from_secs(60)),
+        approval_code_per_device: Limit::new(2, Duration::from_secs(60)),
         ..Limits::default()
     })
     .await;

@@ -249,15 +249,17 @@ impl Accounts {
         approval_id: Uuid,
         code: &str,
     ) -> Result<Device> {
-        let account_subject = self
+        // Counted per pending device, so one device cannot use up the tries of
+        // another device waiting on the same account.
+        let device_subject = self
             .secrets
-            .digest("approval-account", session.account_id.as_bytes());
+            .digest("approval-device", session.device_id.as_bytes());
         let ip_subject = self.ip_digest(client);
         let by_account = limits::allow(
             &self.pool,
             "approval-code",
-            &account_subject,
-            self.limits.approval_code_per_account,
+            &device_subject,
+            self.limits.approval_code_per_device,
         )
         .await?;
         let by_ip = limits::allow(

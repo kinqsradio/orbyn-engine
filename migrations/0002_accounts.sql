@@ -53,9 +53,11 @@ CREATE INDEX sessions_account ON sessions (account_id) WHERE revoked_at IS NULL;
 -- table does not let anyone finish someone else's sign-in. account_id is NULL
 -- when the email has no account; the answer looks the same either way.
 CREATE TABLE login_states (
-    id         uuid        PRIMARY KEY,
-    account_id uuid        REFERENCES accounts (id) ON DELETE CASCADE,
-    sealed     bytea       NOT NULL,
+    id            uuid        PRIMARY KEY,
+    account_id    uuid        REFERENCES accounts (id) ON DELETE CASCADE,
+    -- Keyed digest of the email, so a failed finish counts against it.
+    email_subject bytea       NOT NULL CHECK (length(email_subject) = 32),
+    sealed        bytea       NOT NULL,
     expires_at timestamptz NOT NULL
 );
 

@@ -96,6 +96,23 @@ pub enum Platform {
     Linux,
 }
 
+/// The most devices an account may have waiting for approval at once.
+const MAX_PENDING_DEVICES: i64 = 20;
+
+/// The sealed sign-in state is bound to its id and to the account it was made
+/// for, so moving it to another account's row makes it fail to open.
+fn login_state_aad(login_id: Uuid, account_id: Option<Uuid>) -> Vec<u8> {
+    let mut aad = login_id.as_bytes().to_vec();
+    match account_id {
+        Some(id) => {
+            aad.push(1);
+            aad.extend_from_slice(id.as_bytes());
+        }
+        None => aad.push(0),
+    }
+    aad
+}
+
 impl Platform {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -432,13 +449,24 @@ impl Accounts {
         let email = normalize_email(email).ok_or(AccountError::InvalidEmail)?;
         let email_subject = self.secrets.digest("login-email", email.as_bytes());
         let ip_subject = self.ip_digest(client);
-        let by_email = limits::allow(
+        let mut pair = email_subject.to_vec();
+        pair.extend_from_slice(&ip_subject);
+        let pair_subject = self.secrets.digest("login-email-ip", &pair);
+        let failures_ok = limits::under(
             &self.pool,
-            "login",
+            "login-failed",
             &email_subject,
-            self.limits.login_per_email,
+            self.limits.login_failures_per_email,
         )
         .await?;
+        let by_email = failures_ok
+            && limits::allow(
+                &self.pool,
+                "login",
+                &pair_subject,
+                self.limits.login_per_email_and_ip,
+            )
+            .await?;
         let by_ip = limits::allow(
             &self.pool,
             "login-ip",
@@ -449,7 +477,6 @@ impl Accounts {
         if !(by_email && by_ip) {
             return Err(AccountError::TooManyAttempts);
         }
-        limits::prune(&self.pool).await?;
         let request = CredentialRequest::<Suite>::deserialize(request)
             .map_err(|_| AccountError::InvalidRequest)?;
 
@@ -486,14 +513,19 @@ impl Accounts {
         let sealed = self
             .secrets
             .state_key()
-            .seal(LOGIN_STATE_CONTEXT, login_id.as_bytes(), &state)
+            .seal(
+                LOGIN_STATE_CONTEXT,
+                &login_state_aad(login_id, account_id),
+                &state,
+            )
             .map_err(|_| AccountError::Internal)?;
         sqlx::query(
-            "INSERT INTO login_states (id, account_id, sealed, expires_at)
-             VALUES ($1, $2, $3, now() + make_interval(secs => $4))",
+            "INSERT INTO login_states (id, account_id, email_subject, sealed, expires_at)
+             VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5))",
         )
         .bind(login_id)
         .bind(account_id)
+        .bind(email_subject.as_slice())
         .bind(sealed.to_bytes())
         .bind(LOGIN_STATE_TTL.as_secs_f64())
         .execute(&self.pool)
@@ -517,19 +549,21 @@ impl Accounts {
     ) -> Result<NewSession> {
         let name = device.checked_name()?;
         // Taken and deleted at once: a sign-in state is used at most once.
-        let row: Option<(Option<Uuid>, Vec<u8>)> = sqlx::query_as(
+        let row: Option<(Option<Uuid>, Vec<u8>, Vec<u8>)> = sqlx::query_as(
             "DELETE FROM login_states WHERE id = $1 AND expires_at > now()
-             RETURNING account_id, sealed",
+             RETURNING account_id, email_subject, sealed",
         )
         .bind(login_id)
         .fetch_optional(&self.pool)
         .await?;
-        let (account_id, sealed) = row.ok_or(AccountError::LoginFailed)?;
+        let (account_id, email_subject, sealed) = row.ok_or(AccountError::LoginFailed)?;
         let state = Sealed::from_bytes(&sealed)
             .and_then(|sealed| {
-                self.secrets
-                    .state_key()
-                    .open(LOGIN_STATE_CONTEXT, login_id.as_bytes(), &sealed)
+                self.secrets.state_key().open(
+                    LOGIN_STATE_CONTEXT,
+                    &login_state_aad(login_id, account_id),
+                    &sealed,
+                )
             })
             .map(zeroize::Zeroizing::new)
             .map_err(|_| AccountError::LoginFailed)?;
@@ -552,6 +586,9 @@ impl Accounts {
         let account_id = match (verified, account_id) {
             (true, Some(id)) => id,
             (_, account_id) => {
+                if let Ok(subject) = <[u8; 32]>::try_from(email_subject.as_slice()) {
+                    limits::record(&self.pool, "login-failed", &subject).await?;
+                }
                 self.audit(
                     &self.pool,
                     client,
@@ -588,6 +625,15 @@ impl Accounts {
                 (id, DeviceState::parse(&state)?)
             }
             None => {
+                let pending: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM devices WHERE account_id = $1 AND state = 'pending'",
+                )
+                .bind(account_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                if pending >= MAX_PENDING_DEVICES {
+                    return Err(AccountError::TooManyAttempts);
+                }
                 let id = Uuid::new_v4();
                 sqlx::query(
                     "INSERT INTO devices (id, account_id, name, platform, signing_key, agreement_key, state)

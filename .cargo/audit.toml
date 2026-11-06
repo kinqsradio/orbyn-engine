@@ -1,0 +1,12 @@
+# Advisories we have checked and judged unreachable. Each needs a reason and an
+# exit condition; docs/architecture.md repeats them.
+[advisories]
+ignore = [
+    # crypto-bigint 0.5.5 timing variability. Reached only through opaque-ke 4.0.1
+    # -> voprf/elliptic-curve, whose group code is generic over NIST-style
+    # curves (CurveArithmetic). Our ciphersuite is Ristretto255 on
+    # curve25519-dalek, and no NIST curve crate is in the build (checked with
+    # `cargo tree`), so no crypto-bigint arithmetic runs. Remove once opaque-ke
+    # depends on crypto-bigint >= 0.7.6.
+    "RUSTSEC-2026-0387",
+]
