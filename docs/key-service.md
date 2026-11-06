@@ -53,16 +53,22 @@ If the old phone turns up during the wait, it shows "Someone is recovering your 
 
 The key service runs as its own container with:
 
-- its own Postgres role and schema, which the record server cannot write;
+- its own Postgres instance, whose credentials neither the record server nor its database operators hold;
 - its own HSM credentials;
 - one internal API reachable only from `orbyn-server`, authenticated with mutual TLS.
 
-It keeps its own copy of each recovery's start time, so a changed row in the record server's database cannot move the 72 hours.
+It does not trust its own rows for time. A recovery's 72 hours are measured from the time in the first witness-cosigned log head that includes the start (see *Transparency log*). Neither a back-dated row nor a host clock set forward can shorten the wait: the witness signs its own time, and an entry without such a head has no start time at all.
 
 ## Protection level is signed by the person's devices
 
-- **The setting.** A trusted device signs `orbyn/protection/v1` over the account, the level (`standard` or `advanced`) and a sequence number. The server stores the newest one and returns it. Devices verify it against devices they trust and keep the highest sequence they have seen.
-- **When devices escrow.** A device sends service envelopes only when the newest setting it has verified says Standard. A server that reports a different level, or a setting no trusted device signed, changes nothing.
+- **The setting.** A trusted device signs `orbyn/protection/v1` over:
+  - the account and the level (`standard` or `advanced`);
+  - a sequence number;
+  - the hash of the previous setting, so the settings form a chain.
+
+  The server stores the chain and returns its head. Devices verify each link against devices they trust and keep the highest sequence they have seen.
+- **New devices learn it from their approver.** The approver puts its current signed setting (hash and sequence) inside the signed approval endorsement, so a new device starts from the approver's view. It accepts no setting older than that, which means an old genuine Standard setting replayed after a switch to Advanced is refused.
+- **When devices escrow.** A device sends service envelopes only when the newest setting it has verified says Standard. **No verified setting means no escrow.** A server that reports a different level, or a setting no trusted device signed, changes nothing.
 - **New accounts.** The first device signs Standard at sign-up.
 - **Accounts that exist before this release.** They stay device-only. They move to Standard only when the person turns it on from a trusted device, which signs the setting. Until then, no backfill runs for them.
 - **Advanced to Standard.** Moving back is an explicit action on a trusted device, never automatic.
@@ -130,10 +136,12 @@ none ─start→ waiting_for_email ─code→ waiting (72 h) ─time→ ready �
 
 `POST /v1/recovery/{id}/email {code}`.
 
-- `orbyn-core` asks the key service to start the recovery, and the key service:
-  - records the start time on its own clock;
-  - appends a log entry (`orbyn/recovery-start/v1`: account, recovery id, device id and keys, start time);
-  - returns the signed log head.
+- `orbyn-core` asks the key service to start the recovery. The key service:
+  - appends a log entry (`orbyn/recovery-start/v1`: account digest, recovery id, device id and keys);
+  - waits for the next head the witnesses cosign;
+  - returns that head with the inclusion proof.
+
+  The cosigned head's time is the start time.
 - Every trusted device is shown the recovery: on the device list, by silent push when push exists, and in the log, which devices check (see *Transparency log*).
 - An email goes out, and the worker sends a reminder 24 hours before the end.
 
@@ -149,21 +157,29 @@ none ─start→ waiting_for_email ─code→ waiting (72 h) ─time→ ready �
 `POST /v1/recovery/{id}/finish` from the starting device.
 
 1. **The key service decides.** It refuses unless both hold:
-   - its own record shows a logged start at least 72 hours old on its own clock;
+   - the start's first cosigned head is at least 72 hours older than the newest cosigned head;
    - its log has no cancel for that start.
-2. **The claim is atomic.** `ready` → `finishing` is a compare-and-set in the key service's store, and cancel refuses `finishing`. A cancel that arrives first wins, and a cancel that arrives after the claim is refused with `recovery_finishing`.
-3. **The account changes in one transaction.** In `orbyn-core`, under the account lock:
-   - check that the device is still pending with the same keys;
-   - collect every device trusted at that moment, including any approved during the wait;
+2. **The claim is atomic.** `ready` → `finishing` is a compare-and-set in the key service's store, and cancel refuses `finishing`. A cancel that arrives first wins; one that arrives after the claim is refused with `recovery_finishing`.
+3. **The key service seals first and changes no account.** `orbyn-core` gives it the account's trusted devices under the account lock, and the key service then:
+   - opens the account's service envelopes one at a time (see *Opening one*) and seals each to the device, signed by the current service identity;
+   - signs a recovery approval (`orbyn/service-recovery/v1`: account, recovery id, device id and keys, the removed device ids);
+   - appends a finish entry;
+   - stores the result (envelopes, approval, cosigned head) under the recovery id, and only then moves to `sealed`.
+
+   Until `sealed`, no device has been touched.
+4. **The account changes last, in one idempotent transaction.** In `orbyn-core`, under the account lock:
+   - check that the device is still pending with the same keys, and that the trusted devices are the ones the approval names. A device approved since step 3 makes the key service seal again;
    - mark the recovered device trusted, approved by the service;
-   - mark the collected devices removed and end their sessions.
-4. **The key service seals.** It opens the account's service envelopes one at a time (see *Opening one*) and seals each to the device, signed by the current service identity.
-   - It signs a recovery approval (`orbyn/service-recovery/v1`: account, recovery id, device id and keys, the removed device ids).
-   - It appends a finish entry to the log.
-   - It stores the result (envelopes, approval, log head) under the recovery id.
+   - mark the named devices removed and end their sessions;
+   - store the envelopes.
+
+   Running it again after it committed changes nothing.
 5. **Replays.** A repeated finish returns the stored result without opening the HSM again.
-   - An HSM error before the result is stored leaves the state `finishing`. A retry resumes from there, and the account transaction is not repeated.
-6. **Rotation afterwards.** Before uploading anything, the recovered device rotates every zone key. It sends envelopes only to itself and, while Standard, to the service. A removed device keeps the old keys but cannot read anything written after the rotation.
+6. **Stuck in `finishing`.** If sealing keeps failing (HSM down, KEK lost), `finishing` moves back to `ready` after 24 hours. Cancel then works as usual, and a cancel always works before `sealed`. After `sealed` the recovery can only complete, because the old devices are still untouched and keep working until step 4 commits.
+7. **Rotation afterwards.**
+   - Before uploading anything, the recovered device rotates every zone key, sending envelopes only to itself and, while Standard, to the service.
+   - The server refuses the recovered device's record uploads under a zone key created before the finish, until that zone is rotated.
+   - A removed device keeps the old keys but cannot read anything written after the rotation.
 
 ### What devices trust
 
@@ -184,12 +200,19 @@ none ─start→ waiting_for_email ─code→ waiting (72 h) ─time→ ready �
   - recovery starts, cancels and finishes;
   - service-key certifications;
   - identity and KEK rotations.
-- **Signed heads.** Each entry names the account by a keyed digest, and the current identity signs the log head.
-- **Checks devices make.** A trusted device fetches the head on every sync and, once a day, the entries for its account digest, and checks:
-  - that the head is consistent with the last one it saw;
-  - that no recovery or certification for its account is unknown to it.
-- **What a finding means.** A recovery or a key it did not see through the normal flow is shown to the person as a possible takeover.
-- **Its limit.** The log catches a recovery hidden from the device list. It cannot catch an operator who reads keys without any recovery. For that, the off-machine audit and the HSM roles below are the control.
+- **A map, not only a list.** As in key-transparency systems, the log is two parts:
+  - an append-only Merkle log of entries;
+  - a verifiable map from account digest to that account's own hash chain of entries.
+
+  Devices ask for their account's lookup proof. It proves the full chain for the account, or proves there is none, so "nothing for your account" can be checked, not just asserted.
+- **The account digest.** It is HMAC-SHA256 under a key that the account's own devices create at sign-up and share through the keychain. The key service learns the digest, never the key, so the map does not list accounts by id. A recovered device gets the key with the zone keys.
+- **Signed heads.** Heads carry the time, the log size and root, and the map root. They are signed by a **log key** kept apart from the service identities, then **cosigned by at least one independent witness**. A witness checks consistency with the last head it signed and refuses to sign a fork. Production needs one witness run by someone other than Orbyn; who that is is an open decision. Self-hosters may run their own.
+- **Freshness.** A device refuses a head older than 24 hours, or one that is not consistent with the last head it saw.
+- **Gossip between devices.** Each device writes the last head it verified into a record in a private system zone, so the account's other devices read it encrypted. A device that sees another device's head inconsistent with its own has found a fork and warns.
+- **Checks devices make.** On every sync, and at least daily, a trusted device fetches the newest head, checks it is fresh, consistent and cosigned, then checks its account's lookup proof. It verifies that every recovery and certification in its chain is one it knew of through the normal flow.
+- **What a finding means.** An unknown recovery or key, a fork, or a stale head is shown to the person as a possible takeover.
+- **Availability.** A failed head fetch never blocks sync. The device retries, and after 48 hours without a fresh head it warns that the log cannot be checked.
+- **Its limit.** The log catches a recovery hidden from the device list. It cannot catch an operator who reads keys without any recovery; the off-machine audit and the HSM roles below are the control for that.
 
 ## Audit and HSM access
 
@@ -207,7 +230,7 @@ none ─start→ waiting_for_email ─code→ waiting (72 h) ─time→ ready �
 
 - **Finish after an unknown result.** It is idempotent through the stored result.
 - **HSM error during finish.** The state stays `finishing` and a retry resumes it.
-- **Stale device.** If the starting device was removed, or its keys changed, finish answers `recovery_device_changed`, and the key service appends a cancel.
+- **Stale device.** If the starting device was removed, or its keys changed, before `sealed`, finish answers `recovery_device_changed` and the key service appends a cancel. After `sealed`, step 4 refuses, and the recovery is cancelled the same way, because no account change has been made.
 - **Key service down.** Recovery and escrow pause, and clients retry service envelopes later. Sign-in, sync and approvals do not depend on the key service.
 - **Lost KEK.** Recovery is impossible until it is restored. HSM backups are held apart from Postgres backups (phase 8).
 
@@ -220,7 +243,7 @@ none ─start→ waiting_for_email ─code→ waiting (72 h) ─time→ ready �
   - `ORBYN_HSM_MODULE`, `ORBYN_HSM_SLOT`, `ORBYN_HSM_PIN` (a secret);
   - the key service URL and mutual TLS settings, in `orbyn-server`;
   - `orbyn keyservice init`, which makes the KEK and the first identity and prints the identity public key for client configuration.
-- **Without a key service configured**, recovery is off: `/v1/recovery` answers 503, and new accounts' first devices sign the setting as Standard but send no service envelopes until a service key exists.
+- **Without a key service configured**, recovery is off: `/v1/recovery` answers 503, and new accounts' first devices sign the setting as Standard but send no service envelopes until a service key exists. When a self-hoster adds a key service later, escrow starts through backfill, and the planner tells the person when it begins, naming the key service.
 
 ## Order of work
 
