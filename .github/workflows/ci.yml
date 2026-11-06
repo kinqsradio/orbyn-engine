@@ -44,7 +44,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace -- --include-ignored
       - name: Device crates build for the web
-        run: cargo check -p orbyn-crypto -p orbyn-sync -p orbyn-planner -p orbyn-contracts -p orbyn-auth-client --target wasm32-unknown-unknown
+        run: cargo check -p orbyn-crypto -p orbyn-sync -p orbyn-planner -p orbyn-contracts -p orbyn-auth-client -p orbyn-client -p orbyn-wasm --target wasm32-unknown-unknown
       - name: Generated wire types are committed
         run: |
           git add --intent-to-add crates/orbyn-contracts/bindings

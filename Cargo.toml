@@ -50,6 +50,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "json", "ansi"] }
 ts-rs = "12"
 uuid = { version = "1", features = ["v4", "serde"] }
+# MIT OR Apache-2.0. Only orbyn-wasm uses it.
+wasm-bindgen = "0.2.100"
 x25519-dalek = { version = "3", default-features = false, features = ["precomputed-tables", "static_secrets", "zeroize"] }
 zeroize = { version = "1", features = ["derive"] }
 

@@ -22,6 +22,7 @@ The plan lives in the [Orbyn platform plan](https://claude.ai/artifact/BBhxZSmXR
 | `orbyn-sync` | Hybrid logical clocks and field-by-field merge | Devices |
 | `orbyn-planner` | Tasks, events, lists, repeat rules and their record fields | Devices |
 | `orbyn-client` | The device sync engine: record encryption, uploads, merging incoming changes, zone keys and envelopes. No IO | Devices (native and WebAssembly) |
+| `orbyn-wasm` | JavaScript bindings (wasm-bindgen) for sign-in, device keys and the sync engine | The web |
 | `orbyn-core` | Configuration, Postgres, migrations, job queue, accounts and devices | Server |
 | `orbyn-store` | The CloudKit-style record store: zones, encrypted records, change tokens, uploads, live notices | Server |
 | `orbyn-server` | HTTP API and the `/v1/sync` WebSocket | Server |
