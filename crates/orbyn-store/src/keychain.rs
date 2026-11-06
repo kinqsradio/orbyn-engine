@@ -11,6 +11,9 @@ use uuid::Uuid;
 /// Length of a zone key id.
 pub const KEY_ID_LEN: usize = 16;
 
+/// sender, zone, key id, envelope, created at.
+type EnvelopeRow = (Uuid, String, Vec<u8>, Vec<u8>, DateTime<Utc>);
+
 /// An envelope a device sends.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewEnvelope {
@@ -111,7 +114,7 @@ impl Store {
     /// trusted device of the account, oldest first.
     pub async fn list_envelopes(&self, session: &Session) -> Result<Vec<Envelope>> {
         require_trusted(&self.pool, session, false).await?;
-        let rows: Vec<(Uuid, String, Vec<u8>, Vec<u8>, DateTime<Utc>)> = sqlx::query_as(
+        let rows: Vec<EnvelopeRow> = sqlx::query_as(
             "SELECT e.sender_device_id, e.zone, e.key_id, e.envelope, e.created_at
              FROM key_envelopes e JOIN devices s ON s.id = e.sender_device_id
              WHERE e.recipient_device_id = $1 AND e.account_id = $2
