@@ -48,7 +48,10 @@ struct AddressSlot([u8; 16]);
 impl AddressSlot {
     fn take(ip: Option<std::net::IpAddr>) -> Option<Self> {
         let key = address_key(ip);
-        let mut guard = WAITING.lock().ok()?;
+        // A poisoned lock still holds valid counts; never refuse forever.
+        let mut guard = WAITING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let map = guard.get_or_insert_with(Default::default);
         let count = map.entry(key).or_insert(0);
         if *count >= WAITING_PER_ADDRESS {
@@ -61,8 +64,10 @@ impl AddressSlot {
 
 impl Drop for AddressSlot {
     fn drop(&mut self) {
-        if let Ok(mut guard) = WAITING.lock()
-            && let Some(map) = guard.as_mut()
+        let mut guard = WAITING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(map) = guard.as_mut()
             && let Some(count) = map.get_mut(&self.0)
         {
             *count = count.saturating_sub(1);
@@ -77,6 +82,9 @@ impl Drop for AddressSlot {
 fn address_key(ip: Option<std::net::IpAddr>) -> [u8; 16] {
     match ip {
         Some(std::net::IpAddr::V4(v4)) => v4.to_ipv6_mapped().octets(),
+        // An IPv4 client on a dual-stack socket or behind a proxy arrives as
+        // ::ffff:a.b.c.d; count it as the IPv4 address it is.
+        Some(std::net::IpAddr::V6(v6)) if v6.to_ipv4_mapped().is_some() => v6.octets(),
         Some(std::net::IpAddr::V6(v6)) => {
             let mut o = v6.octets();
             o[8..].fill(0);
@@ -553,5 +561,15 @@ mod waiting_tests {
         let c: IpAddr = "2001:db8:1:3::1".parse().expect("ip");
         assert_eq!(address_key(Some(a)), address_key(Some(b)));
         assert_ne!(address_key(Some(a)), address_key(Some(c)));
+    }
+
+    #[test]
+    fn ipv4_mapped_addresses_count_as_their_ipv4_address() {
+        let mapped: IpAddr = "::ffff:203.0.113.9".parse().expect("ip");
+        let plain: IpAddr = "203.0.113.9".parse().expect("ip");
+        let other: IpAddr = "::ffff:198.51.100.7".parse().expect("ip");
+        assert_eq!(address_key(Some(mapped)), address_key(Some(plain)));
+        assert_ne!(address_key(Some(mapped)), address_key(Some(other)));
+        assert_ne!(address_key(Some(mapped)), address_key(None));
     }
 }
