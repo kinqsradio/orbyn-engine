@@ -21,6 +21,47 @@ use sqlx::PgPool;
 use std::time::Duration;
 use uuid::Uuid;
 
+// The selections. Production runs the plain strings: no parameter that may be NULL, so a
+// prepared statement cannot settle on a generic plan that ignores the tombstone-age and
+// deleted-zone indexes. The scoped strings (tests only) add an owner filter; they are separate
+// strings, not one string with an `IS NULL OR` branch.
+
+/// A deleted zone past the window, or one already being purged. `$1` is the window in seconds.
+const DELETED_ZONE: &str = "SELECT id, seq FROM zones
+     WHERE deleted_at IS NOT NULL
+       AND (purging OR deleted_at < now() - make_interval(secs => $1))
+     ORDER BY purging DESC, deleted_at LIMIT 1 FOR UPDATE SKIP LOCKED";
+
+#[cfg(feature = "test-support")]
+const DELETED_ZONE_OF: &str = "SELECT id, seq FROM zones
+     WHERE deleted_at IS NOT NULL
+       AND (purging OR deleted_at < now() - make_interval(secs => $1))
+       AND owner_id = ANY($2)
+     ORDER BY purging DESC, deleted_at LIMIT 1 FOR UPDATE SKIP LOCKED";
+
+/// The zone holding the oldest expired tombstone, skipping zones already found busy. `$1` is the
+/// window in seconds, `$2` the busy zones.
+const OLDEST_TOMBSTONE: &str = "SELECT r.zone_id FROM records r JOIN zones z ON z.id = r.zone_id
+     WHERE r.deleted AND r.modified_at < now() - make_interval(secs => $1)
+       AND z.deleted_at IS NULL AND r.zone_id <> ALL($2)
+     ORDER BY r.modified_at LIMIT 1";
+
+#[cfg(feature = "test-support")]
+const OLDEST_TOMBSTONE_OF: &str = "SELECT r.zone_id FROM records r JOIN zones z ON z.id = r.zone_id
+     WHERE r.deleted AND r.modified_at < now() - make_interval(secs => $1)
+       AND z.deleted_at IS NULL AND r.zone_id <> ALL($2)
+       AND z.owner_id = ANY($3)
+     ORDER BY r.modified_at LIMIT 1";
+
+/// Takes the zone's lock if it is free. `$1` is the zone.
+const LOCK_ZONE: &str =
+    "SELECT id FROM zones WHERE id = $1 AND deleted_at IS NULL FOR UPDATE SKIP LOCKED";
+
+#[cfg(feature = "test-support")]
+const LOCK_ZONE_OF: &str = "SELECT id FROM zones
+     WHERE id = $1 AND deleted_at IS NULL AND owner_id = ANY($2)
+     FOR UPDATE SKIP LOCKED";
+
 /// Busy zones one step skips before it gives up until the next run.
 const MAX_BUSY: usize = 16;
 
@@ -98,17 +139,12 @@ async fn purge_step(
     // window set meanwhile must not strand it, since it cannot be restored):
     // its records in batches, then the zone.
     let mut tx = pool.begin().await?;
-    let zone: Option<(Uuid, i64)> = sqlx::query_as(
-        "SELECT id, seq FROM zones
-         WHERE deleted_at IS NOT NULL
-           AND (purging OR deleted_at < now() - make_interval(secs => $1))
-           AND ($2::uuid[] IS NULL OR owner_id = ANY($2))
-         ORDER BY purging DESC, deleted_at LIMIT 1 FOR UPDATE SKIP LOCKED",
-    )
-    .bind(secs)
-    .bind(owners)
-    .fetch_optional(&mut *tx)
-    .await?;
+    let query = match owners {
+        #[cfg(feature = "test-support")]
+        Some(owners) => sqlx::query_as(DELETED_ZONE_OF).bind(secs).bind(owners),
+        _ => sqlx::query_as(DELETED_ZONE).bind(secs),
+    };
+    let zone: Option<(Uuid, i64)> = query.fetch_optional(&mut *tx).await?;
     if let Some((zone, seq)) = zone {
         // From its first step the purge is under way: no restore, and every
         // token older than the zone's end has expired, since this step removes
@@ -153,31 +189,25 @@ async fn purge_step(
     let mut busy: Vec<Uuid> = Vec::new();
     while busy.len() < MAX_BUSY {
         let mut tx = pool.begin().await?;
-        let oldest: Option<Uuid> = sqlx::query_scalar(
-            "SELECT r.zone_id FROM records r JOIN zones z ON z.id = r.zone_id
-             WHERE r.deleted AND r.modified_at < now() - make_interval(secs => $1)
-               AND z.deleted_at IS NULL AND r.zone_id <> ALL($2)
-               AND ($3::uuid[] IS NULL OR z.owner_id = ANY($3))
-             ORDER BY r.modified_at LIMIT 1",
-        )
-        .bind(secs)
-        .bind(&busy)
-        .bind(owners)
-        .fetch_optional(&mut *tx)
-        .await?;
+        let query = match owners {
+            #[cfg(feature = "test-support")]
+            Some(owners) => sqlx::query_scalar(OLDEST_TOMBSTONE_OF)
+                .bind(secs)
+                .bind(&busy)
+                .bind(owners),
+            _ => sqlx::query_scalar(OLDEST_TOMBSTONE).bind(secs).bind(&busy),
+        };
+        let oldest: Option<Uuid> = query.fetch_optional(&mut *tx).await?;
         let Some(zone) = oldest else {
             break;
         };
         // The zone lock every write takes.
-        let locked: Option<Uuid> = sqlx::query_scalar(
-            "SELECT id FROM zones
-             WHERE id = $1 AND deleted_at IS NULL AND ($2::uuid[] IS NULL OR owner_id = ANY($2))
-             FOR UPDATE SKIP LOCKED",
-        )
-        .bind(zone)
-        .bind(owners)
-        .fetch_optional(&mut *tx)
-        .await?;
+        let query = match owners {
+            #[cfg(feature = "test-support")]
+            Some(owners) => sqlx::query_scalar(LOCK_ZONE_OF).bind(zone).bind(owners),
+            _ => sqlx::query_scalar(LOCK_ZONE).bind(zone),
+        };
+        let locked: Option<Uuid> = query.fetch_optional(&mut *tx).await?;
         if locked.is_none() {
             busy.push(zone);
             continue;
@@ -217,4 +247,185 @@ async fn purge_step(
         break;
     }
     Ok(done)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orbyn_core::Database;
+    // Only fixed text from this module goes into these statements.
+    use sqlx::AssertSqlSafe;
+
+    /// A table big enough that the planner must prefer the partial indexes: 150,000 live records
+    /// and 100 tombstones, and 3,000 zones of which 60 are deleted. Removed again at the end.
+    struct Seeded {
+        pool: PgPool,
+        account: Uuid,
+    }
+
+    impl Seeded {
+        async fn new() -> Self {
+            let url =
+                std::env::var("DATABASE_URL").expect("set DATABASE_URL to run the Postgres tests");
+            let db = Database::connect(&url).await.expect("connect");
+            db.migrate().await.expect("migrate");
+            let pool = db.pool().clone();
+            // A run that panicked before cleaning up must not leave rows behind for the next
+            // run, or for another test's purge: the seed has a fixed address, removed first.
+            sqlx::query("DELETE FROM accounts WHERE email = 'purge-plan-seed@example.com'")
+                .execute(&pool)
+                .await
+                .expect("clear an earlier seed");
+            let account = Uuid::new_v4();
+            sqlx::query("INSERT INTO accounts (id, email, password_file) VALUES ($1, $2, '\\x00')")
+                .bind(account)
+                .bind("purge-plan-seed@example.com")
+                .execute(&pool)
+                .await
+                .expect("account");
+            sqlx::query(
+                "INSERT INTO zones (id, owner_id, name, deleted_at)
+                 SELECT gen_random_uuid(), $1, 'z' || g,
+                        CASE WHEN g % 50 = 0 THEN now() - interval '60 days' END
+                 FROM generate_series(1, 3000) g",
+            )
+            .bind(account)
+            .execute(&pool)
+            .await
+            .expect("zones");
+            sqlx::query(
+                "INSERT INTO records (zone_id, record_id, record_type, version, ciphertext,
+                                      wrapped_key, author_device_id, modified_at, deleted)
+                 SELECT (SELECT id FROM zones WHERE owner_id = $1 AND name = 'z1'),
+                        'r' || g, 'task', g, '\\x01', '\\x01', gen_random_uuid(),
+                        now() - make_interval(secs => g), false
+                 FROM generate_series(1, 150000) g",
+            )
+            .bind(account)
+            .execute(&pool)
+            .await
+            .expect("live records");
+            sqlx::query(
+                "INSERT INTO records (zone_id, record_id, record_type, version, author_device_id,
+                                      modified_at, deleted)
+                 SELECT (SELECT id FROM zones WHERE owner_id = $1 AND name = 'z2'),
+                        't' || g, 'task', g, gen_random_uuid(),
+                        now() - interval '60 days' - make_interval(secs => g), true
+                 FROM generate_series(1, 100) g",
+            )
+            .bind(account)
+            .execute(&pool)
+            .await
+            .expect("tombstones");
+            // The counters the limits and the purge read agree with the rows.
+            sqlx::query(
+                "UPDATE zones SET live_records = 150000, total_records = 150000
+                 WHERE owner_id = $1 AND name = 'z1'",
+            )
+            .bind(account)
+            .execute(&pool)
+            .await
+            .expect("counters");
+            sqlx::query("UPDATE zones SET total_records = 100 WHERE owner_id = $1 AND name = 'z2'")
+                .bind(account)
+                .execute(&pool)
+                .await
+                .expect("counters");
+            sqlx::query("ANALYZE records")
+                .execute(&pool)
+                .await
+                .expect("analyze");
+            sqlx::query("ANALYZE zones")
+                .execute(&pool)
+                .await
+                .expect("analyze");
+            Self { pool, account }
+        }
+
+        /// The plan of `sql` as a prepared statement with parameter types `types`, run `as_generic`
+        /// the way Postgres does after several executions (a generic plan, which cannot see the
+        /// values), or with the values known (a custom plan).
+        async fn plan(&self, sql: &str, types: &str, values: &str, generic: bool) -> String {
+            let mut conn = self.pool.acquire().await.expect("connection");
+            let mode = if generic {
+                "force_generic_plan"
+            } else {
+                "force_custom_plan"
+            };
+            sqlx::query(AssertSqlSafe(format!("SET plan_cache_mode = {mode}")))
+                .execute(&mut *conn)
+                .await
+                .expect("mode");
+            sqlx::query(AssertSqlSafe(format!(
+                "PREPARE purge_probe({types}) AS {sql}"
+            )))
+            .execute(&mut *conn)
+            .await
+            .expect("prepare");
+            let rows: Vec<(String,)> = sqlx::query_as(AssertSqlSafe(format!(
+                "EXPLAIN EXECUTE purge_probe({values})"
+            )))
+            .fetch_all(&mut *conn)
+            .await
+            .expect("explain");
+            sqlx::query("DEALLOCATE purge_probe")
+                .execute(&mut *conn)
+                .await
+                .expect("deallocate");
+            rows.into_iter()
+                .map(|(line,)| line)
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        async fn remove(self) {
+            sqlx::query("DELETE FROM accounts WHERE id = $1")
+                .bind(self.account)
+                .execute(&self.pool)
+                .await
+                .expect("remove");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs DATABASE_URL"]
+    async fn the_global_selections_use_their_indexes_even_as_a_generic_plan() {
+        let seeded = Seeded::new().await;
+        let secs = "2592000.0";
+        let mut failures = Vec::new();
+        for generic in [false, true] {
+            let kind = if generic { "generic" } else { "custom" };
+            let tombstone = seeded
+                .plan(
+                    OLDEST_TOMBSTONE,
+                    "float8, uuid[]",
+                    &format!("{secs}, '{{}}'"),
+                    generic,
+                )
+                .await;
+            if !tombstone.contains("records_tombstone_age")
+                || tombstone.contains("Seq Scan on records")
+            {
+                failures.push(format!("oldest tombstone ({kind}):\n{tombstone}"));
+            }
+            let zone = seeded.plan(DELETED_ZONE, "float8", secs, generic).await;
+            if !zone.contains("zones_deleted_age") || zone.contains("Seq Scan on zones") {
+                failures.push(format!("deleted zone ({kind}):\n{zone}"));
+            }
+        }
+        seeded.remove().await;
+        assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+    }
+
+    #[test]
+    fn the_global_strings_carry_no_optional_owner_parameter() {
+        for sql in [DELETED_ZONE, OLDEST_TOMBSTONE, LOCK_ZONE] {
+            assert!(!sql.contains("IS NULL OR"), "{sql}");
+            assert!(!sql.contains("owner_id"), "{sql}");
+            assert!(
+                !sql.contains("ANY($2)") || sql.contains("<> ALL($2)"),
+                "{sql}"
+            );
+        }
+    }
 }
