@@ -655,6 +655,51 @@ async fn guessing_is_capped_per_email_but_a_trusted_device_still_signs_in() {
 
 #[tokio::test]
 #[ignore = "needs DATABASE_URL"]
+async fn a_trusted_device_still_cannot_guess_quickly_from_one_address() {
+    let _turn = TURN.lock().await;
+    let server = server_with(Limits {
+        login_per_email_and_ip: Limit::new(2, Duration::from_secs(60)),
+        ..Limits::default()
+    })
+    .await;
+    let owner = email();
+    let laptop = DeviceKeys::generate().expect("keys");
+    server.register(&owner, b"pw", &laptop).await;
+    let normalized = auth::normalize_email(&owner).expect("email");
+    let mut statuses = Vec::new();
+    for _ in 0..3 {
+        let (_, request) = auth::start_login(b"guess").expect("start");
+        let signed_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs() as i64;
+        let signature = laptop.sign(
+            auth::TRUSTED_START_CONTEXT,
+            &auth::trusted_start_message(&normalized, &request, signed_at),
+        );
+        let (status, _) = server
+            .call(
+                Method::POST,
+                "/v1/sessions/login/start",
+                None,
+                Some(json!({"email": owner, "credential_request": b64(&request), "trusted_device": {
+                    "signing_key": b64(&laptop.public().signing), "signed_at": signed_at, "signature": b64(&signature)}})),
+            )
+            .await;
+        statuses.push(status);
+    }
+    assert_eq!(
+        statuses,
+        [
+            StatusCode::OK,
+            StatusCode::OK,
+            StatusCode::TOO_MANY_REQUESTS
+        ]
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
 async fn signing_in_gives_back_the_start_it_used() {
     let _turn = TURN.lock().await;
     let server = server_with(Limits {
