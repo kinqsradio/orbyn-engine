@@ -82,6 +82,17 @@ Modelled on CloudKit's private database. `orbyn-store` owns the behaviour; the r
 - **Silent push.** A device that subscribed to a zone (`subscriptions`, all zones when `zone_id` is null) gets a `zone_changed` job enqueued in the writing transaction, with the idempotency key `<zone id>:<sequence>`, unless it wrote the change itself. The worker's handler is the hook for APNs and FCM; until those exist it does nothing.
 - **Request limits.** The upload route accepts bodies up to 6 MiB; every other route 64 KiB. A WebSocket message from a device is at most 16 KiB.
 
+## Keychain
+
+For now every key is held by devices. Standard and Advanced protection and the key service come later (see the end of this section).
+
+- **Key hierarchy as built.** Each zone has one or more zone keys, each named by a random 16-byte key id. Every record has its own random record key. The record key seals the record; the zone key seals the record key. Zone keys never reach the server in the clear.
+- **Envelopes.** A trusted device hands a zone key to another trusted device of the account with `orbyn_crypto::wrap_key`: sealed to the recipient's X25519 key and signed by the sender, with the label `orbyn/zone-key/v1`, the zone and the key id (each length-prefixed), so an envelope cannot be moved to another zone or key id. The envelope bytes are the one-time public key (32), the signature (64), then the sealed key (nonce and ciphertext).
+- **What the server stores.** `key_envelopes` holds the account, recipient, sender, zone, key id and envelope bytes (at most 1 KiB), and nothing it can open. `POST /v1/keychain/envelopes` takes up to 100 envelopes from the session's device, all or nothing; the sender and every recipient must be trusted devices of the session's account right now, and no envelope may be addressed to its sender (`recipient_not_trusted`, `invalid_envelope`). Sending the same recipient, zone and key id again replaces the envelope, so a retry is harmless. A recipient holds at most 5000 envelopes (`too_many_envelopes`). `GET /v1/keychain/envelopes` returns only the session device's own envelopes, from senders that are still trusted, oldest first.
+- **What the device checks.** The server is not trusted to say who sent an envelope. The host passes the devices it trusts with their public keys, and the device opens an envelope only when that sender's signature verifies; anything else is refused before it is opened. Until devices check approval signatures (see Accounts), a compromised server could still add a device of its own and be sent keys.
+- **More than one key.** Two devices that create a zone at the same time each make a key. Devices keep every key they receive and seal new records with the zone key whose id is smallest, so once both have both keys they agree, and every record stays readable.
+- **Planned.** Standard protection adds a service key held in an HSM by `orbyn-keyservice`: zone keys are also wrapped to it, so a person who loses every device can sign in on a new one and get their keys back after checks, and every unwrap is audited. Advanced protection replaces the service key with the recovery key (`RecoveryKey::derive`), so only the person can recover. Key rotation (a new zone key when a device is removed) comes with them.
+
 ## Merging
 
 Anything received from another device or the server goes through `merge_remote`, which leaves out any field stamped more than an hour ahead of this device's clock and reports it, so one bad clock cannot win a field forever.

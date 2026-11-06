@@ -377,6 +377,49 @@ pub struct ZoneChanges {
     pub zone_deleted: bool,
 }
 
+/// A zone key sealed by a trusted device to another trusted device of the same
+/// account. The server stores the bytes and never opens them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct NewKeyEnvelope {
+    pub recipient_device_id: String,
+    /// The zone the key is for, 1 to 64 characters.
+    pub zone: String,
+    /// Names the zone key, base64url (16 bytes). A zone can have several.
+    pub key_id: String,
+    /// The wrapped key, base64url, at most 1 KiB decoded.
+    pub envelope: String,
+}
+
+/// `POST /v1/keychain/envelopes`: at most 100 envelopes from the session's device.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PutKeyEnvelopes {
+    pub envelopes: Vec<NewKeyEnvelope>,
+}
+
+/// An envelope addressed to the device making the request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct KeyEnvelope {
+    /// The device that sealed and signed it. Open it only if that device is
+    /// one you trust.
+    pub sender_device_id: String,
+    pub zone: String,
+    pub key_id: String,
+    pub envelope: String,
+    /// RFC 3339.
+    pub created_at: String,
+}
+
+/// `GET /v1/keychain/envelopes`: every envelope for this device from a device
+/// that is still trusted, oldest first.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct KeyEnvelopeList {
+    pub envelopes: Vec<KeyEnvelope>,
+}
+
 /// A message a device sends on `/v1/sync`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]

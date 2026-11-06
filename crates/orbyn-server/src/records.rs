@@ -97,6 +97,11 @@ impl IntoResponse for Refusal {
             StoreError::OperationReused => (StatusCode::CONFLICT, "operation_reused"),
             StoreError::TooManyZones => (StatusCode::UNPROCESSABLE_ENTITY, "too_many_zones"),
             StoreError::TooManyRecords => (StatusCode::UNPROCESSABLE_ENTITY, "too_many_records"),
+            StoreError::InvalidEnvelope => (StatusCode::BAD_REQUEST, "invalid_envelope"),
+            StoreError::RecipientNotTrusted => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "recipient_not_trusted")
+            }
+            StoreError::TooManyEnvelopes => (StatusCode::UNPROCESSABLE_ENTITY, "too_many_envelopes"),
             StoreError::RecordChanged(conflicts) => {
                 let body = wire::RecordChanged {
                     code: "record_changed".to_owned(),
@@ -140,10 +145,10 @@ impl IntoResponse for Refusal {
     }
 }
 
-type Answer<T> = Result<T, Refusal>;
+pub(crate) type Answer<T> = Result<T, Refusal>;
 
 /// A JSON body whose errors are [`wire::ApiError`]s, with this route's size limit.
-pub(crate) struct Body<T>(T);
+pub(crate) struct Body<T>(pub(crate) T);
 
 impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for Body<T> {
     type Rejection = Refusal;
@@ -164,11 +169,11 @@ impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for Body<T> {
     }
 }
 
-fn store(state: &AppState) -> Answer<&Store> {
+pub(crate) fn store(state: &AppState) -> Answer<&Store> {
     state.store.as_ref().ok_or(Refusal::Unavailable)
 }
 
-fn bytes(text: &str) -> Answer<Vec<u8>> {
+pub(crate) fn bytes(text: &str) -> Answer<Vec<u8>> {
     URL_SAFE_NO_PAD
         .decode(text)
         .map_err(|_| Refusal::BadRequest)

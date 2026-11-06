@@ -6,7 +6,8 @@
 use orbyn_core::Database;
 use orbyn_core::accounts::{DeviceState, Session};
 use orbyn_store::{
-    Change, ChangeToken, Hub, Limits, Notice, Store, StoreError, Upload, ZONE_CHANGED_JOB,
+    Change, ChangeToken, Hub, KEY_ID_LEN, Limits, NewEnvelope, Notice, Store, StoreError, Upload,
+    ZONE_CHANGED_JOB,
 };
 use std::time::Duration;
 use uuid::Uuid;
@@ -728,4 +729,120 @@ async fn other_devices_hear_committed_changes_across_replicas() {
             .await
             .is_err()
     );
+}
+
+fn envelope(to: &Session, zone: &str, key: u8, bytes: &[u8]) -> NewEnvelope {
+    NewEnvelope {
+        recipient_device_id: to.device_id,
+        zone: zone.into(),
+        key_id: vec![key; KEY_ID_LEN],
+        envelope: bytes.to_vec(),
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn key_envelopes_reach_only_trusted_devices_of_the_account() {
+    let (store, db) = store_with(Limits {
+        max_envelopes_per_device: 3,
+        ..Limits::default()
+    })
+    .await;
+    let laptop = trusted(&db).await;
+    let phone = device(&db, laptop.account_id, "trusted").await;
+    let pending = device(&db, laptop.account_id, "pending").await;
+    let stranger = trusted(&db).await;
+
+    store
+        .put_envelopes(
+            &laptop,
+            &[
+                envelope(&phone, "inbox", 1, b"first"),
+                envelope(&phone, "work", 1, b"work"),
+            ],
+        )
+        .await
+        .expect("put");
+    // Sending the same key again replaces the envelope.
+    store
+        .put_envelopes(&laptop, &[envelope(&phone, "inbox", 1, b"again")])
+        .await
+        .expect("again");
+    let got = store.list_envelopes(&phone).await.expect("list");
+    assert_eq!(got.len(), 2);
+    let inbox = got.iter().find(|e| e.zone == "inbox").expect("inbox");
+    assert_eq!(inbox.envelope, b"again");
+    assert_eq!(inbox.sender_device_id, laptop.device_id);
+    assert!(store.list_envelopes(&laptop).await.expect("own").is_empty());
+
+    // Recipients must be trusted devices of the same account, never the sender.
+    for (to, expected) in [
+        (&pending, "recipient"),
+        (&stranger, "recipient"),
+        (&laptop, "invalid"),
+    ] {
+        let err = store
+            .put_envelopes(&laptop, &[envelope(to, "inbox", 2, b"x")])
+            .await
+            .expect_err("refused");
+        match (expected, err) {
+            ("recipient", StoreError::RecipientNotTrusted)
+            | ("invalid", StoreError::InvalidEnvelope) => {}
+            (_, other) => panic!("unexpected {other:?}"),
+        }
+    }
+    // One bad envelope refuses the whole batch.
+    let err = store
+        .put_envelopes(
+            &laptop,
+            &[
+                envelope(&phone, "home", 3, b"x"),
+                envelope(&pending, "home", 3, b"x"),
+            ],
+        )
+        .await
+        .expect_err("refused");
+    assert!(matches!(err, StoreError::RecipientNotTrusted));
+    assert_eq!(store.list_envelopes(&phone).await.expect("list").len(), 2);
+    let mut short = envelope(&phone, "inbox", 4, b"x");
+    short.key_id.pop();
+    assert!(matches!(
+        store.put_envelopes(&laptop, &[short]).await,
+        Err(StoreError::InvalidEnvelope)
+    ));
+    assert!(matches!(
+        store.put_envelopes(&laptop, &[]).await,
+        Err(StoreError::BatchTooLarge)
+    ));
+    // A pending device can neither send nor fetch.
+    assert!(matches!(
+        store
+            .put_envelopes(&pending, &[envelope(&phone, "inbox", 5, b"x")])
+            .await,
+        Err(StoreError::DeviceNotTrusted)
+    ));
+    assert!(matches!(
+        store.list_envelopes(&pending).await,
+        Err(StoreError::DeviceNotTrusted)
+    ));
+
+    // A recipient holds a bounded number of envelopes.
+    store
+        .put_envelopes(&laptop, &[envelope(&phone, "home", 6, b"x")])
+        .await
+        .expect("third");
+    assert!(matches!(
+        store
+            .put_envelopes(&laptop, &[envelope(&phone, "home", 7, b"x")])
+            .await,
+        Err(StoreError::TooManyEnvelopes)
+    ));
+
+    // Once the sender is removed, its envelopes are no longer handed out.
+    sqlx::query("UPDATE devices SET state = 'removed' WHERE id = $1")
+        .bind(laptop.device_id)
+        .execute(db.pool())
+        .await
+        .expect("remove");
+    assert!(store.list_envelopes(&phone).await.expect("list").is_empty());
 }

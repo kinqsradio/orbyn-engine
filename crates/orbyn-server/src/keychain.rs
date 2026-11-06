@@ -1,0 +1,61 @@
+//! `/v1/keychain` routes: zone keys one trusted device sealed to another. The
+//! store checks that sender and recipients are trusted devices of the account.
+
+use crate::AppState;
+use crate::accounts::{Authed, encode, time};
+use crate::records::{Answer, Body, Refusal, bytes, store};
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::routing::get;
+use axum::{Json, Router};
+use orbyn_contracts as wire;
+use orbyn_store::NewEnvelope;
+use uuid::Uuid;
+
+pub(crate) fn routes() -> Router<AppState> {
+    Router::new().route(
+        "/v1/keychain/envelopes",
+        get(list_envelopes).post(put_envelopes),
+    )
+}
+
+async fn put_envelopes(
+    State(state): State<AppState>,
+    Authed(session): Authed,
+    Body(body): Body<wire::PutKeyEnvelopes>,
+) -> Answer<StatusCode> {
+    let envelopes = body
+        .envelopes
+        .into_iter()
+        .map(|e| {
+            Ok(NewEnvelope {
+                recipient_device_id: Uuid::parse_str(&e.recipient_device_id)
+                    .map_err(|_| Refusal::BadRequest)?,
+                zone: e.zone,
+                key_id: bytes(&e.key_id)?,
+                envelope: bytes(&e.envelope)?,
+            })
+        })
+        .collect::<Answer<Vec<_>>>()?;
+    store(&state)?.put_envelopes(&session, &envelopes).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_envelopes(
+    State(state): State<AppState>,
+    Authed(session): Authed,
+) -> Answer<Json<wire::KeyEnvelopeList>> {
+    let envelopes = store(&state)?.list_envelopes(&session).await?;
+    Ok(Json(wire::KeyEnvelopeList {
+        envelopes: envelopes
+            .into_iter()
+            .map(|e| wire::KeyEnvelope {
+                sender_device_id: e.sender_device_id.to_string(),
+                zone: e.zone,
+                key_id: encode(&e.key_id),
+                envelope: encode(&e.envelope),
+                created_at: time(e.created_at),
+            })
+            .collect(),
+    }))
+}
