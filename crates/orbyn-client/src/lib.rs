@@ -36,6 +36,7 @@ pub use trust::{Peer, PinnedKeys, uuid_bytes};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use crypt::Place;
+use orbyn_auth_client as auth;
 use orbyn_contracts as wire;
 use orbyn_crypto::{CryptoError, DeviceKeys, DevicePublic, SymmetricKey};
 use orbyn_sync::{Clock, Fields, Stamp, merge, merge_remote};
@@ -325,6 +326,9 @@ pub struct Snapshot {
     pub pinned: BTreeMap<String, PinnedKeys>,
     #[serde(default)]
     pub revoked: BTreeMap<String, PinnedKeys>,
+    /// The highest removal sequence this device has counted.
+    #[serde(default)]
+    pub removal_sequence: u64,
     pub zones: BTreeMap<String, ZoneSnapshot>,
 }
 
@@ -384,6 +388,9 @@ impl Engine {
     pub fn restore(keys: DeviceKeys, snapshot: Snapshot, now_millis: u64) -> Result<Self> {
         let mut engine = Self::new(keys, &snapshot.account_id, &snapshot.device_id)?;
         engine.trust.import(&snapshot.pinned, &snapshot.revoked)?;
+        engine
+            .trust
+            .set_removal_sequence(snapshot.removal_sequence.min(auth::MAX_REMOVAL_SEQUENCE));
         for (name, z) in snapshot.zones {
             let mut keys = BTreeMap::new();
             for (id, key) in &z.keys {
@@ -450,6 +457,7 @@ impl Engine {
             device_id: self.trust.device_id.clone(),
             pinned,
             revoked,
+            removal_sequence: self.trust.removal_sequence(),
             zones,
         }
     }
@@ -476,15 +484,19 @@ impl Engine {
     }
 
     /// The `DELETE /v1/devices/{id}` body that removes `device` (from
-    /// `GET /v1/devices`), signed by this device.
+    /// `GET /v1/devices`), signed by this device with a sequence one above
+    /// every removal it has counted.
     pub fn sign_removal(&self, device: &wire::Device) -> Result<wire::RemoveDevice> {
         let keys = trust::public_of(device).ok_or(ClientError::InvalidInput)?;
+        let sequence = (self.trust.removal_sequence() + 1).min(auth::MAX_REMOVAL_SEQUENCE);
         let message = orbyn_auth_client::removal_message(
             &self.trust.account,
             &uuid_bytes(&device.id)?,
             &keys,
+            sequence,
         );
         Ok(wire::RemoveDevice {
+            sequence,
             signature: b64(&self
                 .keys
                 .sign(orbyn_auth_client::DEVICE_REMOVAL_CONTEXT, &message)),

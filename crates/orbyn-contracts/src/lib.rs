@@ -212,13 +212,20 @@ pub struct DeviceRemoval {
     pub signing_key: String,
     pub agreement_key: String,
     pub removed_by: String,
+    /// The remover's removal sequence, signed with the removal.
+    #[ts(type = "number")]
+    pub sequence: u64,
     pub signature: String,
 }
 
-/// `DELETE /v1/devices/{id}`: the remover's signature, base64url.
+/// `DELETE /v1/devices/{id}`: the remover's removal sequence and its
+/// signature, base64url.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct RemoveDevice {
+    /// At most 2^53 - 1, so JavaScript reads it exactly.
+    #[ts(type = "number")]
+    pub sequence: u64,
     pub signature: String,
 }
 
@@ -267,7 +274,8 @@ pub struct CurrentDevice {
 pub struct CreateApproval {
     /// A UUID the approver makes.
     pub approval_id: String,
-    /// The pending device.
+    /// The device to approve: pending, or listed as trusted but without an
+    /// approval the approver verifies.
     pub device_id: String,
     /// Unix seconds, within five minutes of the server's clock.
     #[ts(type = "number")]

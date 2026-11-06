@@ -329,17 +329,24 @@ pub fn approval_message(pairing: &Pairing<'_>) -> Vec<u8> {
     pairing_bytes(DEVICE_APPROVAL_CONTEXT, pairing)
 }
 
+/// The highest removal sequence, so JavaScript reads every one exactly.
+pub const MAX_REMOVAL_SEQUENCE: u64 = (1 << 53) - 1;
+
 /// What a trusted device signs, under [`DEVICE_REMOVAL_CONTEXT`], to remove
-/// `device_id` with `keys` from the account.
+/// `device_id` with `keys` from the account. `sequence` is one more than the
+/// highest removal sequence the remover has seen, so a list endorsed with a
+/// lower sequence was made before the endorser knew of this removal.
 pub fn removal_message(
     account_id: &[u8; 16],
     device_id: &[u8; 16],
     keys: &DevicePublic,
+    sequence: u64,
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(32 + 64);
+    let mut out = Vec::with_capacity(32 + 64 + 8);
     out.extend_from_slice(account_id);
     out.extend_from_slice(device_id);
     push_device(&mut out, keys);
+    out.extend_from_slice(&sequence.to_be_bytes());
     out
 }
 
@@ -407,8 +414,12 @@ mod tests {
         assert_ne!(base, pairing(&[0; 16], &a, &a, 1));
         assert_ne!(base, pairing(&[0; 16], &a, &b, 2));
         assert_ne!(
-            removal_message(&[0; 16], &[1; 16], &a),
-            removal_message(&[1; 16], &[0; 16], &a)
+            removal_message(&[0; 16], &[1; 16], &a, 1),
+            removal_message(&[1; 16], &[0; 16], &a, 1)
+        );
+        assert_ne!(
+            removal_message(&[0; 16], &[1; 16], &a, 1),
+            removal_message(&[0; 16], &[1; 16], &a, 2)
         );
         assert_ne!(
             register_message("ab", b"c", &a),

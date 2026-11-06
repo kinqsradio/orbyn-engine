@@ -5,7 +5,7 @@ mod fake;
 
 use fake::{Answer, FakeStore};
 use orbyn_auth_client as auth;
-use orbyn_client::{ClientError, Engine, ITEM_TYPE, Snapshot, crypt, uuid_bytes};
+use orbyn_client::{ClientError, DevicePairing, Engine, ITEM_TYPE, Snapshot, crypt, uuid_bytes};
 use orbyn_contracts as wire;
 use orbyn_crypto::DeviceKeys;
 use orbyn_planner::Item;
@@ -20,6 +20,7 @@ const ACCOUNT: &str = "0a0a0a0a-0000-4000-8000-000000000001";
 const A: &str = "0000000a-0000-4000-8000-00000000000a";
 const B: &str = "0000000b-0000-4000-8000-00000000000b";
 const C: &str = "0000000c-0000-4000-8000-00000000000c";
+const S: &str = "0000000d-0000-4000-8000-00000000000d";
 const EVIL: &str = "000000ee-0000-4000-8000-0000000000ee";
 
 /// Unix seconds for approvals in these tests.
@@ -323,6 +324,19 @@ fn two_devices_share_a_key_and_see_each_others_tasks() -> R {
     Ok(())
 }
 
+/// `remover`'s signed removal of `removed`, as the device list carries it.
+fn removal(remover: &Device, removed: &Device) -> wire::DeviceRemoval {
+    let signed = remover.engine.sign_removal(&removed.entry).expect("sign");
+    wire::DeviceRemoval {
+        device_id: removed.id.clone(),
+        signing_key: removed.entry.signing_key.clone(),
+        agreement_key: removed.entry.agreement_key.clone(),
+        removed_by: remover.id.clone(),
+        sequence: signed.sequence,
+        signature: signed.signature,
+    }
+}
+
 /// A trusted-looking entry the server makes up: `approver` named, signed by `signer`.
 fn forged(device: &Device, approver: &str, signer: &DeviceKeys) -> wire::Device {
     let mut e = entry(&device.id, &device.keys, wire::DeviceState::Trusted);
@@ -534,15 +548,8 @@ fn a_signed_removal_drops_the_device_and_everything_only_it_approved() {
     let all = list(&[&a, &b, &c]);
     assert_eq!(a.engine.verify_devices(&all).len(), 3);
     // a removes b; the server still lists b and c as trusted.
-    let removal = a.engine.sign_removal(&b.entry).expect("sign");
     let mut after = all.clone();
-    after.removals.push(wire::DeviceRemoval {
-        device_id: B.into(),
-        signing_key: b.entry.signing_key.clone(),
-        agreement_key: b.entry.agreement_key.clone(),
-        removed_by: A.into(),
-        signature: removal.signature.clone(),
-    });
+    after.removals.push(removal(&a, &b));
     let peers = a.engine.verify_devices(&after);
     assert_eq!(peers.len(), 1, "{peers:?}");
     let sent = a.engine.envelopes_for(ZONE, &after).expect("envelopes");
@@ -550,11 +557,8 @@ fn a_signed_removal_drops_the_device_and_everything_only_it_approved() {
     // A removal the server forges is ignored.
     let mut forged_removal = all.clone();
     forged_removal.removals.push(wire::DeviceRemoval {
-        device_id: B.into(),
-        signing_key: b.entry.signing_key.clone(),
-        agreement_key: b.entry.agreement_key.clone(),
-        removed_by: A.into(),
         signature: b64(&[0; 64]),
+        ..removal(&a, &b)
     });
     assert_eq!(c.engine.verify_devices(&forged_removal).len(), 3);
     // b's rotations are refused once b is removed.
@@ -570,6 +574,374 @@ fn a_signed_removal_drops_the_device_and_everything_only_it_approved() {
             .all(|r| r.reason == "untrusted_sender")
     );
     assert_ne!(c.engine.current_key_id(ZONE), Some(rotated));
+}
+
+/// Every step of an approval of `new` by `approver` up to the person
+/// confirming on `new`: its pairing, the view it finishes with and its digits.
+fn confirmed(
+    approver: &mut Device,
+    new: &Device,
+    list: &wire::DeviceList,
+) -> (DevicePairing, wire::PendingApproval, String) {
+    let (mut pa, create) = approver
+        .engine
+        .start_approval(&new.entry, NOW_S)
+        .expect("start");
+    let mut view = view_of(&create, approver, new);
+    let (pd, nonce) = new.engine.join_approval(&view, NOW_S).expect("join");
+    view.device_nonce = Some(nonce.nonce);
+    view.approver_nonce = Some(pa.reveal(&view).expect("reveal").nonce);
+    let sas = pd.sas(&view).expect("sas");
+    let confirm = approver.engine.confirm_approval(pa, list).expect("confirm");
+    view.signature = Some(confirm.signature);
+    view.endorsement = confirm.endorsement;
+    (pd, view, sas)
+}
+
+/// The devices `device` pins, by id, with the device each was pinned under.
+fn pins(device: &Device) -> BTreeMap<String, Option<String>> {
+    device
+        .engine
+        .snapshot()
+        .pinned
+        .into_iter()
+        .map(|(id, k)| (id, k.parent))
+        .collect()
+}
+
+/// A, B approved by A, and a pending C that A is approving.
+fn approving() -> (Device, Device, Device, wire::DeviceList) {
+    let mut store = FakeStore::new(10);
+    let (a, b, _) = pair(&mut store);
+    let c = Device::new(C, a.now);
+    let devices = list(&[&a, &b, &c]);
+    (a, b, c, devices)
+}
+
+#[test]
+fn digits_typed_wrong_at_the_finish_are_refused() {
+    let (mut a, _b, mut c, devices) = approving();
+    let (pd, view, sas) = confirmed(&mut a, &c, &devices);
+    let wrong = if sas == "000000" { "000001" } else { "000000" };
+    assert!(
+        c.engine
+            .finish_approval(pd, &view, Some(wrong), NOW_S + 30)
+            .is_err()
+    );
+    assert_eq!(pins(&c).len(), 1, "c trusts only itself");
+}
+
+#[test]
+fn a_finish_after_ten_minutes_is_refused() {
+    let (mut a, _b, mut c, devices) = approving();
+    // c joined in time; the person confirms on c too late.
+    let (pd, view, sas) = confirmed(&mut a, &c, &devices);
+    assert!(
+        c.engine
+            .finish_approval(pd, &view, Some(&sas), NOW_S + 11 * 60)
+            .is_err()
+    );
+    assert_eq!(pins(&c).len(), 1, "c trusts only itself");
+}
+
+#[test]
+fn an_approval_signature_the_approver_did_not_make_is_refused() {
+    let (mut a, _b, mut c, devices) = approving();
+    let (pd, mut view, sas) = confirmed(&mut a, &c, &devices);
+    // The server signs the same approval with a key of its own.
+    let evil = DeviceKeys::generate().expect("keys");
+    let message = auth::approval_message(&auth::Pairing {
+        account_id: &uuid_bytes(ACCOUNT).expect("uuid"),
+        approval_id: &uuid_bytes(&view.id).expect("uuid"),
+        created_at: view.created_at,
+        approver_id: &uuid_bytes(A).expect("uuid"),
+        approver: &a.keys.public(),
+        device_id: &uuid_bytes(C).expect("uuid"),
+        device: &c.keys.public(),
+    });
+    view.signature = Some(b64(&evil.sign(auth::DEVICE_APPROVAL_CONTEXT, &message)));
+    assert!(
+        c.engine
+            .finish_approval(pd, &view, Some(&sas), NOW_S + 30)
+            .is_err()
+    );
+    assert_eq!(pins(&c).len(), 1, "c trusts only itself");
+}
+
+#[test]
+fn a_device_the_server_adds_to_the_endorsement_is_refused() {
+    let (mut a, _b, mut c, devices) = approving();
+    let (pd, mut view, sas) = confirmed(&mut a, &c, &devices);
+    // Layout: format, sequence (8), count (2), entries of 96 bytes,
+    // signature (64).
+    let mut bytes = unb64(view.endorsement.as_deref().expect("endorsement"));
+    let evil = DeviceKeys::generate().expect("keys").public();
+    let count = u16::from_be_bytes([bytes[9], bytes[10]]) + 1;
+    bytes[9..11].copy_from_slice(&count.to_be_bytes());
+    let at = bytes.len() - 64;
+    let mut entry = uuid_bytes(EVIL).expect("uuid").to_vec();
+    entry.extend_from_slice(&evil.signing);
+    entry.extend_from_slice(&evil.agreement);
+    entry.extend_from_slice(&[0; 16]);
+    bytes.splice(at..at, entry);
+    view.endorsement = Some(b64(&bytes));
+    assert!(
+        c.engine
+            .finish_approval(pd, &view, Some(&sas), NOW_S + 30)
+            .is_err()
+    );
+    assert!(!pins(&c).contains_key(EVIL));
+    assert_eq!(pins(&c).len(), 1, "c trusts only itself");
+}
+
+#[test]
+fn an_endorsement_older_than_a_removal_the_device_counted_is_dropped() {
+    let (mut a, b, mut c, devices) = approving();
+    // c has counted removal 1 (signed by itself here; a stranded device
+    // being approved again knows the removals of its account). a has seen
+    // none, so its list may still name a device removed since.
+    let gone = Device::root(EVIL, a.now);
+    let mut with_removal = list(&[&c]);
+    with_removal.removals.push(removal(&c, &gone));
+    c.engine.verify_devices(&with_removal);
+    assert_eq!(c.engine.snapshot().removal_sequence, 1);
+    let (pd, view, sas) = confirmed(&mut a, &c, &devices);
+    c.engine
+        .finish_approval(pd, &view, Some(&sas), NOW_S + 30)
+        .expect("finish");
+    let pinned = pins(&c);
+    assert!(pinned.contains_key(A), "the approver is pinned");
+    assert!(!pinned.contains_key(B), "a's stale list is dropped");
+
+    // An endorsement made after a counted the same removal is kept.
+    let (mut a2, b2, mut c2, devices2) = approving();
+    let mut a_saw = list(&[&a2, &b2]);
+    a_saw.removals.push(removal(&a2, &gone));
+    a2.engine.verify_devices(&a_saw);
+    let mut c_saw = list(&[&c2]);
+    c_saw.removals.push(removal(&c2, &gone));
+    c2.engine.verify_devices(&c_saw);
+    let (pd, view, sas) = confirmed(&mut a2, &c2, &devices2);
+    c2.engine
+        .finish_approval(pd, &view, Some(&sas), NOW_S + 30)
+        .expect("finish");
+    assert!(pins(&c2).contains_key(B));
+    let _ = b;
+}
+
+/// A root, B and S approved by A, and C approved by A last, so C pins A and
+/// endorsed B and S.
+fn four() -> (Device, Device, Device, Device, wire::DeviceList) {
+    let mut a = Device::root(A, 1_000_000);
+    let mut b = Device::new(B, a.now);
+    let mut s = Device::new(S, a.now);
+    let mut c = Device::new(C, a.now);
+    let l = list(&[&a, &b]);
+    approve(&mut a, &mut b, &l);
+    let l = list(&[&a, &b, &s]);
+    approve(&mut a, &mut s, &l);
+    let l = list(&[&a, &b, &s, &c]);
+    approve(&mut a, &mut c, &l);
+    let all = list(&[&a, &b, &s, &c]);
+    assert_eq!(c.engine.verify_devices(&all).len(), 4);
+    (a, b, s, c, all)
+}
+
+fn trusted_ids(device: &mut Device, devices: &wire::DeviceList) -> Vec<String> {
+    let mut ids: Vec<String> = device
+        .engine
+        .verify_devices(devices)
+        .into_iter()
+        .map(|p| p.device_id)
+        .collect();
+    ids.sort();
+    ids
+}
+
+#[test]
+fn devices_that_remove_each_other_are_both_revoked_in_either_order() {
+    let (_a, b, s, c, all) = four();
+    // b removes a stolen s, and s removes b; the server picks the order.
+    let both = [removal(&b, &s), removal(&s, &b)];
+    let snapshot = serde_json::to_string(&c.engine.snapshot()).expect("json");
+    let mut results = Vec::new();
+    for order in [[0, 1], [1, 0]] {
+        let mut fresh = Device {
+            engine: Engine::restore(
+                copy(&c.keys),
+                serde_json::from_str(&snapshot).expect("parse"),
+                c.now,
+            )
+            .expect("restore"),
+            keys: copy(&c.keys),
+            id: c.id.clone(),
+            now: c.now,
+            entry: c.entry.clone(),
+        };
+        let mut devices = all.clone();
+        devices.removals = order.iter().map(|&i| both[i].clone()).collect();
+        results.push(trusted_ids(&mut fresh, &devices));
+    }
+    assert_eq!(results[0], [A, C]);
+    assert_eq!(results[0], results[1]);
+}
+
+#[test]
+fn a_revoked_devices_other_removals_do_not_count() {
+    let (a, b, s, mut c, all) = four();
+    // a removes b; b's removal of s, which the data cannot place before or
+    // after that, does not count.
+    let mut devices = all.clone();
+    devices.removals = vec![removal(&b, &s), removal(&a, &b)];
+    assert_eq!(trusted_ids(&mut c, &devices), [A, C, S]);
+    // Nor does a removal b signs after it was revoked.
+    devices.removals.push(removal(&b, &a));
+    assert_eq!(trusted_ids(&mut c, &devices), [A, C, S]);
+}
+
+#[test]
+fn random_removal_orders_give_the_same_trusted_devices() {
+    let (a, b, s, c, all) = four();
+    let removals = [
+        removal(&b, &s),
+        removal(&s, &b),
+        removal(&a, &s),
+        removal(&s, &a),
+        removal(&c, &b),
+    ];
+    let snapshot = serde_json::to_string(&c.engine.snapshot()).expect("json");
+    let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let mut expected = None;
+    for _ in 0..200 {
+        let mut order = removals.to_vec();
+        for i in (1..order.len()).rev() {
+            order.swap(i, (next() % (i as u64 + 1)) as usize);
+        }
+        let mut engine = Engine::restore(
+            copy(&c.keys),
+            serde_json::from_str(&snapshot).expect("parse"),
+            c.now,
+        )
+        .expect("restore");
+        let mut devices = all.clone();
+        devices.removals = order;
+        let mut ids: Vec<String> = engine
+            .verify_devices(&devices)
+            .into_iter()
+            .map(|p| p.device_id)
+            .collect();
+        ids.sort();
+        match &expected {
+            None => expected = Some(ids),
+            Some(first) => assert_eq!(&ids, first),
+        }
+    }
+    // a, b and s remove each other around a cycle; only c is left.
+    assert_eq!(expected.as_deref(), Some([C.to_owned()].as_slice()));
+}
+
+#[test]
+fn a_device_stranded_by_a_removal_is_approved_again() {
+    let mut a = Device::root(A, 1_000_000);
+    let mut b = Device::new(B, a.now);
+    let mut c = Device::new(C, a.now);
+    let mut d = Device::new(S, a.now);
+    let l = list(&[&a, &b]);
+    approve(&mut a, &mut b, &l);
+    let l = list(&[&a, &b, &c]);
+    approve(&mut b, &mut c, &l);
+    let l = list(&[&a, &b, &c, &d]);
+    approve(&mut a, &mut d, &l);
+    let all = list(&[&a, &b, &c, &d]);
+    assert_eq!(trusted_ids(&mut a, &all), [A, B, C, S]);
+    assert_eq!(trusted_ids(&mut d, &all), [A, B, C, S]);
+    // While a trusts c, it will not approve c again, whatever the server
+    // says c's state is.
+    let mut says_pending = c.entry.clone();
+    says_pending.state = wire::DeviceState::Pending;
+    assert!(a.engine.start_approval(&says_pending, NOW_S).is_err());
+    assert!(a.engine.start_approval(&a.entry, NOW_S).is_err());
+
+    // a removes b. c, approved by b, is still trusted on the server.
+    let mut after = list(&[&a, &c, &d]);
+    after.removals.push(removal(&a, &b));
+    assert_eq!(trusted_ids(&mut a, &after), [A, S]);
+    assert_eq!(trusted_ids(&mut d, &after), [A, S]);
+    // a never approves the revoked b again, even listed as pending.
+    let mut b_pending = b.entry.clone();
+    b_pending.state = wire::DeviceState::Pending;
+    assert!(a.engine.start_approval(&b_pending, NOW_S).is_err());
+
+    // By its own view a no longer trusts c, so it may approve c again.
+    let c_before = pins(&c);
+    approve(&mut a, &mut c, &after);
+    let again = {
+        let mut l = list(&[&a, &c, &d]);
+        l.removals = after.removals.clone();
+        l
+    };
+    assert_eq!(trusted_ids(&mut a, &again), [A, C, S]);
+    assert_eq!(trusted_ids(&mut d, &again), [A, C, S]);
+    // c is pinned once on a and d, under its new approver.
+    assert_eq!(pins(&a).get(C), Some(&Some(A.to_owned())));
+    assert_eq!(pins(&d).get(C), Some(&Some(A.to_owned())));
+    // On c, a's entry was replaced in place: one entry, now an anchor.
+    let c_after = pins(&c);
+    assert_eq!(c_after.get(A), Some(&None));
+    assert!(
+        c_after
+            .keys()
+            .all(|id| c_before.contains_key(id) || id == S)
+    );
+    assert_eq!(
+        c_after.len(),
+        c_before.len() + 1,
+        "{c_before:?} {c_after:?}"
+    );
+}
+
+#[test]
+fn a_failed_approval_again_leaves_every_pin_as_it_was() {
+    let (a, b, s, mut c, all) = four();
+    // c counts a's removal of b; then a server relays an approval of c by
+    // the revoked b. The comparison can succeed, but c pins nothing.
+    let mut after = all.clone();
+    after.removals.push(removal(&a, &b));
+    c.engine.verify_devices(&after);
+    let before = c.engine.snapshot();
+    let mut b = b;
+    let (pd, view, sas) = confirmed(&mut b, &c, &all);
+    assert!(
+        c.engine
+            .finish_approval(pd, &view, Some(&sas), NOW_S + 30)
+            .is_err()
+    );
+    let now = c.engine.snapshot();
+    assert_eq!(now.pinned, before.pinned);
+    assert_eq!(now.revoked, before.revoked);
+    let _ = s;
+}
+
+#[test]
+fn an_account_whose_devices_have_no_verifiable_approval_starts_from_one_of_them() {
+    // Devices trusted before the two-way comparison: listed as trusted with
+    // no approval. Each trusts only itself, as a first device does.
+    let mut a = Device::root(A, 1_000_000);
+    let mut b = Device::root(B, a.now);
+    let old = list(&[&a, &b]);
+    assert_eq!(trusted_ids(&mut a, &old), [A]);
+    assert_eq!(trusted_ids(&mut b, &old), [B]);
+    // The person picks a and approves b from it.
+    approve(&mut a, &mut b, &old);
+    let now = list(&[&a, &b]);
+    assert_eq!(trusted_ids(&mut a, &now), [A, B]);
+    assert_eq!(trusted_ids(&mut b, &now), [A, B]);
 }
 
 #[test]

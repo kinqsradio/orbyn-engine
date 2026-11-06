@@ -316,13 +316,13 @@ impl Server {
     ) -> (StatusCode, Value) {
         let signature = remover.sign(
             auth::DEVICE_REMOVAL_CONTEXT,
-            &auth::removal_message(account.as_bytes(), device_id.as_bytes(), keys),
+            &auth::removal_message(account.as_bytes(), device_id.as_bytes(), keys, 1),
         );
         self.call(
             Method::DELETE,
             &format!("/v1/devices/{device_id}"),
             Some(token),
-            Some(json!({"signature": b64(&signature)})),
+            Some(json!({"sequence": 1, "signature": b64(&signature)})),
         )
         .await
     }
@@ -1243,11 +1243,12 @@ async fn removing_a_device_needs_a_signature_and_ends_its_sessions() {
     let removal = &list["removals"][0];
     assert_eq!(removal["device_id"], b_id.to_string());
     assert_eq!(removal["removed_by"], a_id.to_string());
+    assert_eq!(removal["sequence"], 1);
     let signature: [u8; 64] = unb64(&removal["signature"]).try_into().expect("64");
     orbyn_crypto::verify(
         &p.a.public(),
         auth::DEVICE_REMOVAL_CONTEXT,
-        &auth::removal_message(p.account_id.as_bytes(), b_id.as_bytes(), &p.b.public()),
+        &auth::removal_message(p.account_id.as_bytes(), b_id.as_bytes(), &p.b.public(), 1),
         &signature,
     )
     .expect("the removal verifies");

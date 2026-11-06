@@ -276,6 +276,7 @@ pub struct Removal {
     pub device_id: Uuid,
     pub keys: DevicePublic,
     pub removed_by: Uuid,
+    pub sequence: u64,
     pub signature: [u8; 64],
 }
 

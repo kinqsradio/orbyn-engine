@@ -405,6 +405,7 @@ async fn list_devices(
                 signing_key: encode(&r.keys.signing),
                 agreement_key: encode(&r.keys.agreement),
                 removed_by: r.removed_by.to_string(),
+                sequence: r.sequence,
                 signature: encode(&r.signature),
             })
             .collect(),
@@ -549,7 +550,13 @@ async fn remove_device(
     Body(body): Body<wire::RemoveDevice>,
 ) -> Answer<StatusCode> {
     service(&state)?
-        .remove_device(&client, &session, id(&device)?, &fixed(&body.signature)?)
+        .remove_device(
+            &client,
+            &session,
+            id(&device)?,
+            body.sequence,
+            &fixed(&body.signature)?,
+        )
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }

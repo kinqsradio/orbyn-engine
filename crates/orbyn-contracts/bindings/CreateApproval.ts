@@ -9,7 +9,8 @@ export type CreateApproval = {
  */
 approval_id: string, 
 /**
- * The pending device.
+ * The device to approve: pending, or listed as trusted but without an
+ * approval the approver verifies.
  */
 device_id: string, 
 /**

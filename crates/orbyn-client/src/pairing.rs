@@ -22,6 +22,19 @@
 //!
 //! A mismatch or cancel on either side ends the approval; each pairing value
 //! is used once, so another try needs a new approval.
+//!
+//! The same steps approve again a device the server lists as trusted but that
+//! the approver, by its own view, does not trust: one approved before the
+//! two-way comparison, or one pinned under a device later removed. In an
+//! account where no device has a verifiable approval, each device still trusts
+//! itself, as an account's first device does at sign-up; the person picks one
+//! and approves the others from it.
+//!
+//! Each endorsed device carries the device the approver pinned it under, so a
+//! removal cascades through it on the new device as it does on the approver.
+//! The endorsement carries the approver's removal sequence. The new device
+//! drops an endorsed list whose sequence is below the newest removal it has
+//! counted: the approver made it before it knew of that removal.
 
 use crate::trust::{key32, public_of, uuid_bytes};
 use crate::{ClientError, Engine, Result, b64, random, unb64};
@@ -31,11 +44,13 @@ use orbyn_crypto::DevicePublic;
 use zeroize::Zeroizing;
 
 /// The context of the approver's signed list of devices it trusts.
-pub const ENDORSEMENT_CONTEXT: &str = "orbyn/approval-endorsement/v1";
-const ENDORSEMENT_FORMAT: u8 = 1;
-const ENTRY_LEN: usize = 16 + 32 + 32;
+pub const ENDORSEMENT_CONTEXT: &str = "orbyn/approval-endorsement/v2";
+const ENDORSEMENT_FORMAT: u8 = 2;
+/// A device id, its two keys and the id of the device the approver pinned it
+/// under (all zero for an anchor).
+const ENTRY_LEN: usize = 16 + 32 + 32 + 16;
 /// At most this many devices fit an endorsement (16 KiB).
-pub const MAX_ENDORSED: usize = 200;
+pub const MAX_ENDORSED: usize = 160;
 
 /// Everything both devices bind into every approval message.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -186,23 +201,27 @@ fn fresh(created_at: i64, now_secs: i64) -> bool {
     (-5 * 60..=auth::APPROVAL_MAX_AGE_SECS).contains(&age)
 }
 
-fn endorsement_message(bound: &Bound, entries: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(32 + entries.len());
+fn endorsement_message(bound: &Bound, sequence: u64, entries: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(40 + entries.len());
     out.extend_from_slice(&bound.approval_id);
     out.extend_from_slice(&bound.device_id);
+    out.extend_from_slice(&sequence.to_be_bytes());
     out.extend_from_slice(entries);
     out
 }
 
 impl Engine {
-    /// Step 1, on a trusted device: starts approving `device` (a pending
-    /// device from `GET /v1/devices`). `now_secs` is Unix seconds.
+    /// Step 1, on a trusted device: starts approving `device` from
+    /// `GET /v1/devices`: a pending device, or one this device does not trust
+    /// by its own view after [`Engine::verify_devices`]. Refused for a device
+    /// it trusts or revoked, whatever the server says. `now_secs` is Unix
+    /// seconds.
     pub fn start_approval(
         &self,
         device: &wire::Device,
         now_secs: i64,
     ) -> Result<(ApproverPairing, wire::CreateApproval)> {
-        if device.state != wire::DeviceState::Pending {
+        if !self.trust.may_approve(device) {
             return Err(ClientError::InvalidInput);
         }
         let mut id: [u8; 16] = random()?;
@@ -262,13 +281,20 @@ impl Engine {
             entries.extend_from_slice(&uuid_bytes(&peer.device_id)?);
             entries.extend_from_slice(&peer.public.signing);
             entries.extend_from_slice(&peer.public.agreement);
+            let parent = match self.trust.parent(&peer.device_id) {
+                Some(parent) => uuid_bytes(parent)?,
+                None => [0; 16],
+            };
+            entries.extend_from_slice(&parent);
             count += 1;
         }
+        let sequence = self.trust.removal_sequence();
         let endorsement_signature = self.keys.sign(
             ENDORSEMENT_CONTEXT,
-            &endorsement_message(&pairing.bound, &entries),
+            &endorsement_message(&pairing.bound, sequence, &entries),
         );
         let mut endorsement = vec![ENDORSEMENT_FORMAT];
+        endorsement.extend_from_slice(&sequence.to_be_bytes());
         endorsement.extend_from_slice(&count.to_be_bytes());
         endorsement.extend_from_slice(&entries);
         endorsement.extend_from_slice(&endorsement_signature);
@@ -321,8 +347,10 @@ impl Engine {
     /// Step 5, on the new device, only after the person confirmed the digits
     /// match (or typed the approver's digits as `typed`). Checks the reveal,
     /// the age, the approver's signature and its endorsement, then pins the
-    /// approver and the devices it endorsed. Consumes the pairing: on any
-    /// failure this device trusts nothing new and needs a new approval.
+    /// approver and the devices it endorsed in one step. An endorsement older
+    /// than the newest removal this device counted is dropped, and only the
+    /// approver is pinned. Consumes the pairing: on any failure this device
+    /// trusts nothing new and needs a new approval.
     pub fn finish_approval(
         &mut self,
         pairing: DevicePairing,
@@ -353,27 +381,35 @@ impl Engine {
         .map_err(|_| ClientError::Mismatch)?;
         let endorsed = match view.endorsement.as_deref() {
             None => Vec::new(),
-            Some(text) => read_endorsement(&pairing.bound, &unb64(text)?)?,
+            Some(text) => {
+                let (sequence, endorsed) = read_endorsement(&pairing.bound, &unb64(text)?)?;
+                if sequence < self.trust.removal_sequence() {
+                    Vec::new()
+                } else {
+                    endorsed
+                }
+            }
         };
         self.trust
-            .pin_anchor(&pairing.approver_id, pairing.bound.approver)?;
-        for (id, public) in endorsed {
-            if id != self.trust.device_id {
-                // A device already pinned with other keys is left as it is.
-                let _ = self.trust.pin_anchor(&id, public);
-            }
-        }
+            .pin_approval(&pairing.approver_id, pairing.bound.approver, endorsed)?;
         Ok(sas)
     }
 }
 
-/// The devices an endorsement lists, after checking the approver's signature.
-fn read_endorsement(bound: &Bound, bytes: &[u8]) -> Result<Vec<(String, DevicePublic)>> {
+/// A device an endorsement lists: its id, keys and the device the approver
+/// pinned it under, if any.
+type Endorsed = (String, DevicePublic, Option<String>);
+
+/// An endorsement's removal sequence and the devices it lists, after checking
+/// the approver's signature.
+fn read_endorsement(bound: &Bound, bytes: &[u8]) -> Result<(u64, Vec<Endorsed>)> {
     let bad = || ClientError::Mismatch;
     let (&format, rest) = bytes.split_first().ok_or_else(bad)?;
-    if format != ENDORSEMENT_FORMAT || rest.len() < 2 + 64 {
+    if format != ENDORSEMENT_FORMAT || rest.len() < 8 + 2 + 64 {
         return Err(bad());
     }
+    let (sequence, rest) = rest.split_at(8);
+    let sequence = u64::from_be_bytes(sequence.try_into().map_err(|_| bad())?);
     let count = usize::from(u16::from_be_bytes([rest[0], rest[1]]));
     let entries = &rest[2..rest.len() - 64];
     if count > MAX_ENDORSED || entries.len() != count * ENTRY_LEN {
@@ -383,21 +419,24 @@ fn read_endorsement(bound: &Bound, bytes: &[u8]) -> Result<Vec<(String, DevicePu
     orbyn_crypto::verify(
         &bound.approver,
         ENDORSEMENT_CONTEXT,
-        &endorsement_message(bound, entries),
+        &endorsement_message(bound, sequence, entries),
         &signature,
     )
     .map_err(|_| bad())?;
-    entries
+    let devices = entries
         .chunks(ENTRY_LEN)
         .map(|e| {
             let id: [u8; 16] = e[..16].try_into().map_err(|_| bad())?;
+            let parent: [u8; 16] = e[80..96].try_into().map_err(|_| bad())?;
             Ok((
                 crate::format_uuid(&id),
                 DevicePublic {
                     signing: e[16..48].try_into().map_err(|_| bad())?,
                     agreement: e[48..80].try_into().map_err(|_| bad())?,
                 },
+                (parent != [0; 16]).then(|| crate::format_uuid(&parent)),
             ))
         })
-        .collect()
+        .collect::<Result<_>>()?;
+    Ok((sequence, devices))
 }

@@ -702,3 +702,77 @@ async fn two_devices_sync_encrypted_tasks_through_the_server() {
     assert_eq!(applied.removed, ["t1"]);
     assert!(applied.unverified_deletes.is_empty());
 }
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn devices_trusted_before_the_two_way_comparison_are_approved_again() {
+    let server = Server::start().await;
+    let email = format!("old-{}@example.com", Uuid::new_v4());
+    let a_keys = DeviceKeys::generate().expect("keys");
+    let a_session = server.sign_up(&email, &a_keys).await;
+    let b_keys = DeviceKeys::generate().expect("keys");
+    let b_session = server.sign_in(&email, &b_keys).await;
+    let device = |keys: &DeviceKeys, session: &wire::SessionCreated| Device {
+        engine: Engine::new(copy(keys), &session.account_id, &session.device_id).expect("engine"),
+        token: session.token.clone(),
+        id: session.device_id.clone(),
+        now: 1_800_000_000_000,
+    };
+    let mut a = device(&a_keys, &a_session);
+    let mut b = device(&b_keys, &b_session);
+    approve(&server, &mut a, &mut b).await;
+    // Make the account look as it does after migration 0006 on devices
+    // approved before it: trusted, with no approval any device can verify.
+    let account = Uuid::parse_str(&a_session.account_id).expect("uuid");
+    orbyn_core::sqlx::query(
+        "UPDATE devices SET approval_id = NULL, approval_created_at = NULL
+         WHERE account_id = $1",
+    )
+    .bind(account)
+    .execute(server.db.pool())
+    .await
+    .expect("old devices");
+    let mut a = device(&a_keys, &a_session);
+    let mut b = device(&b_keys, &b_session);
+    let ids = |peers: Vec<orbyn_client::Peer>| {
+        let mut ids: Vec<String> = peers.into_iter().map(|p| p.device_id).collect();
+        ids.sort();
+        ids
+    };
+    let mut both = vec![a.id.clone(), b.id.clone()];
+    both.sort();
+    // Each device trusts only itself, as an account's first device does.
+    let list = a.devices(&server).await;
+    assert_eq!(ids(a.engine.verify_devices(&list)), [a.id.clone()]);
+    assert_eq!(ids(b.engine.verify_devices(&list)), [b.id.clone()]);
+
+    // No device approves itself.
+    let me = list.devices.iter().find(|d| d.id == a.id).expect("a");
+    assert!(a.engine.start_approval(me, now_secs()).is_err());
+    let (status, body) = server
+        .call(
+            Method::POST,
+            "/v1/devices/approvals",
+            Some(&a.token),
+            Some(json!({
+                "approval_id": Uuid::new_v4().to_string(),
+                "device_id": a.id,
+                "created_at": now_secs(),
+                "commitment": b64(&[0; 32]),
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // The person picks a and approves the trusted-but-unverified b from it.
+    approve(&server, &mut a, &mut b).await;
+    let list = a.devices(&server).await;
+    let b_entry = list.devices.iter().find(|d| d.id == b.id).expect("b");
+    assert_eq!(b_entry.state, wire::DeviceState::Trusted);
+    assert_eq!(b_entry.approved_by.as_deref(), Some(a.id.as_str()));
+    assert!(b_entry.approval_id.is_some());
+    assert_eq!(ids(a.engine.verify_devices(&list)), both);
+    assert_eq!(ids(b.engine.verify_devices(&list)), both);
+    // A device a trusts now is not approved again.
+    assert!(a.engine.start_approval(b_entry, now_secs()).is_err());
+}

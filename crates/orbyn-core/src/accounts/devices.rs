@@ -24,8 +24,8 @@ use super::{
 };
 use chrono::{DateTime, Utc};
 use orbyn_auth_client::{
-    DEVICE_APPROVAL_CONTEXT, DEVICE_REMOVAL_CONTEXT, Pairing, approval_commitment,
-    approval_message, approval_sas, removal_message,
+    DEVICE_APPROVAL_CONTEXT, DEVICE_REMOVAL_CONTEXT, MAX_REMOVAL_SEQUENCE, Pairing,
+    approval_commitment, approval_message, approval_sas, removal_message,
 };
 use orbyn_crypto::DevicePublic;
 use sqlx::{Postgres, Transaction};
@@ -58,8 +58,8 @@ struct DeviceRow {
     approval_created_at: Option<i64>,
 }
 
-/// id, signing key, agreement key, removed by, removal signature.
-type RemovalRow = (Uuid, Vec<u8>, Vec<u8>, Uuid, Vec<u8>);
+/// id, signing key, agreement key, removed by, removal sequence, removal signature.
+type RemovalRow = (Uuid, Vec<u8>, Vec<u8>, Uuid, i64, Vec<u8>);
 
 #[derive(sqlx::FromRow)]
 struct ApprovalRow {
@@ -217,7 +217,8 @@ impl Accounts {
         .fetch_all(&mut *tx)
         .await?;
         let removed: Vec<RemovalRow> = sqlx::query_as(
-            "SELECT id, signing_key, agreement_key, removed_by, removal_signature FROM devices
+            "SELECT id, signing_key, agreement_key, removed_by, removal_sequence, removal_signature
+             FROM devices
              WHERE account_id = $1 AND state = 'removed' AND removal_signature IS NOT NULL
              ORDER BY removed_at, id",
         )
@@ -231,17 +232,20 @@ impl Accounts {
             .collect::<Result<_>>()?;
         let removals = removed
             .into_iter()
-            .map(|(device_id, signing, agreement, removed_by, signature)| {
-                Ok(Removal {
-                    device_id,
-                    keys: public_keys(&signing, &agreement)?,
-                    removed_by,
-                    signature: signature
-                        .as_slice()
-                        .try_into()
-                        .map_err(|_| AccountError::Internal)?,
-                })
-            })
+            .map(
+                |(device_id, signing, agreement, removed_by, sequence, signature)| {
+                    Ok(Removal {
+                        device_id,
+                        keys: public_keys(&signing, &agreement)?,
+                        removed_by,
+                        sequence: u64::try_from(sequence).map_err(|_| AccountError::Internal)?,
+                        signature: signature
+                            .as_slice()
+                            .try_into()
+                            .map_err(|_| AccountError::Internal)?,
+                    })
+                },
+            )
             .collect::<Result<_>>()?;
         Ok((devices, removals))
     }
@@ -320,9 +324,11 @@ impl Accounts {
     }
 
     /// Step 1, from a trusted device: opens approval `approval_id` (chosen by
-    /// the approver) for the pending `device_id`, made at `created_at` (Unix
-    /// seconds, near the server's clock), with its commitment. Any earlier
-    /// open approval for the device closes.
+    /// the approver) for `device_id`, made at `created_at` (Unix seconds, near
+    /// the server's clock), with its commitment. Any earlier open approval for
+    /// the device closes. The device is pending, or trusted here and approved
+    /// again because the approver's own check finds no approval it verifies;
+    /// the server cannot tell which, so it takes either.
     pub async fn create_approval(
         &self,
         client: &Client,
@@ -337,9 +343,12 @@ impl Accounts {
         }
         let mut tx = self.pool.begin().await?;
         self.require_trusted(&mut tx, session).await?;
+        if device_id == session.device_id {
+            return Err(AccountError::InvalidRequest);
+        }
         self.device(&mut tx, session.account_id, device_id)
             .await?
-            .filter(|d| d.state == DeviceState::Pending)
+            .filter(|d| matches!(d.state, DeviceState::Pending | DeviceState::Trusted))
             .ok_or(AccountError::NotFound)?;
         let taken: Option<i32> = sqlx::query_scalar("SELECT 1 FROM device_approvals WHERE id = $1")
             .bind(approval_id)
@@ -518,10 +527,11 @@ impl Accounts {
         Ok(())
     }
 
-    /// Step 5, from the pending device after the person confirmed: the six
-    /// digits it shows. One try: a wrong code closes the approval. On the
+    /// Step 5, from the device being approved after the person confirmed: the
+    /// six digits it shows. One try: a wrong code closes the approval. On the
     /// right code, with the approver still trusted and its signature still
-    /// valid, the device becomes trusted.
+    /// valid, the device becomes trusted, or a trusted device's approval is
+    /// replaced by this one.
     pub async fn submit_approval_code(
         &self,
         client: &Client,
@@ -609,7 +619,7 @@ impl Accounts {
         sqlx::query(
             "UPDATE devices SET state = 'trusted', approved_by = $2, approval_signature = $3,
                     approval_id = $4, approval_created_at = $5, approved_at = now()
-             WHERE id = $1 AND state = 'pending'",
+             WHERE id = $1 AND state IN ('pending', 'trusted')",
         )
         .bind(view.device_id)
         .bind(view.approver_id)
@@ -635,15 +645,20 @@ impl Accounts {
     }
 
     /// A trusted device removes `device_id`, which may be itself, with its
-    /// signature over [`removal_message`]. Its sessions end and its open
-    /// approvals close. The last trusted device stays.
+    /// signature over [`removal_message`] and `sequence`. Its sessions end and
+    /// its open approvals close. The last trusted device stays.
     pub async fn remove_device(
         &self,
         client: &Client,
         session: &Session,
         device_id: Uuid,
+        sequence: u64,
         signature: &[u8; 64],
     ) -> Result<()> {
+        let stored_sequence = i64::try_from(sequence)
+            .ok()
+            .filter(|_| sequence <= MAX_REMOVAL_SEQUENCE)
+            .ok_or(AccountError::InvalidRequest)?;
         let mut tx = self.pool.begin().await?;
         // Lock the account so two removals cannot each leave the other device last.
         sqlx::query("SELECT id FROM accounts WHERE id = $1 FOR UPDATE")
@@ -659,6 +674,7 @@ impl Accounts {
             session.account_id.as_bytes(),
             device_id.as_bytes(),
             &target.keys,
+            sequence,
         );
         verify_signed(&remover, DEVICE_REMOVAL_CONTEXT, &message, signature)?;
         if target.state == DeviceState::Trusted {
@@ -674,12 +690,13 @@ impl Accounts {
         }
         sqlx::query(
             "UPDATE devices SET state = 'removed', removed_at = now(), removed_by = $2,
-                    removal_signature = $3
+                    removal_signature = $3, removal_sequence = $4
              WHERE id = $1",
         )
         .bind(device_id)
         .bind(session.device_id)
         .bind(signature.as_slice())
+        .bind(stored_sequence)
         .execute(&mut *tx)
         .await?;
         sqlx::query(

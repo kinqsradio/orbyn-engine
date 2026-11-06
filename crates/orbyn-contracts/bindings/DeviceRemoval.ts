@@ -4,4 +4,8 @@
  * A removed device and the remover's signature over the
  * `orbyn/device-removal/v1` message.
  */
-export type DeviceRemoval = { device_id: string, signing_key: string, agreement_key: string, removed_by: string, signature: string, };
+export type DeviceRemoval = { device_id: string, signing_key: string, agreement_key: string, removed_by: string, 
+/**
+ * The remover's removal sequence, signed with the removal.
+ */
+sequence: number, signature: string, };
