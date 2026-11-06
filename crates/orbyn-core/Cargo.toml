@@ -7,13 +7,21 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+base64.workspace = true
+chrono.workspace = true
+getrandom.workspace = true
+hkdf.workspace = true
+orbyn-auth-client.workspace = true
+orbyn-crypto.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+zeroize.workspace = true
 
 [lints]
 workspace = true

@@ -1363,13 +1363,21 @@ dependencies = [
 name = "orbyn-core"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "chrono",
+ "getrandom 0.4.3",
+ "hkdf 0.13.0",
+ "orbyn-auth-client",
+ "orbyn-crypto",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "sqlx",
  "thiserror",
  "tokio",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -1392,13 +1400,19 @@ name = "orbyn-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
+ "chrono",
+ "orbyn-auth-client",
  "orbyn-contracts",
  "orbyn-core",
+ "orbyn-crypto",
+ "serde",
  "serde_json",
  "tokio",
  "tower",
  "tower-http",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

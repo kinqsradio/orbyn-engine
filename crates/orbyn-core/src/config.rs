@@ -1,5 +1,5 @@
-//! Settings, read from the environment. Nothing here is a secret except the
-//! database URL, which is never logged.
+//! Settings, read from the environment. The database URL and the sign-in setup
+//! are secrets and are never logged.
 
 use std::net::SocketAddr;
 
@@ -9,6 +9,13 @@ pub struct Config {
     pub bind: SocketAddr,
     /// Browser origins allowed to call the API, such as the planner's dev server.
     pub allowed_origins: Vec<String>,
+    /// The OPAQUE server setup from `orbyn auth-setup`. Without it the server
+    /// runs, but sign-up and sign-in answer 503.
+    pub auth_setup: Option<String>,
+    /// The header a trusted proxy puts the client address in, such as
+    /// `x-forwarded-for`; the last address in it is used. Without it, the
+    /// connection's own address is used.
+    pub client_ip_header: Option<String>,
 }
 
 impl std::fmt::Debug for Config {
@@ -17,6 +24,8 @@ impl std::fmt::Debug for Config {
             .field("database_url", &"(hidden)")
             .field("bind", &self.bind)
             .field("allowed_origins", &self.allowed_origins)
+            .field("auth_setup", &self.auth_setup.as_ref().map(|_| "(hidden)"))
+            .field("client_ip_header", &self.client_ip_header)
             .finish()
     }
 }
@@ -31,7 +40,8 @@ pub enum ConfigError {
 
 impl Config {
     /// Reads `DATABASE_URL`, `ORBYN_BIND` (default `127.0.0.1:8080`) and
-    /// `ORBYN_ALLOWED_ORIGINS` (comma-separated, default the planner's dev server).
+    /// `ORBYN_ALLOWED_ORIGINS` (comma-separated, default the planner's dev server),
+    /// `ORBYN_AUTH_SETUP` and `ORBYN_CLIENT_IP_HEADER` (both optional).
     pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_lookup(|name| std::env::var(name).ok())
     }
@@ -50,10 +60,17 @@ impl Config {
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty())
             .collect();
+        let optional = |name: &str| {
+            get(name)
+                .map(|v| v.trim().to_owned())
+                .filter(|v| !v.is_empty())
+        };
         Ok(Self {
             database_url,
             bind,
             allowed_origins,
+            auth_setup: optional("ORBYN_AUTH_SETUP"),
+            client_ip_header: optional("ORBYN_CLIENT_IP_HEADER").map(|v| v.to_lowercase()),
         })
     }
 }
@@ -76,6 +93,8 @@ mod tests {
         let config = Config::from_lookup(lookup(&[("DATABASE_URL", "postgres://x")]))?;
         assert_eq!(config.bind.to_string(), "127.0.0.1:8080");
         assert_eq!(config.allowed_origins, vec!["http://localhost:5173"]);
+        assert_eq!(config.auth_setup, None);
+        assert_eq!(config.client_ip_header, None);
         Ok(())
     }
 
@@ -97,7 +116,11 @@ mod tests {
 
     #[test]
     fn debug_hides_the_database_url() -> Result<(), ConfigError> {
-        let config = Config::from_lookup(lookup(&[("DATABASE_URL", "postgres://user:secret@db")]))?;
+        let config = Config::from_lookup(lookup(&[
+            ("DATABASE_URL", "postgres://user:secret@db"),
+            ("ORBYN_AUTH_SETUP", "setup-secret"),
+        ]))?;
+        assert_eq!(config.auth_setup.as_deref(), Some("setup-secret"));
         assert!(!format!("{config:?}").contains("secret"));
         Ok(())
     }

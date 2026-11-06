@@ -18,8 +18,9 @@ The plan lives in the [Orbyn platform plan](https://claude.ai/artifact/BBhxZSmXR
 | --- | --- | --- |
 | `orbyn-contracts` | Wire types; generates TypeScript into `bindings/` | Everywhere |
 | `orbyn-crypto` | Symmetric sealing, device keys, key wrapping, signatures, recovery keys | Devices (native and WebAssembly) |
+| `orbyn-auth-client` | The OPAQUE ciphersuite, the device side of sign-in, the messages devices sign | Devices (native and WebAssembly); the server uses its ciphersuite |
 | `orbyn-sync` | Hybrid logical clocks and field-by-field merge | Devices |
-| `orbyn-core` | Configuration, Postgres, migrations, job queue | Server |
+| `orbyn-core` | Configuration, Postgres, migrations, job queue, accounts and devices | Server |
 | `orbyn-server` | HTTP API | Server |
 | `orbyn-worker` | Job runner | Server |
 | `orbyn-cli` | The `orbyn` binary with every role | Server |
@@ -37,6 +38,29 @@ Later phases add `orbyn-planner` (planner rules), `orbyn-client` (the device eng
 - Secret types wipe themselves on drop and never print their bytes.
 - An outside review of this crate is required before launch.
 
+## Accounts and devices
+
+- Passwords use OPAQUE (RFC 9807, `opaque-ke` 4.0): Ristretto255 for the OPRF and the key exchange, triple Diffie-Hellman with SHA-512, and Argon2id (64 MiB, 3 passes, one lane) run on the device. The password never reaches the server; it stores only the registration record. Changing the ciphersuite or the Argon2id cost needs a versioned migration, because every record depends on it.
+- Emails are trimmed and lowercased, and unique. Sign-in never tells whether an email has an account: an unknown email gets a fake answer from the server setup, the same limits count it, and every failure is `login_failed`. Sign-up can tell that an email is taken (`email_unavailable`) until email verification exists.
+- `ORBYN_AUTH_SETUP` holds the OPAQUE server setup. It is a secret from `orbyn auth-setup`, the same on every replica and never in the database; a new one makes every password unusable. Without it the account routes answer 503. Two keys are derived from it with HKDF: one seals the server's half of a sign-in, the other keys the digests of IP addresses, rate-limit subjects and approval codes.
+- The server's half of a sign-in is sealed (XChaCha20-Poly1305, bound to the login id) and kept in Postgres for five minutes, so any replica can finish it. Finishing deletes it, so it works once.
+- A session token is 32 random bytes in base64url, returned once. Postgres keeps its SHA-256 digest with the account, device, creation, last use and expiry. Each use moves the expiry to 30 days later, never past one year after sign-in. A device can sign out itself; a trusted device can sign out every session.
+- Each device registers its Ed25519 and X25519 public keys with a name and platform, and signs a message that names the sign-up or the login id, so knowing the password is not enough to act as another device. The first device is trusted at sign-up. A device that signs in later is `pending` and can only see itself, answer an approval and sign out.
+- A trusted device approves a pending one by signing the account id, the pending device's id and its keys under `orbyn/device-approval/v1`. The server checks the signature, makes a uniform six-digit code (shown only on the trusted device) and keeps a keyed digest of it. The person types the code on the new device. Five wrong codes or ten minutes close the approval. On the right code the server checks the signature again, against the approver as it is now, before it trusts the device. Every device sees the approver and signature in the device list and checks them before trusting the new device's keys, so the server cannot add a device on its own.
+- Removing a device ends its sessions and closes its approvals at once. The last trusted device cannot be removed.
+- Rate limits live in Postgres as sliding windows and answer 429 `too_many_attempts`: sign-in 10 per email and 100 per address in 15 minutes; sign-up 20 per address an hour; approval codes 10 per account and 50 per address in 10 minutes. IPv6 addresses count by their /64. Each attempt is written before it is counted, so concurrent attempts cannot pass the limit together.
+- The audit log records sign-ups, sign-ins (and failures), sign-outs, approvals, wrong codes and removals with the account, device, time and a keyed digest of the address. It holds no emails, tokens, keys or plain addresses.
+- Behind a proxy, `ORBYN_CLIENT_IP_HEADER` names the header with the client address (its last entry is used). Set it only when every request comes through that proxy, or a caller can choose its own address.
+
+### Threat model
+
+- **Server compromise.** An attacker running the server sees no passwords and cannot add a device that other devices will trust: devices check approval signatures themselves. It can refuse service, issue sessions for pending devices it invents, and run an offline guessing attack on records with the setup secret, slowed by Argon2id on each guess.
+- **Stolen database.** Records cannot be tested against guesses without `ORBYN_AUTH_SETUP` (OPAQUE needs the OPRF key). Token digests cannot sign anyone in. Sealed sign-in states cannot be finished. Code, address and email digests are keyed, so small spaces cannot be reversed by trying every value.
+- **Phished code.** A code works only for the device the trusted device signed, and only for ten minutes and five tries. Someone who tricks a person into reading a code still needs the password and a pending device the trusted device chose to approve; the trusted device shows the pending device's name and platform before it signs.
+- **Brute force.** Password guesses need a full OPAQUE exchange each and are limited per email and per address, with no difference between known and unknown emails. Codes are limited per approval, account and address.
+
+Next: passkeys (WebAuthn) as a second sign-in method, TOTP as a second factor, email verification so sign-up stops revealing taken emails, and recovery-key sign-in for Advanced protection.
+
 ## Merging
 
 Each field carries a hybrid-logical-clock stamp (milliseconds, counter, device). A merge keeps the larger stamp per field, so merging is commutative, associative and idempotent. If two edits carry exactly the same stamp but different values, the one with the greater canonical JSON string wins, so even a reused stamp merges the same way everywhere. A delete is the `_deleted` field and merges like any other edit.
@@ -51,6 +75,6 @@ Delivery is at least once: a crash or a lost lease runs a job again. Handlers mu
 
 ## Running
 
-`docker compose up -d` starts Postgres, runs `orbyn migrate`, then `orbyn serve` on `127.0.0.1:8080` and one `orbyn worker`. The image is distroless and runs as a non-root user; `orbyn health` is its health check. Logs are JSON in the image and never include request bodies.
+`docker compose up -d` starts Postgres, runs `orbyn migrate`, then `orbyn serve` on `127.0.0.1:8080` and one `orbyn worker`. Sign-in needs `ORBYN_AUTH_SETUP` in the environment, from `orbyn auth-setup`. The image is distroless and runs as a non-root user; `orbyn health` is its health check. Logs are JSON in the image and never include request bodies.
 
 The compose Postgres trusts every connection without a password, and any container on the compose network can reach it. That is for local development only: no deployment may use `compose.yaml` or trust auth.
