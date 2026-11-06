@@ -34,6 +34,7 @@ struct RecordRow {
     author_device_id: Uuid,
     modified_at: DateTime<Utc>,
     deleted: bool,
+    delete_proof: Option<Vec<u8>>,
 }
 
 /// A record and the bytes of the page up to and including it.
@@ -54,6 +55,7 @@ fn record(row: RecordRow) -> Record {
         author_device_id: row.author_device_id,
         modified_at: row.modified_at,
         deleted: row.deleted,
+        delete_proof: row.delete_proof,
     }
 }
 
@@ -88,10 +90,15 @@ fn digest(upload: &Upload) -> [u8; 32] {
             Change::Delete {
                 record_id,
                 expected_version,
+                proof,
             } => {
                 field(&mut hash, b"delete");
                 field(&mut hash, record_id.as_bytes());
                 field(&mut hash, &expected_version.to_be_bytes());
+                match proof {
+                    Some(proof) => field(&mut hash, proof),
+                    None => field(&mut hash, b""),
+                }
             }
         }
     }
@@ -115,6 +122,13 @@ impl Store {
             }
             if let Some(v) = change.expected_version()
                 && v < 0
+            {
+                return Err(StoreError::InvalidRecord);
+            }
+            if let Change::Delete {
+                proof: Some(proof), ..
+            } = change
+                && (proof.is_empty() || proof.len() > limits.max_delete_proof)
             {
                 return Err(StoreError::InvalidRecord);
             }
@@ -188,7 +202,7 @@ impl Store {
         let ids: Vec<&str> = upload.changes.iter().map(Change::record_id).collect();
         let current: HashMap<String, Record> = sqlx::query_as::<_, RecordRow>(
             "SELECT record_id, record_type, version, ciphertext, wrapped_key, author_device_id,
-                    modified_at, deleted
+                    modified_at, deleted, delete_proof
              FROM records WHERE zone_id = $1 AND record_id = ANY($2)",
         )
         .bind(row.id)
@@ -268,7 +282,7 @@ impl Store {
         let mut seq = row.seq;
         for change in &upload.changes {
             seq += 1;
-            let (record_type, ciphertext, wrapped_key, deleted) = match change {
+            let (record_type, ciphertext, wrapped_key, deleted, proof) = match change {
                 Change::Save {
                     record_type,
                     ciphertext,
@@ -279,25 +293,30 @@ impl Store {
                     Some(ciphertext.as_slice()),
                     Some(wrapped_key.as_slice()),
                     false,
+                    None,
                 ),
-                Change::Delete { record_id, .. } => {
+                Change::Delete {
+                    record_id, proof, ..
+                } => {
                     // The conflict check found the record, so it has a type.
                     let kept = current
                         .get(record_id)
                         .map(|r| r.record_type.clone())
                         .ok_or(StoreError::Internal)?;
-                    (kept, None, None, true)
+                    (kept, None, None, true, proof.as_deref())
                 }
             };
             sqlx::query(
                 "INSERT INTO records (zone_id, record_id, record_type, version, ciphertext,
-                                      wrapped_key, author_device_id, modified_at, deleted)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                                      wrapped_key, author_device_id, modified_at, deleted,
+                                      delete_proof)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                  ON CONFLICT (zone_id, record_id) DO UPDATE SET
                      record_type = EXCLUDED.record_type, version = EXCLUDED.version,
                      ciphertext = EXCLUDED.ciphertext, wrapped_key = EXCLUDED.wrapped_key,
                      author_device_id = EXCLUDED.author_device_id,
-                     modified_at = EXCLUDED.modified_at, deleted = EXCLUDED.deleted",
+                     modified_at = EXCLUDED.modified_at, deleted = EXCLUDED.deleted,
+                     delete_proof = EXCLUDED.delete_proof",
             )
             .bind(row.id)
             .bind(change.record_id())
@@ -308,6 +327,7 @@ impl Store {
             .bind(session.device_id)
             .bind(modified_at)
             .bind(deleted)
+            .bind(proof)
             .execute(&mut *tx)
             .await?;
             saved.push(Saved {
@@ -411,7 +431,7 @@ impl Store {
         let rows: Vec<PageRow> =
             sqlx::query_as(
                 "SELECT record_id, record_type, version, ciphertext, wrapped_key, author_device_id,
-                        modified_at, deleted,
+                        modified_at, deleted, delete_proof,
                         (sum(coalesce(octet_length(ciphertext), 0) + coalesce(octet_length(wrapped_key), 0))
                             OVER (ORDER BY version))::bigint AS running
                  FROM records WHERE zone_id = $1 AND version > $2 AND version <= $3

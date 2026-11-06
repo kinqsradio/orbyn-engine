@@ -24,7 +24,7 @@ mod records;
 mod token;
 mod zones;
 
-pub use keychain::{Envelope, KEY_ID_LEN, NewEnvelope};
+pub use keychain::{Envelope, KEY_ID_LEN, NewEnvelope, Rotation};
 pub use live::{Feed, Hub, Notice};
 pub use token::ChangeToken;
 
@@ -53,6 +53,8 @@ pub struct Limits {
     pub max_batch_bytes: usize,
     pub max_ciphertext: usize,
     pub max_wrapped_key: usize,
+    /// Bytes of a delete proof.
+    pub max_delete_proof: usize,
     /// Records in one fetch.
     pub max_fetch: usize,
     /// A fetch stops adding records once they hold this many bytes (it always
@@ -76,6 +78,7 @@ impl Default for Limits {
             max_batch_bytes: 4 * 1024 * 1024,
             max_ciphertext: 256 * 1024,
             max_wrapped_key: 1024,
+            max_delete_proof: 256,
             max_fetch: 200,
             fetch_bytes: 4 * 1024 * 1024,
             max_envelope_batch: 100,
@@ -152,6 +155,8 @@ pub struct Record {
     pub author_device_id: Uuid,
     pub modified_at: DateTime<Utc>,
     pub deleted: bool,
+    /// A tombstone's proof from the deleting device; opaque to the server.
+    pub delete_proof: Option<Vec<u8>>,
 }
 
 /// One change in an upload.
@@ -166,10 +171,12 @@ pub enum Change {
         ciphertext: Vec<u8>,
         wrapped_key: Vec<u8>,
     },
-    /// Turns the record into a tombstone.
+    /// Turns the record into a tombstone. `proof` is the deleting device's
+    /// signature, stored with the tombstone for other devices to check.
     Delete {
         record_id: String,
         expected_version: i64,
+        proof: Option<Vec<u8>>,
     },
 }
 

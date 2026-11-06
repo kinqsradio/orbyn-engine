@@ -287,6 +287,11 @@ pub struct Record {
     /// RFC 3339.
     pub modified_at: String,
     pub deleted: bool,
+    /// A tombstone's proof from the device that deleted it, base64url; `None`
+    /// for live records and for tombstones left by deleting the zone.
+    #[serde(default)]
+    #[ts(optional)]
+    pub delete_proof: Option<String>,
 }
 
 /// One change in an upload.
@@ -312,6 +317,11 @@ pub enum RecordChange {
         record_id: String,
         #[ts(type = "number")]
         expected_version: i64,
+        /// The deleting device's signature over the delete, base64url, at most
+        /// 256 bytes decoded. Stored with the tombstone for other devices to check.
+        #[serde(default)]
+        #[ts(optional)]
+        proof: Option<String>,
     },
 }
 
@@ -393,6 +403,22 @@ pub struct NewKeyEnvelope {
     pub key_id: String,
     /// The wrapped key, base64url, at most 1 KiB decoded.
     pub envelope: String,
+    /// Set when this key replaced another one of the zone.
+    #[serde(default)]
+    #[ts(optional)]
+    pub rotation: Option<KeyRotation>,
+}
+
+/// The record of a zone key rotation, signed by the device that rotated it
+/// under `orbyn/zone-key-rotation/v1`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct KeyRotation {
+    /// The key this one replaces, base64url (16 bytes).
+    pub previous_key_id: String,
+    pub signer_device_id: String,
+    /// Base64url Ed25519 signature (64 bytes).
+    pub signature: String,
 }
 
 /// `POST /v1/keychain/envelopes`: at most 100 envelopes from the session's device.
@@ -414,6 +440,9 @@ pub struct KeyEnvelope {
     pub envelope: String,
     /// RFC 3339.
     pub created_at: String,
+    #[serde(default)]
+    #[ts(optional)]
+    pub rotation: Option<KeyRotation>,
 }
 
 /// `GET /v1/keychain/envelopes`: every envelope for this device from a device
@@ -472,10 +501,11 @@ mod tests {
         let delete = RecordChange::Delete {
             record_id: "a".into(),
             expected_version: 3,
+            proof: None,
         };
         assert_eq!(
             serde_json::to_string(&delete).expect("serialize"),
-            r#"{"op":"delete","record_id":"a","expected_version":3}"#
+            r#"{"op":"delete","record_id":"a","expected_version":3,"proof":null}"#
         );
         let save: RecordChange = serde_json::from_str(
             r#"{"op":"save","record_id":"a","record_type":"task","expected_version":null,"ciphertext":"AA","wrapped_key":""}"#,

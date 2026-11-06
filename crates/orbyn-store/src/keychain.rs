@@ -11,8 +11,26 @@ use uuid::Uuid;
 /// Length of a zone key id.
 pub const KEY_ID_LEN: usize = 16;
 
-/// sender, zone, key id, envelope, created at.
-type EnvelopeRow = (Uuid, String, Vec<u8>, Vec<u8>, DateTime<Utc>);
+#[derive(sqlx::FromRow)]
+struct EnvelopeRow {
+    sender_device_id: Uuid,
+    zone: String,
+    key_id: Vec<u8>,
+    envelope: Vec<u8>,
+    created_at: DateTime<Utc>,
+    previous_key_id: Option<Vec<u8>>,
+    rotation_signer: Option<Uuid>,
+    rotation_signature: Option<Vec<u8>>,
+}
+
+/// A rotated zone key's record: the key it replaces and the rotating device's
+/// signature. The server checks only the sizes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rotation {
+    pub previous_key_id: Vec<u8>,
+    pub signer_device_id: Uuid,
+    pub signature: Vec<u8>,
+}
 
 /// An envelope a device sends.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -21,6 +39,7 @@ pub struct NewEnvelope {
     pub zone: String,
     pub key_id: Vec<u8>,
     pub envelope: Vec<u8>,
+    pub rotation: Option<Rotation>,
 }
 
 /// An envelope addressed to the session's device.
@@ -31,6 +50,7 @@ pub struct Envelope {
     pub key_id: Vec<u8>,
     pub envelope: Vec<u8>,
     pub created_at: DateTime<Utc>,
+    pub rotation: Option<Rotation>,
 }
 
 impl Store {
@@ -49,6 +69,11 @@ impl Store {
                 && !e.envelope.is_empty()
                 && e.envelope.len() <= self.limits.max_envelope
                 && e.recipient_device_id != session.device_id
+                && e.rotation.as_ref().is_none_or(|r| {
+                    r.previous_key_id.len() == KEY_ID_LEN
+                        && r.previous_key_id != e.key_id
+                        && r.signature.len() == 64
+                })
                 && seen.insert((e.recipient_device_id, e.zone.as_str(), e.key_id.as_slice()));
             if !valid {
                 return Err(StoreError::InvalidEnvelope);
@@ -80,11 +105,15 @@ impl Store {
         for e in envelopes {
             sqlx::query(
                 "INSERT INTO key_envelopes
-                     (account_id, recipient_device_id, sender_device_id, zone, key_id, envelope)
-                 VALUES ($1, $2, $3, $4, $5, $6)
+                     (account_id, recipient_device_id, sender_device_id, zone, key_id, envelope,
+                      previous_key_id, rotation_signer, rotation_signature)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                  ON CONFLICT (recipient_device_id, zone, key_id) DO UPDATE
                  SET sender_device_id = EXCLUDED.sender_device_id,
-                     envelope = EXCLUDED.envelope, created_at = now()",
+                     envelope = EXCLUDED.envelope, created_at = now(),
+                     previous_key_id = EXCLUDED.previous_key_id,
+                     rotation_signer = EXCLUDED.rotation_signer,
+                     rotation_signature = EXCLUDED.rotation_signature",
             )
             .bind(session.account_id)
             .bind(e.recipient_device_id)
@@ -92,6 +121,9 @@ impl Store {
             .bind(&e.zone)
             .bind(&e.key_id)
             .bind(&e.envelope)
+            .bind(e.rotation.as_ref().map(|r| r.previous_key_id.as_slice()))
+            .bind(e.rotation.as_ref().map(|r| r.signer_device_id))
+            .bind(e.rotation.as_ref().map(|r| r.signature.as_slice()))
             .execute(&mut *tx)
             .await?;
         }
@@ -115,7 +147,8 @@ impl Store {
     pub async fn list_envelopes(&self, session: &Session) -> Result<Vec<Envelope>> {
         require_trusted(&self.pool, session, false).await?;
         let rows: Vec<EnvelopeRow> = sqlx::query_as(
-            "SELECT e.sender_device_id, e.zone, e.key_id, e.envelope, e.created_at
+            "SELECT e.sender_device_id, e.zone, e.key_id, e.envelope, e.created_at,
+                    e.previous_key_id, e.rotation_signer, e.rotation_signature
              FROM key_envelopes e JOIN devices s ON s.id = e.sender_device_id
              WHERE e.recipient_device_id = $1 AND e.account_id = $2
                AND s.account_id = $2 AND s.state = 'trusted'
@@ -127,15 +160,23 @@ impl Store {
         .await?;
         Ok(rows
             .into_iter()
-            .map(
-                |(sender_device_id, zone, key_id, envelope, created_at)| Envelope {
-                    sender_device_id,
-                    zone,
-                    key_id,
-                    envelope,
-                    created_at,
+            .map(|r| Envelope {
+                rotation: match (r.previous_key_id, r.rotation_signer, r.rotation_signature) {
+                    (Some(previous_key_id), Some(signer_device_id), Some(signature)) => {
+                        Some(Rotation {
+                            previous_key_id,
+                            signer_device_id,
+                            signature,
+                        })
+                    }
+                    _ => None,
                 },
-            )
+                sender_device_id: r.sender_device_id,
+                zone: r.zone,
+                key_id: r.key_id,
+                envelope: r.envelope,
+                created_at: r.created_at,
+            })
             .collect())
     }
 }

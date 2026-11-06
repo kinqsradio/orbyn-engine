@@ -264,6 +264,7 @@ fn wire_record(record: orbyn_store::Record) -> wire::Record {
         author_device_id: record.author_device_id.to_string(),
         modified_at: time(record.modified_at),
         deleted: record.deleted,
+        delete_proof: record.delete_proof.as_deref().map(encode),
     }
 }
 
@@ -285,9 +286,11 @@ fn change(change: wire::RecordChange) -> Answer<Change> {
         wire::RecordChange::Delete {
             record_id,
             expected_version,
+            proof,
         } => Change::Delete {
             record_id,
             expected_version,
+            proof: proof.as_deref().map(bytes).transpose()?,
         },
     })
 }

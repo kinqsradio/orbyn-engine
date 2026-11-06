@@ -9,7 +9,7 @@ use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
 use orbyn_contracts as wire;
-use orbyn_store::NewEnvelope;
+use orbyn_store::{NewEnvelope, Rotation};
 use uuid::Uuid;
 
 pub(crate) fn routes() -> Router<AppState> {
@@ -34,6 +34,17 @@ async fn put_envelopes(
                 zone: e.zone,
                 key_id: bytes(&e.key_id)?,
                 envelope: bytes(&e.envelope)?,
+                rotation: e
+                    .rotation
+                    .map(|r| {
+                        Answer::Ok(Rotation {
+                            previous_key_id: bytes(&r.previous_key_id)?,
+                            signer_device_id: Uuid::parse_str(&r.signer_device_id)
+                                .map_err(|_| Refusal::BadRequest)?,
+                            signature: bytes(&r.signature)?,
+                        })
+                    })
+                    .transpose()?,
             })
         })
         .collect::<Answer<Vec<_>>>()?;
@@ -55,6 +66,11 @@ async fn list_envelopes(
                 key_id: encode(&e.key_id),
                 envelope: encode(&e.envelope),
                 created_at: time(e.created_at),
+                rotation: e.rotation.map(|r| wire::KeyRotation {
+                    previous_key_id: encode(&r.previous_key_id),
+                    signer_device_id: r.signer_device_id.to_string(),
+                    signature: encode(&r.signature),
+                }),
             })
             .collect(),
     }))

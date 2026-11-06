@@ -6,8 +6,8 @@
 use orbyn_core::Database;
 use orbyn_core::accounts::{DeviceState, Session};
 use orbyn_store::{
-    Change, ChangeToken, Hub, KEY_ID_LEN, Limits, NewEnvelope, Notice, Store, StoreError, Upload,
-    ZONE_CHANGED_JOB,
+    Change, ChangeToken, Hub, KEY_ID_LEN, Limits, NewEnvelope, Notice, Rotation, Store, StoreError,
+    Upload, ZONE_CHANGED_JOB,
 };
 use std::time::Duration;
 use uuid::Uuid;
@@ -81,6 +81,7 @@ fn delete(id: &str, expected: i64) -> Change {
     Change::Delete {
         record_id: id.into(),
         expected_version: expected,
+        proof: Some(vec![5; 89]),
     }
 }
 
@@ -898,6 +899,7 @@ fn envelope(to: &Session, zone: &str, key: u8, bytes: &[u8]) -> NewEnvelope {
         zone: zone.into(),
         key_id: vec![key; KEY_ID_LEN],
         envelope: bytes.to_vec(),
+        rotation: None,
     }
 }
 
@@ -999,6 +1001,38 @@ async fn key_envelopes_reach_only_trusted_devices_of_the_account() {
         Err(StoreError::TooManyEnvelopes)
     ));
 
+    // A rotated key carries its record, returned as stored; a malformed one is refused.
+    let mut rotated = envelope(&phone, "work", 9, b"rotated");
+    rotated.rotation = Some(Rotation {
+        previous_key_id: vec![1; KEY_ID_LEN],
+        signer_device_id: laptop.device_id,
+        signature: vec![4; 64],
+    });
+    let mut bad = rotated.clone();
+    bad.key_id = vec![8; KEY_ID_LEN];
+    if let Some(r) = bad.rotation.as_mut() {
+        r.signature.pop();
+    }
+    assert!(matches!(
+        store.put_envelopes(&laptop, &[bad]).await,
+        Err(StoreError::InvalidEnvelope)
+    ));
+    sqlx::query("DELETE FROM key_envelopes WHERE recipient_device_id = $1 AND zone = 'home'")
+        .bind(phone.device_id)
+        .execute(db.pool())
+        .await
+        .expect("make room");
+    store
+        .put_envelopes(&laptop, &[rotated.clone()])
+        .await
+        .expect("rotation");
+    let got = store.list_envelopes(&phone).await.expect("list");
+    let stored = got
+        .iter()
+        .find(|e| e.key_id == rotated.key_id)
+        .expect("rotated");
+    assert_eq!(stored.rotation, rotated.rotation);
+
     // Once the sender is removed, its envelopes are no longer handed out.
     sqlx::query("UPDATE devices SET state = 'removed' WHERE id = $1")
         .bind(laptop.device_id)
@@ -1049,4 +1083,45 @@ async fn sending_envelopes_never_deadlocks_with_removing_a_device() {
     }
     let errors = hammer.await.expect("join");
     assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_tombstone_keeps_the_deleting_devices_proof() {
+    let (store, db) = store().await;
+    let me = trusted(&db).await;
+    store.create_zone(&me, "inbox").await.expect("zone");
+    store
+        .upload(&me, "inbox", &batch(vec![save("a", None, b"one")]))
+        .await
+        .expect("save");
+    let oversized = Change::Delete {
+        record_id: "a".into(),
+        expected_version: 1,
+        proof: Some(vec![1; 257]),
+    };
+    assert!(matches!(
+        store.upload(&me, "inbox", &batch(vec![oversized])).await,
+        Err(StoreError::InvalidRecord)
+    ));
+    store
+        .upload(&me, "inbox", &batch(vec![delete("a", 1)]))
+        .await
+        .expect("delete");
+    let changes = store
+        .fetch_changes(&me, "inbox", None, None)
+        .await
+        .expect("fetch");
+    assert!(changes.records[0].deleted);
+    assert_eq!(changes.records[0].delete_proof, Some(vec![5; 89]));
+    // Saving over the tombstone clears the proof.
+    store
+        .upload(&me, "inbox", &batch(vec![save("a", Some(2), b"back")]))
+        .await
+        .expect("save again");
+    let changes = store
+        .fetch_changes(&me, "inbox", None, None)
+        .await
+        .expect("fetch");
+    assert_eq!(changes.records[0].delete_proof, None);
 }
