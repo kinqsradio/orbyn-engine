@@ -29,6 +29,9 @@ pub struct Config {
     /// Uploads one client address may run at once on this replica; `None`
     /// keeps the store's default.
     pub max_uploads_per_address: Option<usize>,
+    /// Connections this process's database pool may open (`ORBYN_DATABASE_POOL_SIZE`).
+    /// The server and the worker are separate processes with a pool each.
+    pub database_pool_size: u32,
 }
 
 impl std::fmt::Debug for Config {
@@ -42,6 +45,7 @@ impl std::fmt::Debug for Config {
             .field("purge_after", &self.purge_after)
             .field("max_uploads_in_flight", &self.max_uploads_in_flight)
             .field("max_uploads_per_address", &self.max_uploads_per_address)
+            .field("database_pool_size", &self.database_pool_size)
             .finish()
     }
 }
@@ -58,6 +62,8 @@ pub enum ConfigError {
     InvalidUploadCap,
     #[error("ORBYN_MAX_UPLOADS_PER_ADDRESS is not a whole number from 1 to 1000")]
     InvalidAddressUploadCap,
+    #[error("ORBYN_DATABASE_POOL_SIZE is not a whole number from 2 to 200")]
+    InvalidPoolSize,
 }
 
 impl Config {
@@ -118,6 +124,15 @@ impl Config {
                     .ok_or(ConfigError::InvalidAddressUploadCap)?,
             ),
         };
+        let database_pool_size = match get("ORBYN_DATABASE_POOL_SIZE") {
+            None => crate::db::DEFAULT_POOL_SIZE,
+            Some(text) => text
+                .trim()
+                .parse::<u32>()
+                .ok()
+                .filter(|n| (crate::db::MIN_POOL_SIZE..=crate::db::MAX_POOL_SIZE).contains(n))
+                .ok_or(ConfigError::InvalidPoolSize)?,
+        };
         Ok(Self {
             database_url,
             bind,
@@ -127,6 +142,7 @@ impl Config {
             purge_after: Duration::from_secs(purge_days * 24 * 60 * 60),
             max_uploads_in_flight,
             max_uploads_per_address,
+            database_pool_size,
         })
     }
 }
@@ -194,6 +210,25 @@ mod tests {
         }
         let unset = Config::from_lookup(lookup(&[("DATABASE_URL", "postgres://x")]))?;
         assert_eq!(unset.max_uploads_per_address, None);
+        Ok(())
+    }
+
+    #[test]
+    fn the_pool_size_defaults_to_ten_and_is_bounded() -> Result<(), ConfigError> {
+        let with = |value: &str| {
+            Config::from_lookup(lookup(&[
+                ("DATABASE_URL", "postgres://x"),
+                ("ORBYN_DATABASE_POOL_SIZE", value),
+            ]))
+        };
+        let unset = Config::from_lookup(lookup(&[("DATABASE_URL", "postgres://x")]))?;
+        assert_eq!(unset.database_pool_size, 10);
+        assert_eq!(with("2")?.database_pool_size, 2);
+        assert_eq!(with(" 40 ")?.database_pool_size, 40);
+        assert_eq!(with("200")?.database_pool_size, 200);
+        for bad in ["1", "0", "201", "-5", "ten", "", "2.5"] {
+            assert_eq!(with(bad).err(), Some(ConfigError::InvalidPoolSize), "{bad}");
+        }
         Ok(())
     }
 

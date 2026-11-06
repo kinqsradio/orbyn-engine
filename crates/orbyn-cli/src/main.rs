@@ -81,7 +81,8 @@ async fn main() -> ExitCode {
 }
 
 async fn serve(config: Config) -> Result<(), String> {
-    let db = Database::connect_lazy(&config.database_url).map_err(|e| e.to_string())?;
+    let db = Database::connect_lazy_with_pool(&config.database_url, config.database_pool_size)
+        .map_err(|e| e.to_string())?;
     let mut state = orbyn_server::AppState::new(Arc::new(db.clone()));
     match &config.auth_setup {
         Some(setup) => {
@@ -138,7 +139,7 @@ async fn serve(config: Config) -> Result<(), String> {
 }
 
 async fn worker(config: Config) -> Result<(), String> {
-    let db = Database::connect(&config.database_url)
+    let db = Database::connect_with_pool(&config.database_url, config.database_pool_size)
         .await
         .map_err(|e| e.to_string())?;
     let (tx, rx) = watch::channel(false);

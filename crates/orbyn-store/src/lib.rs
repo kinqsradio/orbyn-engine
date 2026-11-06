@@ -94,6 +94,21 @@ pub struct Limits {
     pub max_sockets_per_account: usize,
 }
 
+impl Limits {
+    /// The caps on uploads running at once, as the store applies them. One address
+    /// never takes every replica slot (at most the replica cap less one), so another
+    /// address can always get in, however small the pool.
+    pub(crate) fn in_flight_caps(&self) -> inflight::Caps {
+        inflight::Caps {
+            account: self.max_uploads_in_flight,
+            address: self
+                .max_uploads_in_flight_per_address
+                .min(self.max_uploads_in_flight_global.saturating_sub(1).max(1)),
+            global: self.max_uploads_in_flight_global,
+        }
+    }
+}
+
 impl Default for Limits {
     fn default() -> Self {
         Self {
@@ -449,5 +464,40 @@ mod tests {
         assert!(!valid_name("", 64));
         assert!(!valid_name("a\u{0}b", 64));
         assert!(!valid_name("a\nb", 64));
+    }
+
+    /// A store on a pool of `size` connections that is never used.
+    async fn store_on_pool(size: u32) -> Store {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(size)
+            .connect_lazy("postgres://orbyn@127.0.0.1:1/none")
+            .expect("pool");
+        let hub = Hub::start(pool.clone());
+        Store::new(pool, hub)
+    }
+
+    #[tokio::test]
+    async fn the_replica_cap_is_half_the_pool_and_the_address_cap_leaves_room() {
+        // (pool, replica cap, address cap that applies)
+        for (pool, global, address) in [
+            (2, 1, 1),
+            (4, 2, 1),
+            (10, 5, 4),
+            (20, 10, 9),
+            (34, 17, 16),
+            (200, 100, 16),
+        ] {
+            let store = store_on_pool(pool).await;
+            let caps = store.limits().in_flight_caps();
+            assert_eq!(
+                store.limits().max_uploads_in_flight_global,
+                global,
+                "pool {pool}"
+            );
+            assert_eq!(caps.global, global, "pool {pool}");
+            assert_eq!(caps.address, address, "pool {pool}");
+            assert_eq!(caps.account, 4);
+            assert!(caps.address <= caps.global.saturating_sub(1).max(1));
+        }
     }
 }

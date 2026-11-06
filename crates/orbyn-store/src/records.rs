@@ -128,18 +128,7 @@ impl Store {
         if session.device_state != orbyn_core::accounts::DeviceState::Trusted {
             return Err(StoreError::DeviceNotTrusted);
         }
-        let caps = inflight::Caps {
-            account: self.limits.max_uploads_in_flight,
-            // One address never takes every replica slot, so another address
-            // can always get in, however small the pool.
-            address: self.limits.max_uploads_in_flight_per_address.min(
-                self.limits
-                    .max_uploads_in_flight_global
-                    .saturating_sub(1)
-                    .max(1),
-            ),
-            global: self.limits.max_uploads_in_flight_global,
-        };
+        let caps = self.limits.in_flight_caps();
         let slot = self
             .in_flight
             .enter(session.account_id, address, caps)
