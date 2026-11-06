@@ -23,9 +23,11 @@ pub struct Limits {
     /// has an account. Keyed on both, so nobody can lock an account out from
     /// elsewhere just by knowing the email.
     pub login_per_email_and_ip: Limit,
-    /// Failed sign-ins for one email from anywhere. Only wrong passwords count,
-    /// never starts, so the cap is high and a slow guesser is still stopped.
-    pub login_failures_per_email: Limit,
+    /// Sign-in starts for one email from anywhere. OPAQUE lets a client learn a
+    /// wrong password without finishing, so every start counts; a successful
+    /// sign-in gives its start back, and a start signed by an already trusted
+    /// device is not counted, so the owner cannot be locked out.
+    pub login_per_email: Limit,
     pub login_per_ip: Limit,
     /// Sign-up requests, start and finish, from one address.
     pub register_per_ip: Limit,
@@ -39,7 +41,7 @@ impl Default for Limits {
         const MINUTE: u64 = 60;
         Self {
             login_per_email_and_ip: Limit::new(10, Duration::from_secs(15 * MINUTE)),
-            login_failures_per_email: Limit::new(100, Duration::from_secs(60 * MINUTE)),
+            login_per_email: Limit::new(30, Duration::from_secs(60 * MINUTE)),
             login_per_ip: Limit::new(100, Duration::from_secs(15 * MINUTE)),
             register_per_ip: Limit::new(20, Duration::from_secs(60 * MINUTE)),
             approval_code_per_device: Limit::new(10, Duration::from_secs(10 * MINUTE)),
@@ -60,10 +62,16 @@ pub(crate) async fn allow(
     limit: Limit,
 ) -> Result<bool, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+    // Never wait for the lock: a burst on one subject is refused rather than
+    // holding pool connections.
+    let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
         .bind(lock_key(action, subject))
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await?;
+    if !locked {
+        tx.rollback().await?;
+        return Ok(false);
+    }
     let count = count_in(&mut *tx, action, subject, limit).await?;
     if count >= limit.max {
         tx.rollback().await?;
@@ -78,27 +86,22 @@ pub(crate) async fn allow(
     Ok(true)
 }
 
-/// Whether `subject` is still under `limit` for `action`, without recording anything.
-pub(crate) async fn under(
-    pool: &PgPool,
-    action: &str,
-    subject: &[u8; 32],
-    limit: Limit,
-) -> Result<bool, sqlx::Error> {
-    Ok(count_in(pool, action, subject, limit).await? < limit.max)
-}
-
-/// Records one event (such as a failed sign-in) that a later [`under`] counts.
-pub(crate) async fn record(
+/// Gives back the newest attempt by `subject` at `action`, as when a sign-in
+/// that was counted succeeds.
+pub(crate) async fn give_back(
     pool: &PgPool,
     action: &str,
     subject: &[u8; 32],
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("INSERT INTO auth_attempts (action, subject) VALUES ($1, $2)")
-        .bind(action)
-        .bind(subject.as_slice())
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "DELETE FROM auth_attempts WHERE id = (
+             SELECT id FROM auth_attempts WHERE action = $1 AND subject = $2
+             ORDER BY at DESC LIMIT 1)",
+    )
+    .bind(action)
+    .bind(subject.as_slice())
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -134,27 +137,26 @@ fn lock_key(action: &str, subject: &[u8; 32]) -> i64 {
 /// devices nobody approved within a week, in bounded batches. The worker runs
 /// it on a schedule.
 pub async fn prune(pool: &PgPool) -> Result<u64, sqlx::Error> {
-    let mut removed = 0;
-    removed += sqlx::query(
+    const BATCH: u64 = 5000;
+    const STATEMENTS: [&str; 3] = [
         "DELETE FROM auth_attempts WHERE id IN (
              SELECT id FROM auth_attempts WHERE at < now() - interval '1 day' LIMIT 5000)",
-    )
-    .execute(pool)
-    .await?
-    .rows_affected();
-    removed += sqlx::query(
         "DELETE FROM login_states WHERE id IN (
              SELECT id FROM login_states WHERE expires_at < now() LIMIT 5000)",
-    )
-    .execute(pool)
-    .await?
-    .rows_affected();
-    removed += sqlx::query(
         "DELETE FROM devices WHERE id IN (
-             SELECT id FROM devices WHERE state = 'pending' AND created_at < now() - interval '7 days' LIMIT 1000)",
-    )
-    .execute(pool)
-    .await?
-    .rows_affected();
+             SELECT id FROM devices WHERE state = 'pending' AND created_at < now() - interval '7 days' LIMIT 5000)",
+    ];
+    let mut removed = 0;
+    for statement in STATEMENTS {
+        // Keep deleting until a batch comes back short, so pruning keeps up
+        // however fast rows arrive; the cap stops one run from going on forever.
+        for _ in 0..100 {
+            let n = sqlx::query(statement).execute(pool).await?.rows_affected();
+            removed += n;
+            if n < BATCH {
+                break;
+            }
+        }
+    }
     Ok(removed)
 }

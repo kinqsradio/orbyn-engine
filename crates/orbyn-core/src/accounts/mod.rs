@@ -96,6 +96,28 @@ pub enum Platform {
     Linux,
 }
 
+/// A trusted device's signature over a sign-in start; see
+/// `orbyn_auth_client::trusted_start_message`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrustedStart {
+    pub signing_key: [u8; 32],
+    pub signed_at: i64,
+    pub signature: [u8; 64],
+}
+
+/// How far a trusted start's time may be from the server's clock.
+const TRUSTED_START_WINDOW_SECS: i64 = 300;
+
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// A sign-in state as read back: account, email digest, whether it was counted, sealed state.
+type LoginStateRow = (Option<Uuid>, Vec<u8>, bool, Vec<u8>);
+
 /// The most devices an account may have waiting for approval at once.
 const MAX_PENDING_DEVICES: i64 = 20;
 
@@ -445,6 +467,7 @@ impl Accounts {
         client: &Client,
         email: &str,
         request: &[u8],
+        trusted: Option<&TrustedStart>,
     ) -> Result<LoginChallenge> {
         let email = normalize_email(email).ok_or(AccountError::InvalidEmail)?;
         let email_subject = self.secrets.digest("login-email", email.as_bytes());
@@ -452,21 +475,29 @@ impl Accounts {
         let mut pair = email_subject.to_vec();
         pair.extend_from_slice(&ip_subject);
         let pair_subject = self.secrets.digest("login-email-ip", &pair);
-        let failures_ok = limits::under(
-            &self.pool,
-            "login-failed",
-            &email_subject,
-            self.limits.login_failures_per_email,
-        )
-        .await?;
-        let by_email = failures_ok
-            && limits::allow(
+        // A start signed by a device already trusted on this account skips the
+        // per-email limits, so the owner is never locked out by someone else's
+        // guessing. An invalid proof is simply ignored: it tells nobody anything.
+        let trusted = match trusted {
+            Some(proof) => self.is_trusted_start(&email, request, proof).await?,
+            None => false,
+        };
+        let by_email = trusted
+            || (limits::allow(
                 &self.pool,
-                "login",
-                &pair_subject,
-                self.limits.login_per_email_and_ip,
+                "login-email",
+                &email_subject,
+                self.limits.login_per_email,
             )
-            .await?;
+            .await?
+                && limits::allow(
+                    &self.pool,
+                    "login",
+                    &pair_subject,
+                    self.limits.login_per_email_and_ip,
+                )
+                .await?);
+        let counted = !trusted;
         let by_ip = limits::allow(
             &self.pool,
             "login-ip",
@@ -520,12 +551,13 @@ impl Accounts {
             )
             .map_err(|_| AccountError::Internal)?;
         sqlx::query(
-            "INSERT INTO login_states (id, account_id, email_subject, sealed, expires_at)
-             VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5))",
+            "INSERT INTO login_states (id, account_id, email_subject, counted, sealed, expires_at)
+             VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6))",
         )
         .bind(login_id)
         .bind(account_id)
         .bind(email_subject.as_slice())
+        .bind(counted)
         .bind(sealed.to_bytes())
         .bind(LOGIN_STATE_TTL.as_secs_f64())
         .execute(&self.pool)
@@ -549,14 +581,14 @@ impl Accounts {
     ) -> Result<NewSession> {
         let name = device.checked_name()?;
         // Taken and deleted at once: a sign-in state is used at most once.
-        let row: Option<(Option<Uuid>, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+        let row: Option<LoginStateRow> = sqlx::query_as(
             "DELETE FROM login_states WHERE id = $1 AND expires_at > now()
-             RETURNING account_id, email_subject, sealed",
+             RETURNING account_id, email_subject, counted, sealed",
         )
         .bind(login_id)
         .fetch_optional(&self.pool)
         .await?;
-        let (account_id, email_subject, sealed) = row.ok_or(AccountError::LoginFailed)?;
+        let (account_id, email_subject, counted, sealed) = row.ok_or(AccountError::LoginFailed)?;
         let state = Sealed::from_bytes(&sealed)
             .and_then(|sealed| {
                 self.secrets.state_key().open(
@@ -586,9 +618,6 @@ impl Accounts {
         let account_id = match (verified, account_id) {
             (true, Some(id)) => id,
             (_, account_id) => {
-                if let Ok(subject) = <[u8; 32]>::try_from(email_subject.as_slice()) {
-                    limits::record(&self.pool, "login-failed", &subject).await?;
-                }
                 self.audit(
                     &self.pool,
                     client,
@@ -625,6 +654,11 @@ impl Accounts {
                 (id, DeviceState::parse(&state)?)
             }
             None => {
+                // Lock the account so concurrent sign-ins cannot pass the cap together.
+                sqlx::query("SELECT id FROM accounts WHERE id = $1 FOR UPDATE")
+                    .bind(account_id)
+                    .execute(&mut *tx)
+                    .await?;
                 let pending: i64 = sqlx::query_scalar(
                     "SELECT count(*) FROM devices WHERE account_id = $1 AND state = 'pending'",
                 )
@@ -660,7 +694,50 @@ impl Accounts {
         )
         .await?;
         tx.commit().await?;
+        // A sign-in that worked gives back the start it was counted for, so the
+        // owner's own sign-ins never use up the per-email limit.
+        if counted && let Ok(subject) = <[u8; 32]>::try_from(email_subject.as_slice()) {
+            limits::give_back(&self.pool, "login-email", &subject).await?;
+        }
         Ok(session)
+    }
+
+    /// Whether `proof` is a fresh signature over this start by a device that is
+    /// trusted on the account with this email.
+    async fn is_trusted_start(
+        &self,
+        email: &str,
+        request: &[u8],
+        proof: &TrustedStart,
+    ) -> Result<bool> {
+        let now = unix_now_secs();
+        if (now - proof.signed_at).abs() > TRUSTED_START_WINDOW_SECS {
+            return Ok(false);
+        }
+        let signer = orbyn_crypto::DevicePublic {
+            signing: proof.signing_key,
+            agreement: [0; 32],
+        };
+        let message = orbyn_auth_client::trusted_start_message(email, request, proof.signed_at);
+        if orbyn_crypto::verify(
+            &signer,
+            orbyn_auth_client::TRUSTED_START_CONTEXT,
+            &message,
+            &proof.signature,
+        )
+        .is_err()
+        {
+            return Ok(false);
+        }
+        let trusted: Option<i32> = sqlx::query_scalar(
+            "SELECT 1 FROM devices d JOIN accounts a ON a.id = d.account_id
+             WHERE a.email = $1 AND d.signing_key = $2 AND d.state = 'trusted'",
+        )
+        .bind(email)
+        .bind(proof.signing_key.as_slice())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(trusted.is_some())
     }
 
     /// Checks that `session` belongs to a device that is trusted right now.

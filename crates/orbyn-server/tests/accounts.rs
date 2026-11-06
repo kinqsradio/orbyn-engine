@@ -523,7 +523,7 @@ async fn sign_in_attempts_are_limited_per_email_and_per_address() {
     let _turn = TURN.lock().await;
     let server = server_with(Limits {
         login_per_email_and_ip: Limit::new(3, Duration::from_secs(60)),
-        login_failures_per_email: Limit::new(100, Duration::from_secs(60)),
+        login_per_email: Limit::new(100, Duration::from_secs(60)),
         login_per_ip: Limit::new(8, Duration::from_secs(60)),
         ..Limits::default()
     })
@@ -564,39 +564,110 @@ async fn sign_in_attempts_are_limited_per_email_and_per_address() {
 
 #[tokio::test]
 #[ignore = "needs DATABASE_URL"]
-async fn knowing_an_email_is_not_enough_to_lock_its_owner_out() {
+async fn guessing_is_capped_per_email_but_a_trusted_device_still_signs_in() {
     let _turn = TURN.lock().await;
     let server = server_with(Limits {
+        login_per_email: Limit::new(5, Duration::from_secs(60)),
         login_per_email_and_ip: Limit::new(3, Duration::from_secs(60)),
-        login_failures_per_email: Limit::new(100, Duration::from_secs(60)),
         login_per_ip: Limit::new(100, Duration::from_secs(60)),
         ..Limits::default()
     })
     .await;
     let victim = email();
-    server
-        .register(&victim, b"pw", &DeviceKeys::generate().expect("keys"))
-        .await;
-    // Someone floods sign-in starts for the victim's email from many addresses,
-    // well past the limit, including refused requests.
-    for _ in 0..4 {
-        let attacker = random_ip();
-        for _ in 0..6 {
-            let (_, request) = auth::start_login(b"guess").expect("start");
-            server
-                .call_from(
-                    attacker,
-                    Method::POST,
-                    "/v1/sessions/login/start",
-                    None,
-                    Some(json!({"email": victim, "credential_request": b64(&request)})),
-                )
-                .await;
+    let laptop = DeviceKeys::generate().expect("keys");
+    server.register(&victim, b"pw", &laptop).await;
+
+    // Guesses from many addresses: OPAQUE lets the guesser check each one
+    // without finishing, so every start counts against the email.
+    let mut refused = 0;
+    for _ in 0..10 {
+        let (_, request) = auth::start_login(b"guess").expect("start");
+        let (status, _) = server
+            .call_from(
+                random_ip(),
+                Method::POST,
+                "/v1/sessions/login/start",
+                None,
+                Some(json!({"email": victim, "credential_request": b64(&request)})),
+            )
+            .await;
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            refused += 1;
         }
     }
-    // The owner, from their own address, can still sign in.
+    assert_eq!(refused, 5, "only five guesses an hour per email");
+
+    // Without a proof the owner waits like everyone else.
     let (_, status, _) = server.login_start(&victim, b"pw").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+
+    // From their trusted laptop, with a signed start, they sign in at once.
+    let normalized = auth::normalize_email(&victim).expect("email");
+    let (login, request) = auth::start_login(b"pw").expect("start");
+    let signed_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64;
+    let signature = laptop.sign(
+        auth::TRUSTED_START_CONTEXT,
+        &auth::trusted_start_message(&normalized, &request, signed_at),
+    );
+    let proof = json!({
+        "signing_key": b64(&laptop.public().signing),
+        "signed_at": signed_at,
+        "signature": b64(&signature),
+    });
+    let (status, started) = server
+        .call(
+            Method::POST,
+            "/v1/sessions/login/start",
+            None,
+            Some(json!({"email": victim, "credential_request": b64(&request), "trusted_device": proof})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{started}");
+    let finish = login
+        .finish(b"pw", &unb64(&started["credential_response"]))
+        .expect("right password");
+    let (status, _) = server
+        .login_finish(&started, &finish.finalization, &laptop)
+        .await;
     assert_eq!(status, StatusCode::OK);
+
+    // A proof from a key that is not trusted on this account is ignored.
+    let stranger = DeviceKeys::generate().expect("keys");
+    let (_, request) = auth::start_login(b"guess").expect("start");
+    let signature = stranger.sign(
+        auth::TRUSTED_START_CONTEXT,
+        &auth::trusted_start_message(&normalized, &request, signed_at),
+    );
+    let (status, _) = server
+        .call(
+            Method::POST,
+            "/v1/sessions/login/start",
+            None,
+            Some(json!({"email": victim, "credential_request": b64(&request), "trusted_device": {
+                "signing_key": b64(&stranger.public().signing), "signed_at": signed_at, "signature": b64(&signature)}})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn signing_in_gives_back_the_start_it_used() {
+    let _turn = TURN.lock().await;
+    let server = server_with(Limits {
+        login_per_email: Limit::new(2, Duration::from_secs(60)),
+        ..Limits::default()
+    })
+    .await;
+    let owner = email();
+    let keys = DeviceKeys::generate().expect("keys");
+    server.register(&owner, b"pw", &keys).await;
+    for _ in 0..5 {
+        server.login(&owner, b"pw", &keys).await;
+    }
 }
 
 #[tokio::test]

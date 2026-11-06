@@ -107,6 +107,24 @@ pub struct LoginStart {
     pub email: String,
     /// The OPAQUE credential request.
     pub credential_request: String,
+    /// Sent by a device that is already trusted on this account, so its sign-in
+    /// is not held back by the per-email limit that slows password guessing.
+    #[serde(default)]
+    #[ts(optional)]
+    pub trusted_device: Option<TrustedDeviceProof>,
+}
+
+/// A trusted device's signature over this sign-in start, made with
+/// `orbyn_auth_client::trusted_start_message`. Valid for five minutes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TrustedDeviceProof {
+    /// The device's Ed25519 public key, base64url.
+    pub signing_key: String,
+    /// Unix seconds when it was signed.
+    pub signed_at: i64,
+    /// Base64url Ed25519 signature.
+    pub signature: String,
 }
 
 /// The answer to [`LoginStart`]. It has the same shape whether or not the email
