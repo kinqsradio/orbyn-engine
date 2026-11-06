@@ -76,6 +76,18 @@ pub async fn allow(
         // A crowd already waits on this subject: a flood. Refuse without joining it.
         return Ok(false);
     };
+    allow_after_turn(pool, action, subject, limit).await
+}
+
+/// The count and the insert, under the subject's database lock, with a few short looks when another
+/// replica holds it. Reached only after the process-local turn (or by a test standing in for
+/// another replica).
+async fn allow_after_turn(
+    pool: &PgPool,
+    action: &str,
+    subject: &[u8; 32],
+    limit: Limit,
+) -> Result<bool, sqlx::Error> {
     for pause in LOCK_RETRIES {
         match admit(pool, action, subject, limit, false).await? {
             Admit::Allowed => return Ok(true),
@@ -90,58 +102,81 @@ pub async fn allow(
     ))
 }
 
-/// Attempts waiting for one subject's turn before a newcomer is refused as part of a flood.
+/// Attempts that may wait for one subject's turn, besides the one being served. A newcomer beyond
+/// that is part of a flood and is refused without joining.
 const MAX_WAITING: usize = 32;
 
-type Gates =
-    std::sync::Mutex<std::collections::HashMap<i64, std::sync::Arc<tokio::sync::Mutex<()>>>>;
-
-static GATES: std::sync::LazyLock<Gates> = std::sync::LazyLock::new(Default::default);
-
-/// One attempt's turn on a subject, within this process. Given back when dropped, and the subject
-/// is forgotten when nobody is waiting for it.
-struct Turn {
-    key: i64,
-    gate: Option<std::sync::Arc<tokio::sync::Mutex<()>>>,
-    _held: Option<tokio::sync::OwnedMutexGuard<()>>,
+/// One subject's turn-taking in this process. `lock` is the turn itself; `in_line` counts the
+/// attempt being served and every attempt waiting for it, and is kept apart from the lock so the
+/// bound does not depend on how many handles the lock has.
+struct Line {
+    lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    in_line: usize,
 }
 
-impl Turn {
-    /// Waits for this subject's turn, or `None` when [`MAX_WAITING`] attempts are already waiting.
-    async fn take(key: i64) -> Option<Self> {
-        let gate = {
-            let mut gates = GATES
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let gate = gates.entry(key).or_default().clone();
-            // The map's own handle and this one are two; every other is a waiter or the holder.
-            if std::sync::Arc::strong_count(&gate) > MAX_WAITING + 2 {
-                return None;
-            }
-            gate
-        };
-        let held = gate.clone().lock_owned().await;
+static GATES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<i64, Line>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// A place in a subject's line, taken before waiting and given back however the attempt ends
+/// (served, refused, or dropped while waiting because its client went away). The subject is
+/// forgotten when the last place is given back.
+struct Place {
+    key: i64,
+    lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Place {
+    /// A place in `key`'s line, or `None` when [`MAX_WAITING`] attempts already wait behind the
+    /// one being served.
+    fn join(key: i64) -> Option<Self> {
+        let mut gates = GATES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let line = gates.entry(key).or_insert_with(|| Line {
+            lock: Default::default(),
+            in_line: 0,
+        });
+        if line.in_line > MAX_WAITING {
+            return None;
+        }
+        line.in_line += 1;
         Some(Self {
             key,
-            gate: Some(gate),
-            _held: Some(held),
+            lock: line.lock.clone(),
         })
     }
 }
 
-impl Drop for Turn {
+impl Drop for Place {
     fn drop(&mut self) {
-        // Give the turn up first, then forget the subject if no one else holds its gate.
-        self._held.take();
-        let gate = self.gate.take();
         let mut gates = GATES
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(gate) = gate
-            && std::sync::Arc::strong_count(&gate) == 2
-        {
-            gates.remove(&self.key);
+        if let Some(line) = gates.get_mut(&self.key) {
+            line.in_line = line.in_line.saturating_sub(1);
+            if line.in_line == 0 {
+                gates.remove(&self.key);
+            }
         }
+    }
+}
+
+/// One attempt's turn on a subject. The place is taken before the wait, so an attempt dropped
+/// while waiting gives it back; fields drop in order, so the turn is released before the place.
+struct Turn {
+    _held: tokio::sync::OwnedMutexGuard<()>,
+    _place: Place,
+}
+
+impl Turn {
+    /// Waits for this subject's turn, or `None` when the line is full.
+    async fn take(key: i64) -> Option<Self> {
+        let place = Place::join(key)?;
+        let held = place.lock.clone().lock_owned().await;
+        Some(Self {
+            _held: held,
+            _place: place,
+        })
     }
 }
 
@@ -342,6 +377,182 @@ mod tests {
         let db = crate::Database::connect(&url).await.expect("connect");
         db.migrate().await.expect("migrate");
         db.pool().clone()
+    }
+
+    /// The attempts in line for a subject, served one included; zero when it is forgotten.
+    fn in_line(key: i64) -> usize {
+        GATES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .map_or(0, |line| line.in_line)
+    }
+
+    async fn until_in_line(key: i64, wanted: usize) {
+        for _ in 0..2000 {
+            if in_line(key) == wanted {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        panic!("{} in line, wanted {wanted}", in_line(key));
+    }
+
+    fn fresh_subject() -> [u8; 32] {
+        *uuid::Uuid::new_v4()
+            .as_bytes()
+            .repeat(2)
+            .first_chunk()
+            .expect("32")
+    }
+
+    #[test]
+    fn a_line_holds_the_one_served_and_thirty_two_waiting_and_forgets_the_subject() {
+        let key = i64::from_be_bytes(
+            *uuid::Uuid::new_v4()
+                .as_bytes()
+                .first_chunk::<8>()
+                .expect("8"),
+        );
+        let mut places: Vec<Place> = (0..33)
+            .map(|_| Place::join(key).expect("a place"))
+            .collect();
+        assert_eq!(in_line(key), 33);
+        assert!(Place::join(key).is_none(), "the 34th is part of a flood");
+        assert_eq!(in_line(key), 33, "a refusal takes no place");
+        places.pop();
+        assert!(
+            Place::join(key).is_some(),
+            "a place comes back when one is given up"
+        );
+        places.clear();
+        assert_eq!(in_line(key), 0);
+        assert!(
+            !GATES.lock().expect("gates").contains_key(&key),
+            "the subject is forgotten"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_attempt_dropped_while_waiting_leaves_nothing_behind() {
+        // The holder releases and the waiter is cancelled right after, as when a client goes away
+        // mid-wait: its place must go with it. A thousand subjects leave nothing in the map.
+        let base = i64::from_be_bytes(
+            *uuid::Uuid::new_v4()
+                .as_bytes()
+                .first_chunk::<8>()
+                .expect("8"),
+        );
+        let keys: Vec<i64> = (0..1000).map(|n| base.wrapping_add(n)).collect();
+        for &key in &keys {
+            let holder = Turn::take(key).await.expect("the first turn");
+            let waiter = tokio::spawn(Turn::take(key));
+            until_in_line(key, 2).await;
+            drop(holder);
+            waiter.abort();
+            drop(waiter.await); // cancelled, or already served: either way it is gone now
+            assert_eq!(in_line(key), 0, "subject {key} was left in the map");
+        }
+        let gates = GATES.lock().expect("gates");
+        assert!(keys.iter().all(|key| !gates.contains_key(key)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs DATABASE_URL"]
+    async fn the_line_is_thirty_two_waiting_and_a_crowd_beyond_it_is_refused() {
+        let pool = pool().await;
+        let subject = fresh_subject();
+        let limit = Limit::new(1000, Duration::from_secs(60));
+        let key = lock_key("test-line", &subject);
+        // The test holds the turn, so the line stays full while the crowd arrives.
+        let held = Turn::take(key).await.expect("the turn");
+        let spawn = |pool: PgPool| {
+            tokio::spawn(async move {
+                allow(&pool, "test-line", &subject, limit)
+                    .await
+                    .expect("answer")
+            })
+        };
+        // Exactly 32 wait: none of them is refused.
+        let waiting: Vec<_> = (0..32).map(|_| spawn(pool.clone())).collect();
+        until_in_line(key, 33).await;
+        // Eight more arrive and are refused at once, without waiting for the turn.
+        let late: Vec<_> = (0..8).map(|_| spawn(pool.clone())).collect();
+        for attempt in late {
+            assert!(!attempt.await.expect("task"), "beyond the line");
+        }
+        assert_eq!(in_line(key), 33, "the refused ones took no place");
+        drop(held);
+        for attempt in waiting {
+            assert!(attempt.await.expect("task"), "a waiting attempt is served");
+        }
+        assert_eq!(in_line(key), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs DATABASE_URL"]
+    async fn the_database_lock_keeps_another_replica_from_going_over_the_limit() {
+        let pool = pool().await;
+        let subject = fresh_subject();
+        let limit = Limit::new(5, Duration::from_secs(60));
+        // Twenty attempts that skip this process's line, as twenty from other replicas would: only
+        // the database lock keeps the count right.
+        let attempts: Vec<_> = (0..20)
+            .map(|_| {
+                let pool = pool.clone();
+                tokio::spawn(async move {
+                    allow_after_turn(&pool, "test-replicas", &subject, limit).await
+                })
+            })
+            .collect();
+        let mut allowed = 0;
+        for attempt in attempts {
+            if attempt.await.expect("task").expect("answer") {
+                allowed += 1;
+            }
+        }
+        assert_eq!(allowed, 5, "exactly the limit, however the attempts race");
+        let recorded: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM auth_attempts WHERE action = 'test-replicas' AND subject = $1",
+        )
+        .bind(subject.as_slice())
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+        assert_eq!(recorded, 5);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs DATABASE_URL"]
+    async fn a_lock_another_replica_holds_for_a_moment_is_waited_out() {
+        let pool = pool().await;
+        let subject = fresh_subject();
+        let limit = Limit::new(5, Duration::from_secs(60));
+        // Another connection holds the subject's database lock for 30 ms.
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+        let other = {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                let mut tx = pool.begin().await.expect("tx");
+                sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                    .bind(lock_key("test-held", &subject))
+                    .execute(&mut *tx)
+                    .await
+                    .expect("lock");
+                held_tx.send(()).expect("signal");
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                tx.commit().await.expect("release");
+            })
+        };
+        held_rx.await.expect("the lock is held");
+        let answer = allow(&pool, "test-held", &subject, limit)
+            .await
+            .expect("answer");
+        assert!(
+            answer,
+            "a lock held for 30 ms is looked at again, not taken for the limit"
+        );
+        other.await.expect("task");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
