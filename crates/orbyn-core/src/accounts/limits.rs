@@ -66,7 +66,133 @@ pub async fn allow(
     subject: &[u8; 32],
     limit: Limit,
 ) -> Result<bool, sqlx::Error> {
-    admit(pool, action, subject, limit, false).await
+    // A busy lock only means another attempt for this subject is counting at this very moment; it
+    // says nothing about the limit, and refusing for it would turn two honest requests from one
+    // address (two browsers on one network, two tabs) into "too many attempts" for a limit nobody
+    // has reached. So attempts for one subject take turns in this process first, waiting in memory
+    // (no pool connection is held while waiting), and the database lock is then only ever
+    // contended by another replica, for which a few short looks are enough.
+    let Some(_turn) = Turn::take(lock_key(action, subject)).await else {
+        // A crowd already waits on this subject: a flood. Refuse without joining it.
+        return Ok(false);
+    };
+    allow_after_turn(pool, action, subject, limit).await
+}
+
+/// The count and the insert, under the subject's database lock, with a few short looks when another
+/// replica holds it. Reached only after the process-local turn (or by a test standing in for
+/// another replica).
+async fn allow_after_turn(
+    pool: &PgPool,
+    action: &str,
+    subject: &[u8; 32],
+    limit: Limit,
+) -> Result<bool, sqlx::Error> {
+    for pause in LOCK_RETRIES {
+        match admit(pool, action, subject, limit, false).await? {
+            Admit::Allowed => return Ok(true),
+            Admit::Refused => return Ok(false),
+            Admit::LockBusy => tokio::time::sleep(pause).await,
+        }
+    }
+    // Still busy after about 75 ms of looking: a flood on one subject. Refuse rather than queue.
+    Ok(matches!(
+        admit(pool, action, subject, limit, false).await?,
+        Admit::Allowed
+    ))
+}
+
+/// Attempts that may wait for one subject's turn, besides the one being served. A newcomer beyond
+/// that is part of a flood and is refused without joining.
+const MAX_WAITING: usize = 32;
+
+/// One subject's turn-taking in this process. `lock` is the turn itself; `in_line` counts the
+/// attempt being served and every attempt waiting for it, and is kept apart from the lock so the
+/// bound does not depend on how many handles the lock has.
+struct Line {
+    lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    in_line: usize,
+}
+
+static GATES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<i64, Line>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// A place in a subject's line, taken before waiting and given back however the attempt ends
+/// (served, refused, or dropped while waiting because its client went away). The subject is
+/// forgotten when the last place is given back.
+struct Place {
+    key: i64,
+    lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Place {
+    /// A place in `key`'s line, or `None` when [`MAX_WAITING`] attempts already wait behind the
+    /// one being served.
+    fn join(key: i64) -> Option<Self> {
+        let mut gates = GATES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let line = gates.entry(key).or_insert_with(|| Line {
+            lock: Default::default(),
+            in_line: 0,
+        });
+        if line.in_line > MAX_WAITING {
+            return None;
+        }
+        line.in_line += 1;
+        Some(Self {
+            key,
+            lock: line.lock.clone(),
+        })
+    }
+}
+
+impl Drop for Place {
+    fn drop(&mut self) {
+        let mut gates = GATES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(line) = gates.get_mut(&self.key) {
+            line.in_line = line.in_line.saturating_sub(1);
+            if line.in_line == 0 {
+                gates.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// One attempt's turn on a subject. The place is taken before the wait, so an attempt dropped
+/// while waiting gives it back; fields drop in order, so the turn is released before the place.
+struct Turn {
+    _held: tokio::sync::OwnedMutexGuard<()>,
+    _place: Place,
+}
+
+impl Turn {
+    /// Waits for this subject's turn, or `None` when the line is full.
+    async fn take(key: i64) -> Option<Self> {
+        let place = Place::join(key)?;
+        let held = place.lock.clone().lock_owned().await;
+        Some(Self {
+            _held: held,
+            _place: place,
+        })
+    }
+}
+
+/// How long [`allow`] waits between looks at a busy subject: about 75 ms in all.
+const LOCK_RETRIES: [Duration; 4] = [
+    Duration::from_millis(5),
+    Duration::from_millis(10),
+    Duration::from_millis(20),
+    Duration::from_millis(40),
+];
+
+enum Admit {
+    Allowed,
+    Refused,
+    /// Another attempt holds the subject's lock; nothing was counted.
+    LockBusy,
 }
 
 /// How long [`allow_queued`] waits for a subject's lock before giving up.
@@ -96,8 +222,8 @@ pub async fn allow_queued(
     limit: Limit,
 ) -> Result<Queued, sqlx::Error> {
     match admit(pool, action, subject, limit, true).await {
-        Ok(true) => Ok(Queued::Allowed),
-        Ok(false) => Ok(Queued::Refused),
+        Ok(Admit::Allowed) => Ok(Queued::Allowed),
+        Ok(Admit::Refused | Admit::LockBusy) => Ok(Queued::Refused),
         // lock_not_available: the wait timed out.
         Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("55P03") => Ok(Queued::Busy),
         Err(err) => Err(err),
@@ -110,7 +236,7 @@ async fn admit(
     subject: &[u8; 32],
     limit: Limit,
     wait: bool,
-) -> Result<bool, sqlx::Error> {
+) -> Result<Admit, sqlx::Error> {
     let mut tx = pool.begin().await?;
     if wait {
         // Local to this transaction, like SET LOCAL.
@@ -129,13 +255,13 @@ async fn admit(
             .await?;
         if !locked {
             tx.rollback().await?;
-            return Ok(false);
+            return Ok(Admit::LockBusy);
         }
     }
     let count = count_in(&mut *tx, action, subject, limit).await?;
     if count >= limit.max {
         tx.rollback().await?;
-        return Ok(false);
+        return Ok(Admit::Refused);
     }
     sqlx::query("INSERT INTO auth_attempts (action, subject) VALUES ($1, $2)")
         .bind(action)
@@ -143,7 +269,7 @@ async fn admit(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    Ok(true)
+    Ok(Admit::Allowed)
 }
 
 /// How long until `subject` may try `action` again, rounded up to whole
@@ -251,6 +377,230 @@ mod tests {
         let db = crate::Database::connect(&url).await.expect("connect");
         db.migrate().await.expect("migrate");
         db.pool().clone()
+    }
+
+    /// The attempts in line for a subject, served one included; zero when it is forgotten.
+    fn in_line(key: i64) -> usize {
+        GATES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .map_or(0, |line| line.in_line)
+    }
+
+    async fn until_in_line(key: i64, wanted: usize) {
+        for _ in 0..2000 {
+            if in_line(key) == wanted {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        panic!("{} in line, wanted {wanted}", in_line(key));
+    }
+
+    fn fresh_subject() -> [u8; 32] {
+        *uuid::Uuid::new_v4()
+            .as_bytes()
+            .repeat(2)
+            .first_chunk()
+            .expect("32")
+    }
+
+    #[test]
+    fn a_line_holds_the_one_served_and_thirty_two_waiting_and_forgets_the_subject() {
+        let key = i64::from_be_bytes(
+            *uuid::Uuid::new_v4()
+                .as_bytes()
+                .first_chunk::<8>()
+                .expect("8"),
+        );
+        let mut places: Vec<Place> = (0..33)
+            .map(|_| Place::join(key).expect("a place"))
+            .collect();
+        assert_eq!(in_line(key), 33);
+        assert!(Place::join(key).is_none(), "the 34th is part of a flood");
+        assert_eq!(in_line(key), 33, "a refusal takes no place");
+        places.pop();
+        assert!(
+            Place::join(key).is_some(),
+            "a place comes back when one is given up"
+        );
+        places.clear();
+        assert_eq!(in_line(key), 0);
+        assert!(
+            !GATES.lock().expect("gates").contains_key(&key),
+            "the subject is forgotten"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_attempt_dropped_while_waiting_leaves_nothing_behind() {
+        // The holder releases and the waiter is cancelled right after, as when a client goes away
+        // mid-wait: its place must go with it. A thousand subjects leave nothing in the map.
+        let base = i64::from_be_bytes(
+            *uuid::Uuid::new_v4()
+                .as_bytes()
+                .first_chunk::<8>()
+                .expect("8"),
+        );
+        let keys: Vec<i64> = (0..1000).map(|n| base.wrapping_add(n)).collect();
+        for &key in &keys {
+            let holder = Turn::take(key).await.expect("the first turn");
+            let waiter = tokio::spawn(Turn::take(key));
+            until_in_line(key, 2).await;
+            drop(holder);
+            waiter.abort();
+            drop(waiter.await); // cancelled, or already served: either way it is gone now
+            assert_eq!(in_line(key), 0, "subject {key} was left in the map");
+        }
+        let gates = GATES.lock().expect("gates");
+        assert!(keys.iter().all(|key| !gates.contains_key(key)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs DATABASE_URL"]
+    async fn the_line_is_thirty_two_waiting_and_a_crowd_beyond_it_is_refused() {
+        let pool = pool().await;
+        let subject = fresh_subject();
+        let limit = Limit::new(1000, Duration::from_secs(60));
+        let key = lock_key("test-line", &subject);
+        // The test holds the turn, so the line stays full while the crowd arrives.
+        let held = Turn::take(key).await.expect("the turn");
+        let spawn = |pool: PgPool| {
+            tokio::spawn(async move {
+                allow(&pool, "test-line", &subject, limit)
+                    .await
+                    .expect("answer")
+            })
+        };
+        // Exactly 32 wait: none of them is refused.
+        let waiting: Vec<_> = (0..32).map(|_| spawn(pool.clone())).collect();
+        until_in_line(key, 33).await;
+        // Eight more arrive and are refused at once, without waiting for the turn.
+        let late: Vec<_> = (0..8).map(|_| spawn(pool.clone())).collect();
+        for attempt in late {
+            assert!(!attempt.await.expect("task"), "beyond the line");
+        }
+        assert_eq!(in_line(key), 33, "the refused ones took no place");
+        drop(held);
+        for attempt in waiting {
+            assert!(attempt.await.expect("task"), "a waiting attempt is served");
+        }
+        assert_eq!(in_line(key), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs DATABASE_URL"]
+    async fn the_database_lock_keeps_another_replica_from_going_over_the_limit() {
+        let pool = pool().await;
+        let subject = fresh_subject();
+        let limit = Limit::new(5, Duration::from_secs(60));
+        // Twenty attempts that skip this process's line, as twenty from other replicas would: only
+        // the database lock keeps the count right.
+        let attempts: Vec<_> = (0..20)
+            .map(|_| {
+                let pool = pool.clone();
+                tokio::spawn(async move {
+                    allow_after_turn(&pool, "test-replicas", &subject, limit).await
+                })
+            })
+            .collect();
+        let mut allowed = 0;
+        for attempt in attempts {
+            if attempt.await.expect("task").expect("answer") {
+                allowed += 1;
+            }
+        }
+        assert_eq!(allowed, 5, "exactly the limit, however the attempts race");
+        let recorded: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM auth_attempts WHERE action = 'test-replicas' AND subject = $1",
+        )
+        .bind(subject.as_slice())
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+        assert_eq!(recorded, 5);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs DATABASE_URL"]
+    async fn a_lock_another_replica_holds_for_a_moment_is_waited_out() {
+        let pool = pool().await;
+        let subject = fresh_subject();
+        let limit = Limit::new(5, Duration::from_secs(60));
+        // Another connection holds the subject's database lock for 30 ms.
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+        let other = {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                let mut tx = pool.begin().await.expect("tx");
+                sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                    .bind(lock_key("test-held", &subject))
+                    .execute(&mut *tx)
+                    .await
+                    .expect("lock");
+                held_tx.send(()).expect("signal");
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                tx.commit().await.expect("release");
+            })
+        };
+        held_rx.await.expect("the lock is held");
+        let answer = allow(&pool, "test-held", &subject, limit)
+            .await
+            .expect("answer");
+        assert!(
+            answer,
+            "a lock held for 30 ms is looked at again, not taken for the limit"
+        );
+        other.await.expect("task");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs DATABASE_URL"]
+    async fn simultaneous_attempts_of_one_subject_are_not_refused_for_a_limit_nobody_reached() {
+        let pool = pool().await;
+        let subject = *uuid::Uuid::new_v4()
+            .as_bytes()
+            .repeat(2)
+            .first_chunk()
+            .expect("32");
+        let limit = Limit::new(1000, Duration::from_secs(60));
+        // Many requests from one address at the same moment: far below the limit, so all pass.
+        let attempts: Vec<_> = (0..16)
+            .map(|_| {
+                let pool = pool.clone();
+                tokio::spawn(
+                    async move { allow(&pool, "test-simultaneous", &subject, limit).await },
+                )
+            })
+            .collect();
+        let mut refused = 0;
+        for attempt in attempts {
+            if !attempt.await.expect("task").expect("answer") {
+                refused += 1;
+            }
+        }
+        assert_eq!(
+            refused, 0,
+            "attempts refused although the limit was nowhere near"
+        );
+        // The limit itself still holds.
+        let tight = Limit::new(3, Duration::from_secs(60));
+        let other = *uuid::Uuid::new_v4()
+            .as_bytes()
+            .repeat(2)
+            .first_chunk()
+            .expect("32");
+        let mut allowed = 0;
+        for _ in 0..6 {
+            if allow(&pool, "test-simultaneous", &other, tight)
+                .await
+                .expect("answer")
+            {
+                allowed += 1;
+            }
+        }
+        assert_eq!(allowed, 3);
     }
 
     #[tokio::test]
