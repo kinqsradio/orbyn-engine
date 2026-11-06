@@ -17,12 +17,13 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use orbyn_auth_client as auth;
 use orbyn_client::{ClientError, Engine};
 use orbyn_contracts as wire;
-use orbyn_crypto::DevicePublic;
+use orbyn_crypto::{DevicePublic, Sealed, SymmetricKey};
 use orbyn_planner::Item;
 use orbyn_sync::{Fields, Stamp};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use wasm_bindgen::prelude::*;
+use zeroize::Zeroizing;
 
 /// An error for JavaScript: a stable code and a sentence. Never key material,
 /// passwords or record content.
@@ -100,19 +101,47 @@ fn key32(text: &str) -> Result<[u8; 32]> {
         .map_err(|_| error("invalid_input", "a public key is 32 bytes"))
 }
 
-/// A UUID in its usual text form, as its 16 bytes.
+/// A UUID in its usual text form (ASCII hex and dashes only) as its 16 bytes.
 fn uuid_bytes(text: &str) -> Result<[u8; 16]> {
-    let hex: String = text.chars().filter(|c| *c != '-').collect();
-    if hex.len() != 32 || text.len() != 36 {
-        return Err(error("invalid_input", "not a UUID"));
-    }
-    let mut out = [0u8; 16];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16)
-            .map_err(|_| error("invalid_input", "not a UUID"))?;
-    }
+    orbyn_client::uuid_bytes(text).map_err(|_| error("invalid_input", "not a UUID"))
+}
+
+/// Local sealing: what leaves WebAssembly to be stored is sealed under a key
+/// derived from the host's wrapping secret. The format is a version byte (1)
+/// and the sealed bytes.
+const LOCAL_FORMAT: u8 = 1;
+
+fn local_seal(secret: &[u8], purpose: &str, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
+    let key = SymmetricKey::derive(secret, purpose).map_err(|_| {
+        error(
+            "invalid_wrap_secret",
+            "the wrapping secret must be 32 bytes or more",
+        )
+    })?;
+    let sealed = key.seal(purpose, aad, plaintext)?;
+    let mut out = vec![LOCAL_FORMAT];
+    out.extend_from_slice(&sealed.to_bytes());
     Ok(out)
 }
+
+fn local_open(secret: &[u8], purpose: &str, aad: &[u8], blob: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+    let key = SymmetricKey::derive(secret, purpose).map_err(|_| {
+        error(
+            "invalid_wrap_secret",
+            "the wrapping secret must be 32 bytes or more",
+        )
+    })?;
+    let Some((&LOCAL_FORMAT, rest)) = blob.split_first() else {
+        return Err(error("open_failed", "not a sealed blob"));
+    };
+    let sealed = Sealed::from_bytes(rest).map_err(|_| error("open_failed", "not a sealed blob"))?;
+    key.open(purpose, aad, &sealed)
+        .map(Zeroizing::new)
+        .map_err(|_| error("open_failed", "wrong wrapping secret or changed bytes"))
+}
+
+const DEVICE_KEYS_PURPOSE: &str = "orbyn/local/device-keys/v1";
+const SNAPSHOT_PURPOSE: &str = "orbyn/local/snapshot/v1";
 
 fn millis(now: f64) -> u64 {
     if now.is_finite() && now > 0.0 {
@@ -143,17 +172,24 @@ impl DeviceKeys {
         })
     }
 
-    /// Keys saved with `export`.
+    /// Keys saved with `export` under the same wrapping secret.
     #[wasm_bindgen(js_name = import)]
-    pub fn import_bytes(bytes: &[u8]) -> Result<DeviceKeys> {
+    pub fn import_sealed(sealed: &[u8], wrap_secret: &[u8]) -> Result<DeviceKeys> {
+        let bytes = local_open(wrap_secret, DEVICE_KEYS_PURPOSE, b"", sealed)?;
         Ok(Self {
-            keys: orbyn_crypto::DeviceKeys::from_bytes(bytes)?,
+            keys: orbyn_crypto::DeviceKeys::from_bytes(&bytes)?,
         })
     }
 
-    /// The 64 secret bytes, for the host's key store. Keep them secret.
-    pub fn export(&self) -> Vec<u8> {
-        self.keys.to_bytes().to_vec()
+    /// The keys sealed under `wrap_secret` (see the README), for the host to
+    /// store. The secret bytes themselves never leave WebAssembly.
+    pub fn export(&self, wrap_secret: &[u8]) -> Result<Vec<u8>> {
+        local_seal(
+            wrap_secret,
+            DEVICE_KEYS_PURPOSE,
+            b"",
+            self.keys.to_bytes().as_slice(),
+        )
     }
 
     /// The Ed25519 public key, base64url, as `NewDevice.signing_key`.
@@ -347,23 +383,36 @@ pub struct SyncEngine {
 
 #[wasm_bindgen]
 impl SyncEngine {
-    /// A new engine with nothing cached.
-    pub fn create(keys: &DeviceKeys) -> Result<SyncEngine> {
+    /// A new engine for this device (`SessionCreated.account_id` and `device_id`).
+    pub fn create(keys: &DeviceKeys, account_id: &str, device_id: &str) -> Result<SyncEngine> {
         Ok(Self {
-            engine: Engine::new(keys.copy()?),
+            engine: Engine::new(keys.copy()?, account_id, device_id)?,
         })
     }
 
-    /// An engine from `snapshot()`.
-    pub fn restore(keys: &DeviceKeys, snapshot_json: &str, now: f64) -> Result<SyncEngine> {
+    /// An engine from a `snapshot` sealed under the same wrapping secret.
+    pub fn restore(
+        keys: &DeviceKeys,
+        sealed: &[u8],
+        wrap_secret: &[u8],
+        now: f64,
+    ) -> Result<SyncEngine> {
+        let aad = keys.keys.public().signing;
+        let json = local_open(wrap_secret, SNAPSHOT_PURPOSE, &aad, sealed)?;
+        let snapshot = serde_json::from_slice(&json).map_err(|e| error("invalid_json", e))?;
         Ok(Self {
-            engine: Engine::restore(keys.copy()?, parse(snapshot_json)?, millis(now))?,
+            engine: Engine::restore(keys.copy()?, snapshot, millis(now))?,
         })
     }
 
-    /// The state to store. It holds zone keys: keep it as secret as the device keys.
-    pub fn snapshot(&self) -> Result<String> {
-        to_json(&self.engine.snapshot())
+    /// The engine's state sealed under `wrap_secret`, bound to this device's
+    /// keys. Zone keys inside it never leave WebAssembly in the clear.
+    pub fn snapshot(&self, wrap_secret: &[u8]) -> Result<Vec<u8>> {
+        let json = Zeroizing::new(
+            serde_json::to_vec(&self.engine.snapshot()).map_err(|e| error("encode_failed", e))?,
+        );
+        let aad = self.engine.device_keys().public().signing;
+        local_seal(wrap_secret, SNAPSHOT_PURPOSE, &aad, &json)
     }
 
     /// A `Stamp` for a new edit at `now` (milliseconds).
@@ -481,25 +530,83 @@ impl SyncEngine {
         Ok(self.engine.create_zone_key(zone)?)
     }
 
-    /// A `PutKeyEnvelopes` sealing every key of the zone to each trusted device
-    /// of `devices_json` (a `DeviceList`) but this one.
+    /// A `PutKeyEnvelopes` sealing every key of the zone to each device of
+    /// `devices_json` (a `DeviceList`) this device verifies, other than itself.
     #[wasm_bindgen(js_name = envelopesFor)]
-    pub fn envelopes_for(&self, zone: &str, devices_json: &str) -> Result<String> {
+    pub fn envelopes_for(&mut self, zone: &str, devices_json: &str) -> Result<String> {
         let devices: wire::DeviceList = parse(devices_json)?;
-        let peers = orbyn_client::trusted_peers(&devices)?;
         to_json(&wire::PutKeyEnvelopes {
-            envelopes: self.engine.envelopes_for(zone, &peers)?,
+            envelopes: self.engine.envelopes_for(zone, &devices)?,
         })
     }
 
-    /// Opens a `KeyEnvelopeList` from the trusted devices of `devices_json`;
-    /// returns `{zones, refused}`.
+    /// Opens a `KeyEnvelopeList`, only from devices of `devices_json` this
+    /// device verifies; returns `{zones, refused}`. Call `retryQuarantined`
+    /// for each zone that got a key.
     #[wasm_bindgen(js_name = acceptEnvelopes)]
     pub fn accept_envelopes(&mut self, envelopes_json: &str, devices_json: &str) -> Result<String> {
         let list: wire::KeyEnvelopeList = parse(envelopes_json)?;
         let devices: wire::DeviceList = parse(devices_json)?;
-        let peers = orbyn_client::trusted_peers(&devices)?;
-        to_json(&self.engine.accept_envelopes(&list.envelopes, &peers))
+        to_json(&self.engine.accept_envelopes(&list.envelopes, &devices))
+    }
+
+    /// The device ids of `devices_json` this device verifies by approval chain.
+    #[wasm_bindgen(js_name = verifyDevices)]
+    pub fn verify_devices(&mut self, devices_json: &str) -> Result<String> {
+        let devices: wire::DeviceList = parse(devices_json)?;
+        let ids: Vec<String> = self
+            .engine
+            .verify_devices(&devices)
+            .into_iter()
+            .map(|p| p.device_id)
+            .collect();
+        to_json(&ids)
+    }
+
+    /// Trusts a device the person checked another way (keys base64url).
+    #[wasm_bindgen(js_name = pinDevice)]
+    pub fn pin_device(
+        &mut self,
+        device_id: &str,
+        signing_key: &str,
+        agreement_key: &str,
+    ) -> Result<()> {
+        let public = DevicePublic {
+            signing: key32(signing_key)?,
+            agreement: key32(agreement_key)?,
+        };
+        Ok(self.engine.pin_device(device_id, public)?)
+    }
+
+    /// Replaces the zone's current key with a new one signed by this device;
+    /// returns its id. Send it with `envelopesFor`.
+    #[wasm_bindgen(js_name = rotateZoneKey)]
+    pub fn rotate_zone_key(&mut self, zone: &str) -> Result<String> {
+        Ok(self.engine.rotate_zone_key(zone)?)
+    }
+
+    /// Tries quarantined records again; returns what changed (`Applied`).
+    #[wasm_bindgen(js_name = retryQuarantined)]
+    pub fn retry_quarantined(&mut self, zone: &str, now: f64) -> Result<String> {
+        to_json(&self.engine.retry_quarantined(zone, millis(now)))
+    }
+
+    /// Records another device deleted while this one had edits, as
+    /// `{record_id: Trashed}`.
+    pub fn trash(&self, zone: &str) -> Result<String> {
+        let trash: std::collections::BTreeMap<&str, &orbyn_client::Trashed> =
+            self.engine.trash(zone).collect();
+        to_json(&trash)
+    }
+
+    /// Takes a record out of the trash; returns it, or `undefined`.
+    #[wasm_bindgen(js_name = takeFromTrash)]
+    pub fn take_from_trash(&mut self, zone: &str, record_id: &str) -> Result<Option<String>> {
+        self.engine
+            .take_from_trash(zone, record_id)
+            .as_ref()
+            .map(to_json)
+            .transpose()
     }
 }
 

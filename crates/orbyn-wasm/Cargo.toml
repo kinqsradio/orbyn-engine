@@ -20,6 +20,7 @@ orbyn-sync.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 wasm-bindgen.workspace = true
+zeroize.workspace = true
 
 [lints]
 workspace = true

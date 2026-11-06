@@ -1584,6 +1584,7 @@ dependencies = [
  "serde",
  "serde_json",
  "wasm-bindgen",
+ "zeroize",
 ]
 
 [[package]]

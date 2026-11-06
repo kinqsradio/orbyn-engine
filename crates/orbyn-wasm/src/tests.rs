@@ -1,7 +1,22 @@
 use super::*;
 use serde_json::{Value, json};
 
-fn device(id: &str, keys: &DeviceKeys, current: bool) -> Value {
+const ACCOUNT: &str = "11111111-2222-4333-8444-555555555555";
+const A: &str = "0000000a-0000-4000-8000-00000000000a";
+const B: &str = "0000000b-0000-4000-8000-00000000000b";
+const SECRET: [u8; 32] = [42; 32];
+
+/// `id` as the server lists it, approved by `approver` (the first device when `None`).
+fn device(id: &str, keys: &DeviceKeys, approver: Option<&DeviceKeys>) -> Value {
+    let signature = approver.map(|a| {
+        let message = auth::approval_message(
+            &uuid_bytes(ACCOUNT).expect("uuid"),
+            &uuid_bytes(id).expect("uuid"),
+            &keys.keys.public(),
+        );
+        URL_SAFE_NO_PAD.encode(a.sign(auth::DEVICE_APPROVAL_CONTEXT, &message))
+    });
+    let approved_by = approver.map(|_| A);
     json!({
         "id": id,
         "name": id,
@@ -10,18 +25,36 @@ fn device(id: &str, keys: &DeviceKeys, current: bool) -> Value {
         "signing_key": keys.signing_key(),
         "agreement_key": keys.agreement_key(),
         "created_at": "2026-11-07T00:00:00Z",
-        "approved_by": null,
-        "approval_signature": null,
-        "current": current,
+        "approved_by": approved_by,
+        "approval_signature": signature,
+        "current": false,
     })
 }
 
 #[test]
 fn device_keys_export_import_and_sign_the_auth_messages() -> Result<()> {
     let keys = DeviceKeys::create()?;
-    let again = DeviceKeys::import_bytes(&keys.export())?;
+    let sealed = keys.export(&SECRET)?;
+    // The export is sealed: the secret halves are not in it.
+    let raw = keys.keys.to_bytes();
+    assert!(
+        !sealed
+            .windows(32)
+            .any(|w| w == &raw[..32] || w == &raw[32..])
+    );
+    let again = DeviceKeys::import_sealed(&sealed, &SECRET)?;
     assert_eq!(again.signing_key(), keys.signing_key());
-    assert!(DeviceKeys::import_bytes(&[1, 2, 3]).is_err());
+    assert_eq!(
+        DeviceKeys::import_sealed(&sealed, &[7; 32])
+            .map(|_| ())
+            .map_err(|e| e.code),
+        Err("open_failed")
+    );
+    assert_eq!(
+        keys.export(&[1; 16]).map_err(|e| e.code),
+        Err("invalid_wrap_secret")
+    );
+    assert!(DeviceKeys::import_sealed(&[1, 2, 3], &SECRET).is_err());
 
     let public = keys.keys.public();
     let login_id = "0b6f6e2e-7d1a-4c3b-9a8e-1f2d3c4b5a69";
@@ -62,6 +95,11 @@ fn device_keys_export_import_and_sign_the_auth_messages() -> Result<()> {
     orbyn_crypto::verify(&public, auth::TRUSTED_START_CONTEXT, &message, &signature)?;
 
     assert_eq!(uuid_bytes("nope").map_err(|e| e.code), Err("invalid_input"));
+    // Multibyte input of the right length is refused, never sliced.
+    assert_eq!(
+        uuid_bytes("0b6f6e2e-7d1a-4c3b-9a8e-1f2d3c4b5aé").map_err(|e| e.code),
+        Err("invalid_input")
+    );
     assert_eq!(normalize_email("nope"), None);
     Ok(())
 }
@@ -87,16 +125,24 @@ fn sign_in_starts_and_refuses_a_bad_answer_once() -> Result<()> {
 #[test]
 fn two_engines_sync_an_item_through_json() -> Result<()> {
     let (a_keys, b_keys) = (DeviceKeys::create()?, DeviceKeys::create()?);
-    let mut a = SyncEngine::create(&a_keys)?;
-    let mut b = SyncEngine::create(&b_keys)?;
-    let devices = json!({"devices": [device("a", &a_keys, true), device("b", &b_keys, false)]});
+    let mut a = SyncEngine::create(&a_keys, ACCOUNT, A)?;
+    let mut b = SyncEngine::create(&b_keys, ACCOUNT, B)?;
+    let devices = json!({"devices": [device(A, &a_keys, None), device(B, &b_keys, Some(&a_keys))]});
+    assert_eq!(b.verify_devices(&devices.to_string())?, to_json(&[A, B])?);
+    // A device the server lists with no approval gets no keys.
+    let stranger = DeviceKeys::create()?;
+    let with_stranger = json!({"devices": [
+        device(A, &a_keys, None),
+        device(B, &b_keys, Some(&a_keys)),
+        device("0000000c-0000-4000-8000-00000000000c", &stranger, None),
+    ]});
 
     a.create_zone_key("inbox")?;
-    let put: Value = serde_json::from_str(&a.envelopes_for("inbox", &devices.to_string())?)
+    let put: Value = serde_json::from_str(&a.envelopes_for("inbox", &with_stranger.to_string())?)
         .map_err(|e| error("invalid_json", e))?;
     assert_eq!(put["envelopes"].as_array().map(Vec::len), Some(1));
     let delivered = json!({"envelopes": [{
-        "sender_device_id": "a",
+        "sender_device_id": A,
         "zone": "inbox",
         "key_id": put["envelopes"][0]["key_id"],
         "envelope": put["envelopes"][0]["envelope"],
@@ -127,9 +173,10 @@ fn two_engines_sync_an_item_through_json() -> Result<()> {
                 version: 1,
                 ciphertext: Some(ciphertext.clone()),
                 wrapped_key: Some(wrapped_key.clone()),
-                author_device_id: "a".into(),
+                author_device_id: A.into(),
                 modified_at: String::new(),
                 deleted: false,
+                delete_proof: None,
             },
             wire::RecordChange::Delete { .. } => panic!("no deletes"),
         })
@@ -147,21 +194,35 @@ fn two_engines_sync_an_item_through_json() -> Result<()> {
     assert_eq!(b.item("inbox", "t1")?, Some(item_json.clone()));
     assert_eq!(b.token("inbox").as_deref(), Some("t1"));
 
-    // A snapshot restores the same engine.
-    let restored = SyncEngine::restore(&b_keys, &b.snapshot()?, 3_000.0)?;
+    // A snapshot is sealed, restores the same engine, and opens only with the
+    // same secret and device.
+    let sealed = b.snapshot(&SECRET)?;
+    assert!(!String::from_utf8_lossy(&sealed).contains("oat milk"));
+    let restored = SyncEngine::restore(&b_keys, &sealed, &SECRET, 3_000.0)?;
     assert_eq!(restored.item("inbox", "t1")?, Some(item_json.clone()));
+    assert_eq!(
+        SyncEngine::restore(&b_keys, &sealed, &[1; 32], 0.0)
+            .map(|_| ())
+            .map_err(|e| e.code),
+        Err("open_failed")
+    );
+    assert_eq!(
+        SyncEngine::restore(&a_keys, &sealed, &SECRET, 0.0)
+            .map(|_| ())
+            .map_err(|e| e.code),
+        Err("open_failed")
+    );
 
     // Items round-trip through fields.
     let stamp = a.tick(5_000.0)?;
     let fields = item_to_fields(&item_json, None, &stamp)?;
     assert_eq!(item_from_fields("t1", &fields)?, item_json);
 
-    // A record sealed with a key b lacks names the problem.
-    let mut c = SyncEngine::create(&DeviceKeys::create()?)?;
-    assert_eq!(
-        c.apply_changes("inbox", &to_json(&page)?, 2_000.0)
-            .map_err(|e| e.code),
-        Err("missing_zone_key")
-    );
+    // A record sealed with a key this device lacks is quarantined.
+    let mut c = SyncEngine::create(&stranger, ACCOUNT, B)?;
+    let applied: Value =
+        serde_json::from_str(&c.apply_changes("inbox", &to_json(&page)?, 2_000.0)?)
+            .map_err(|e| error("invalid_json", e))?;
+    assert_eq!(applied["quarantined"], json!(["t1"]));
     Ok(())
 }
