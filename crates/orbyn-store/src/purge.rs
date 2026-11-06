@@ -21,6 +21,9 @@ use sqlx::PgPool;
 use std::time::Duration;
 use uuid::Uuid;
 
+/// Busy zones one step skips before it gives up until the next run.
+const MAX_BUSY: usize = 16;
+
 /// What a purge removed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Purged {
@@ -64,15 +67,25 @@ async fn purge_step(pool: &PgPool, retention: Duration, batch: i64) -> Result<Pu
 
     // A deleted zone past the window: its records in batches, then the zone.
     let mut tx = pool.begin().await?;
-    let zone: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM zones
+    let zone: Option<(Uuid, i64)> = sqlx::query_as(
+        "SELECT id, seq FROM zones
          WHERE deleted_at IS NOT NULL AND deleted_at < now() - make_interval(secs => $1)
          ORDER BY deleted_at LIMIT 1 FOR UPDATE SKIP LOCKED",
     )
     .bind(secs)
     .fetch_optional(&mut *tx)
     .await?;
-    if let Some(zone) = zone {
+    if let Some((zone, seq)) = zone {
+        // From its first step the purge is under way: no restore, and every
+        // token older than the zone's end has expired, since this step removes
+        // tombstones a device may not have seen.
+        sqlx::query(
+            "UPDATE zones SET purging = true, purge_floor = greatest(purge_floor, $2) WHERE id = $1",
+        )
+        .bind(zone)
+        .bind(seq)
+        .execute(&mut *tx)
+        .await?;
         let removed = sqlx::query(
             "DELETE FROM records WHERE zone_id = $1 AND record_id IN (
                  SELECT record_id FROM records WHERE zone_id = $1 ORDER BY record_id LIMIT $2)",
@@ -101,59 +114,68 @@ async fn purge_step(pool: &PgPool, retention: Duration, batch: i64) -> Result<Pu
     }
     tx.commit().await?;
 
-    // Tombstones past the window in a zone that is still in use.
-    let mut tx = pool.begin().await?;
-    let oldest: Option<Uuid> = sqlx::query_scalar(
-        "SELECT r.zone_id FROM records r JOIN zones z ON z.id = r.zone_id
-         WHERE r.deleted AND r.modified_at < now() - make_interval(secs => $1)
-           AND z.deleted_at IS NULL
-         ORDER BY r.modified_at LIMIT 1",
-    )
-    .bind(secs)
-    .fetch_optional(&mut *tx)
-    .await?;
-    if let Some(zone) = oldest {
-        // The zone lock every write takes; a busy zone waits for the next run.
+    // Tombstones past the window in a zone that is still in use. A zone that
+    // is busy is skipped for the next-oldest one, not the end of the run.
+    let mut busy: Vec<Uuid> = Vec::new();
+    while busy.len() < MAX_BUSY {
+        let mut tx = pool.begin().await?;
+        let oldest: Option<Uuid> = sqlx::query_scalar(
+            "SELECT r.zone_id FROM records r JOIN zones z ON z.id = r.zone_id
+             WHERE r.deleted AND r.modified_at < now() - make_interval(secs => $1)
+               AND z.deleted_at IS NULL AND r.zone_id <> ALL($2)
+             ORDER BY r.modified_at LIMIT 1",
+        )
+        .bind(secs)
+        .bind(&busy)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(zone) = oldest else {
+            break;
+        };
+        // The zone lock every write takes.
         let locked: Option<Uuid> = sqlx::query_scalar(
             "SELECT id FROM zones WHERE id = $1 AND deleted_at IS NULL FOR UPDATE SKIP LOCKED",
         )
         .bind(zone)
         .fetch_optional(&mut *tx)
         .await?;
-        if locked.is_some() {
-            // Lowest versions first, so the floor rises evenly. Checked again
-            // under the lock: an upload may have brought a record back.
-            let (removed, floor): (i64, i64) = sqlx::query_as(
-                "WITH doomed AS (
-                     SELECT record_id FROM records
-                     WHERE zone_id = $1 AND deleted
-                       AND modified_at < now() - make_interval(secs => $2)
-                     ORDER BY version LIMIT $3),
-                 gone AS (
-                     DELETE FROM records r USING doomed d
-                     WHERE r.zone_id = $1 AND r.record_id = d.record_id
-                     RETURNING r.version)
-                 SELECT count(*)::bigint, coalesce(max(version), 0)::bigint FROM gone",
+        if locked.is_none() {
+            busy.push(zone);
+            continue;
+        }
+        // Lowest versions first, so the floor rises evenly. Checked again
+        // under the lock: an upload may have brought a record back.
+        let (removed, floor): (i64, i64) = sqlx::query_as(
+            "WITH doomed AS (
+                 SELECT record_id FROM records
+                 WHERE zone_id = $1 AND deleted
+                   AND modified_at < now() - make_interval(secs => $2)
+                 ORDER BY version LIMIT $3),
+             gone AS (
+                 DELETE FROM records r USING doomed d
+                 WHERE r.zone_id = $1 AND r.record_id = d.record_id
+                 RETURNING r.version)
+             SELECT count(*)::bigint, coalesce(max(version), 0)::bigint FROM gone",
+        )
+        .bind(zone)
+        .bind(secs)
+        .bind(batch)
+        .fetch_one(&mut *tx)
+        .await?;
+        if removed > 0 {
+            sqlx::query(
+                "UPDATE zones SET total_records = total_records - $2,
+                        purge_floor = greatest(purge_floor, $3) WHERE id = $1",
             )
             .bind(zone)
-            .bind(secs)
-            .bind(batch)
-            .fetch_one(&mut *tx)
+            .bind(i32::try_from(removed).map_err(|_| StoreError::Internal)?)
+            .bind(floor)
+            .execute(&mut *tx)
             .await?;
-            if removed > 0 {
-                sqlx::query(
-                    "UPDATE zones SET total_records = total_records - $2,
-                            purge_floor = greatest(purge_floor, $3) WHERE id = $1",
-                )
-                .bind(zone)
-                .bind(i32::try_from(removed).map_err(|_| StoreError::Internal)?)
-                .bind(floor)
-                .execute(&mut *tx)
-                .await?;
-                done.records += removed.unsigned_abs();
-            }
+            done.records += removed.unsigned_abs();
         }
+        tx.commit().await?;
+        break;
     }
-    tx.commit().await?;
     Ok(done)
 }

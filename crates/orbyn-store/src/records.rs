@@ -477,9 +477,17 @@ impl Store {
             Some(_) => return Err(StoreError::BatchTooLarge),
         };
         require_trusted(&self.pool, session, false).await?;
-        // The zone's sequence is read first: every write up to it has
-        // committed, because writes hold the zone row until they commit.
-        let row = find(&self.pool, session, zone, false).await?;
+        // One snapshot for the zone row and its records. The floor check
+        // below is only sound if the purge is either wholly visible (the floor
+        // is raised and the tombstones are gone) or wholly invisible (neither),
+        // and two statements under READ COMMITTED could see one and not the
+        // other. The zone's sequence read first is also safe: every write up
+        // to it has committed, because writes hold the zone row until they do.
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .await?;
+        let row = find(&mut *tx, session, zone, false).await?;
         let mut resuming = false;
         let from = match since {
             None => 0,
@@ -503,6 +511,10 @@ impl Store {
                 token.seq()
             }
         };
+        #[cfg(test)]
+        if let Some(gap) = &self.gap {
+            (gap.0)().await;
+        }
         let fetch = i64::try_from(limit + 1).map_err(|_| StoreError::Internal)?;
         let rows: Vec<PageRow> =
             sqlx::query_as(
@@ -517,7 +529,7 @@ impl Store {
             .bind(from)
             .bind(row.seq)
             .bind(fetch)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx)
             .await?;
         let mut records = Vec::new();
         let mut more = false;

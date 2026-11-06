@@ -811,13 +811,47 @@ impl Engine {
 
     /// Opens and merges one page of `GET /v1/zones/{zone}/changes` and moves
     /// the token on. Records that do not open are quarantined.
+    ///
+    /// While a zone is being fetched again after [`Engine::token_expired`] this
+    /// returns [`ClientError::Mismatch`]: use [`Engine::apply_changes_from`],
+    /// which can tell the refetch's own pages from any other.
     pub fn apply_changes(
         &mut self,
         zone: &str,
         page: &wire::ZoneChanges,
         now_millis: u64,
     ) -> Result<Applied> {
-        self.zone_mut(zone)?;
+        if self.zone_mut(zone)?.refetch.is_some() {
+            return Err(ClientError::Mismatch);
+        }
+        self.apply_page(zone, page, now_millis)
+    }
+
+    /// Like [`Engine::apply_changes`], for a page fetched with `since` (the
+    /// `since` query of the request, `None` for a fetch from the start). A page
+    /// fetched with any other token than the engine's current one is stale, for
+    /// example an answer that arrived after [`Engine::token_expired`], and is
+    /// refused with [`ClientError::Mismatch`] without changing anything. A
+    /// refetch ends only on the last page of its own fetch.
+    pub fn apply_changes_from(
+        &mut self,
+        zone: &str,
+        since: Option<&str>,
+        page: &wire::ZoneChanges,
+        now_millis: u64,
+    ) -> Result<Applied> {
+        if self.zone_mut(zone)?.token.as_deref() != since {
+            return Err(ClientError::Mismatch);
+        }
+        self.apply_page(zone, page, now_millis)
+    }
+
+    fn apply_page(
+        &mut self,
+        zone: &str,
+        page: &wire::ZoneChanges,
+        now_millis: u64,
+    ) -> Result<Applied> {
         let records: Vec<(String, Option<wire::Record>)> = page
             .records
             .iter()
@@ -846,11 +880,11 @@ impl Engine {
     /// (without `since`), page by page as usual. Local edits are kept.
     ///
     /// Once the last page is applied, a record this device held at a server
-    /// version that the full listing no longer has was deleted and purged. The
-    /// purge left no tombstone to verify, so the record is not trusted as
-    /// deleted for good: a clean copy goes to the trash for 30 days (listed in
-    /// `trashed`), and a copy with local edits is uploaded again as a new
-    /// record.
+    /// version that the full listing no longer has was deleted and purged. As
+    /// with any delete, it wins over local edits: the copy, edits included, goes
+    /// to the trash for 30 days (listed in `trashed`) and is not uploaded again.
+    /// No tombstone is left to verify, so the trash is what keeps a wrong
+    /// answer from losing data.
     ///
     /// The refetch is bounded: if the zone expires again while one is still
     /// running, this returns [`ClientError::ExpiredAgain`] and the host stops
@@ -885,10 +919,9 @@ impl Engine {
             if local.deleted {
                 // Already deleted here and the server has nothing left to delete.
                 z.records.remove(&id);
-            } else if local.dirty {
-                local.version = None;
-                local.edits += 1;
             } else if let Some(local) = z.records.remove(&id) {
+                // Clean or edited alike: a delete wins over edits everywhere, so
+                // the edits are in the trash, not uploaded as a new record.
                 z.trash.insert(
                     id.clone(),
                     Trashed {

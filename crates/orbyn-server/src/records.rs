@@ -156,6 +156,7 @@ impl IntoResponse for Refusal {
             StoreError::DeviceNotTrusted => (StatusCode::FORBIDDEN, "device_not_trusted"),
             StoreError::ZoneNotFound => (StatusCode::NOT_FOUND, "zone_not_found"),
             StoreError::ZoneDeleted => (StatusCode::CONFLICT, "zone_deleted"),
+            StoreError::ZonePurging => (StatusCode::CONFLICT, "zone_purging"),
             StoreError::InvalidToken => (StatusCode::BAD_REQUEST, "invalid_change_token"),
             StoreError::TokenExpired => (StatusCode::GONE, "token_expired"),
             StoreError::OperationReused => (StatusCode::CONFLICT, "operation_reused"),

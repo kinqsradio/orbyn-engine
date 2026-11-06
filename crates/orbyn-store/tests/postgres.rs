@@ -1442,6 +1442,20 @@ fn at(token: &ChangeToken, seq: i64) -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// Purges take turns, so one test's run cannot finish what another test is
+/// looking at part-way.
+static PURGING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn run_purge(
+    db: &Database,
+    retention: Duration,
+    batch: i64,
+    steps: usize,
+) -> Result<orbyn_store::Purged, StoreError> {
+    let _turn = PURGING.lock().await;
+    orbyn_store::purge(db.pool(), retention, batch, steps).await
+}
+
 const MONTH: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// Makes a record look `days` old, as if time had passed.
@@ -1502,11 +1516,7 @@ async fn only_tombstones_older_than_the_window_are_purged_and_old_tokens_expire(
     age_record(&db, &me, "list", "old", 40).await;
     age_record(&db, &me, "list", "live", 40).await; // old but live: never purged
 
-    let purged = orbyn_store::purge(db.pool(), MONTH, 1000, 10)
-        .await
-        .expect("purge");
-    // Other tests share the database: this account's rows are what count.
-    assert!(purged.records >= 1);
+    run_purge(&db, MONTH, 1000, 10).await.expect("purge");
     let all = store
         .fetch_changes(&me, "list", None, None)
         .await
@@ -1582,6 +1592,8 @@ async fn a_purge_works_in_bounded_batches_oldest_version_first() {
         )
         .await
         .expect("delete");
+    // No other test purges between aging these rows and counting the steps.
+    let turn = PURGING.lock().await;
     for id in &ids {
         age_record(&db, &me, "list", id, 40).await;
     }
@@ -1601,19 +1613,16 @@ async fn a_purge_works_in_bounded_batches_oldest_version_first() {
             .await
             .expect("step");
         let now = remaining().await;
-        assert!(
-            now <= left && now >= expected,
-            "{now} left, expected about {expected}"
-        );
+        assert_eq!(now, expected, "two tombstones per step");
+        assert!(now <= left);
         left = now;
     }
+    drop(turn);
     // Run to the end: nothing is left, and the floor is above every version
     // that was purged, so the token from before the first delete has expired.
     // Another test's purge may hold a zone for a moment; a busy zone waits for the next run.
     for _ in 0..20 {
-        orbyn_store::purge(db.pool(), MONTH, 2, 100)
-            .await
-            .expect("rest");
+        run_purge(&db, MONTH, 2, 100).await.expect("rest");
         if remaining().await == 0 {
             break;
         }
@@ -1678,9 +1687,7 @@ async fn limits_count_only_what_is_retained() {
     store.delete_zone(&me, "b", None).await.expect("delete b");
 
     // Young tombstones and a young deleted zone are not purged.
-    orbyn_store::purge(db.pool(), MONTH, 1000, 100)
-        .await
-        .expect("purge");
+    run_purge(&db, MONTH, 1000, 100).await.expect("purge");
     assert!(matches!(
         store
             .upload(&me, "a", &batch(vec![save("4", None, b"x")]))
@@ -1696,10 +1703,8 @@ async fn limits_count_only_what_is_retained() {
         age_record(&db, &me, "a", id, 40).await;
     }
     age_zone(&db, &me, "b", 40).await;
-    let purged = orbyn_store::purge(db.pool(), MONTH, 1000, 100)
-        .await
-        .expect("purge");
-    assert!(purged.records >= 3 && purged.zones >= 1, "{purged:?}");
+    // Another test's purge may have taken them already; either way they are gone.
+    run_purge(&db, MONTH, 1000, 100).await.expect("purge");
 
     // Both limits have room again.
     store
@@ -1744,12 +1749,10 @@ async fn paging_from_the_start_below_the_floor_is_not_mistaken_for_a_stale_token
         age_record(&db, &me, "list", id, 40).await;
     }
     let purged_zone = |db: &Database| {
-        let pool = db.pool().clone();
+        let db = db.clone();
         async move {
             for _ in 0..20 {
-                orbyn_store::purge(&pool, MONTH, 1000, 100)
-                    .await
-                    .expect("purge");
+                run_purge(&db, MONTH, 1000, 100).await.expect("purge");
                 tokio::time::sleep(Duration::from_millis(30)).await;
             }
         }
@@ -1803,4 +1806,137 @@ async fn paging_from_the_start_below_the_floor_is_not_mistaken_for_a_stale_token
         }
     }
     panic!("a token made under an older floor must expire");
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_deleted_zone_cannot_be_restored_once_its_purge_has_started() {
+    let (store, db) = store().await;
+    let me = trusted(&db).await;
+    store.create_zone(&me, "list").await.expect("zone");
+    let ids: Vec<String> = (0..5).map(|n| format!("r{n}")).collect();
+    let saved = store
+        .upload(
+            &me,
+            "list",
+            &batch(ids.iter().map(|id| save(id, None, b"x")).collect()),
+        )
+        .await
+        .expect("upload");
+    let early = saved.token;
+    store.delete_zone(&me, "list", None).await.expect("delete");
+    // Older than any other test's zone, so one step takes this one; and no
+    // other test purges between aging it and the asserts below.
+    let turn = PURGING.lock().await;
+    age_zone(&db, &me, "list", 400).await;
+    orbyn_store::purge(db.pool(), MONTH, 2, 1)
+        .await
+        .expect("one step");
+
+    // Two of five records are gone. A restore would hide those deletes.
+    let restored = store.create_zone(&me, "list").await;
+    assert!(
+        matches!(restored, Err(StoreError::ZonePurging)),
+        "{restored:?}"
+    );
+    // And a device that has not seen the deletion is told to start over.
+    let fetched = store
+        .fetch_changes(&me, "list", Some(&early.encode()), None)
+        .await;
+    assert!(
+        matches!(fetched, Err(StoreError::TokenExpired)),
+        "{fetched:?}"
+    );
+
+    drop(turn);
+
+    // Finish the purge: the name is free and the zone is new.
+    for _ in 0..20 {
+        run_purge(&db, MONTH, 1000, 100).await.expect("purge");
+        if matches!(
+            store.fetch_changes(&me, "list", None, None).await,
+            Err(StoreError::ZoneNotFound)
+        ) {
+            break;
+        }
+    }
+    let (zone, created) = store.create_zone(&me, "list").await.expect("fresh zone");
+    assert!(created);
+    assert_eq!(zone.token.seq(), 0);
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_busy_zone_does_not_end_the_run() {
+    let (store, db) = store().await;
+    let busy = trusted(&db).await;
+    let free = trusted(&db).await;
+    for (session, id) in [(&busy, "x"), (&free, "y")] {
+        store.create_zone(session, "list").await.expect("zone");
+        store
+            .upload(session, "list", &batch(vec![save(id, None, b"1")]))
+            .await
+            .expect("upload");
+        store
+            .upload(session, "list", &batch(vec![delete(id, 1)]))
+            .await
+            .expect("delete");
+    }
+    // The zone is locked before its tombstone is aged, and no other test
+    // purges meanwhile, so nothing can take it first.
+    let turn = PURGING.lock().await;
+    let mut holding = db.pool().begin().await.expect("tx");
+    sqlx::query("SELECT 1 FROM zones WHERE owner_id = $1 AND name = 'list' FOR UPDATE")
+        .bind(busy.account_id)
+        .execute(&mut *holding)
+        .await
+        .expect("lock");
+    // The busy zone has the oldest tombstone, so the purge meets it first.
+    age_record(&db, &busy, "list", "x", 400).await;
+    age_record(&db, &free, "list", "y", 40).await;
+
+    for _ in 0..20 {
+        orbyn_store::purge(db.pool(), MONTH, 1000, 100)
+            .await
+            .expect("purge");
+        let gone = store
+            .fetch_changes(&free, "list", None, None)
+            .await
+            .expect("fetch");
+        if gone.records.is_empty() {
+            break;
+        }
+    }
+    let free_left = store
+        .fetch_changes(&free, "list", None, None)
+        .await
+        .expect("fetch");
+    assert!(
+        free_left.records.is_empty(),
+        "the next-oldest zone was purged"
+    );
+    let busy_left: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM records WHERE deleted AND zone_id =
+             (SELECT id FROM zones WHERE owner_id = $1)",
+    )
+    .bind(busy.account_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("count");
+    assert_eq!(busy_left, 1, "the busy zone was left alone");
+
+    holding.rollback().await.expect("release");
+    drop(turn);
+    for _ in 0..20 {
+        run_purge(&db, MONTH, 1000, 100).await.expect("purge");
+    }
+    let busy_left: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM records WHERE deleted AND zone_id =
+             (SELECT id FROM zones WHERE owner_id = $1)",
+    )
+    .bind(busy.account_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("count");
+    assert_eq!(busy_left, 0, "and purged on the next run");
 }

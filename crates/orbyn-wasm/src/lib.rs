@@ -578,6 +578,25 @@ impl SyncEngine {
         to_json(&self.engine.apply_changes(zone, &page, millis(now))?)
     }
 
+    /// Like `applyChanges`, for a page fetched with `since` (empty for a fetch
+    /// from the start). Required while a zone is fetched again after
+    /// `tokenExpired`; a page fetched with another token is refused.
+    #[wasm_bindgen(js_name = applyChangesFrom)]
+    pub fn apply_changes_from(
+        &mut self,
+        zone: &str,
+        since: Option<String>,
+        page_json: &str,
+        now: f64,
+    ) -> Result<String> {
+        let page: wire::ZoneChanges = parse(page_json)?;
+        to_json(
+            &self
+                .engine
+                .apply_changes_from(zone, since.as_deref(), &page, millis(now))?,
+        )
+    }
+
     /// Compares one `ZoneList` page with this device; returns `{stale, next}`.
     #[wasm_bindgen(js_name = checkZones)]
     pub fn check_zones(&self, zones_json: &str) -> Result<String> {

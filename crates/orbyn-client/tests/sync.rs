@@ -1634,14 +1634,18 @@ fn fetch_all_or_restart(d: &mut Device, store: &FakeStore) -> (orbyn_client::App
     let mut expired = false;
     let mut all = orbyn_client::Applied::default();
     loop {
-        let Some(page) = store.try_changes(ZONE, d.engine.token(ZONE)) else {
+        let since = d.engine.token(ZONE).map(str::to_owned);
+        let Some(page) = store.try_changes(ZONE, since.as_deref()) else {
             assert!(!expired, "the refetch expired again: the store moved on");
             expired = true;
             d.engine.token_expired(ZONE).expect("expired");
             assert_eq!(d.engine.token(ZONE), None, "the next fetch starts over");
             continue;
         };
-        let applied = d.engine.apply_changes(ZONE, &page, d.now).expect("apply");
+        let applied = d
+            .engine
+            .apply_changes_from(ZONE, since.as_deref(), &page, d.now)
+            .expect("apply");
         all.changed.extend(applied.changed);
         all.removed.extend(applied.removed);
         all.trashed.extend(applied.trashed);
@@ -1674,23 +1678,30 @@ fn a_device_behind_a_purge_fetches_the_zone_again_and_keeps_what_it_has() -> R {
     let (applied, expired) = fetch_all_or_restart(&mut b, &store);
     assert!(expired, "the token predates the purge");
     assert!(applied.changed.contains(&"new".to_owned()));
-    // The clean copy of the purged delete is recoverable, not silently lost.
-    assert_eq!(applied.trashed, vec!["gone".to_owned()]);
+    // A delete wins over edits everywhere: both copies are recoverable from the
+    // trash, the edited one included, and neither is silently lost.
+    let mut trashed = applied.trashed.clone();
+    trashed.sort();
+    assert_eq!(trashed, vec!["also-gone".to_owned(), "gone".to_owned()]);
     assert!(b.engine.record(ZONE, "gone").is_none());
+    assert!(b.engine.record(ZONE, "also-gone").is_none());
     assert!(b.engine.trash(ZONE).any(|(id, _)| id == "gone"));
+    assert!(b.engine.trash(ZONE).any(|(id, _)| id == "also-gone"));
     // Untouched records stay, and the token caught up.
     for id in ["edited", "kept", "new"] {
         assert!(b.engine.record(ZONE, id).is_some(), "{id}");
     }
     assert_eq!(b.engine.token(ZONE), Some(store.token(ZONE).as_str()));
-    // The offline edit is kept and goes up again as a new record.
-    assert!(b.engine.has_pending(ZONE));
+    // Nothing is uploaded again: the edit is in the trash, and the server has
+    // no record under that id.
+    assert!(!b.engine.has_pending(ZONE));
+    assert!(b.engine.build_upload(ZONE)?.is_none());
     b.sync(&mut store);
     assert!(
         store
             .records(ZONE)
             .iter()
-            .any(|r| r.record_id == "also-gone" && !r.deleted)
+            .all(|r| r.record_id != "also-gone")
     );
     Ok(())
 }
@@ -1713,7 +1724,7 @@ fn a_refetch_survives_a_restart_between_pages() -> R {
         .try_changes(ZONE, b.engine.token(ZONE))
         .expect("from the start");
     assert!(page.more);
-    b.engine.apply_changes(ZONE, &page, b.now)?;
+    b.engine.apply_changes_from(ZONE, None, &page, b.now)?;
     let snapshot: Snapshot =
         serde_json::from_str(&serde_json::to_string(&b.engine.snapshot()).expect("json"))
             .expect("round trip");
@@ -1747,7 +1758,7 @@ fn a_zone_that_expires_again_during_its_refetch_is_an_error_not_a_loop() -> R {
         .try_changes(ZONE, b.engine.token(ZONE))
         .expect("start");
     assert!(page.more);
-    b.engine.apply_changes(ZONE, &page, b.now)?;
+    b.engine.apply_changes_from(ZONE, None, &page, b.now)?;
     // The server says expired again before the refetch finished.
     assert_eq!(b.engine.token_expired(ZONE), Err(ClientError::ExpiredAgain));
     // The refetch in progress is untouched and can still finish.
@@ -1757,5 +1768,58 @@ fn a_zone_that_expires_again_during_its_refetch_is_an_error_not_a_loop() -> R {
     assert_eq!(applied.trashed, vec!["r1".to_owned()]);
     // After it finished, a later expiry starts a new refetch.
     b.engine.token_expired(ZONE)?;
+    Ok(())
+}
+
+#[test]
+fn a_refetch_ends_only_on_the_last_page_of_its_own_fetch() -> R {
+    let mut store = FakeStore::new(1);
+    let (mut a, mut b, _) = pair(&mut store);
+    for id in ["r1", "r2", "r3"] {
+        a.edit(id, "title", json!(id));
+    }
+    settle(&mut a, &mut b, &mut store);
+    // B fetches incrementally; the answer is slow and arrives later.
+    a.edit("r4", "title", json!("r4"));
+    a.sync(&mut store);
+    let old_token = b.engine.token(ZONE).map(str::to_owned);
+    let slow = store.changes(ZONE, old_token.as_deref());
+    assert!(!slow.more || slow.records.len() == 1);
+    let mut last = slow.clone();
+    last.more = false;
+
+    a.engine.delete(ZONE, "r1")?;
+    a.sync(&mut store);
+    store.purge_tombstones(ZONE);
+
+    // The zone expires and its refetch starts.
+    b.engine.token_expired(ZONE)?;
+    let page = store.try_changes(ZONE, None).expect("from the start");
+    assert!(page.more);
+    b.engine.apply_changes_from(ZONE, None, &page, b.now)?;
+
+    // The slow incremental answer shows up now, with more = false. It was not
+    // fetched with the engine's token, so it neither applies nor ends the refetch.
+    let before = b.engine.snapshot();
+    assert_eq!(
+        b.engine
+            .apply_changes_from(ZONE, old_token.as_deref(), &last, b.now),
+        Err(ClientError::Mismatch)
+    );
+    assert_eq!(
+        b.engine.apply_changes(ZONE, &last, b.now),
+        Err(ClientError::Mismatch),
+        "the plain call is refused while a refetch runs"
+    );
+    assert_eq!(b.engine.snapshot(), before, "nothing changed");
+    assert!(
+        b.engine.record(ZONE, "r2").is_some(),
+        "r2 is not trashed early"
+    );
+
+    // The real fetch carries on and finishes the refetch.
+    let (applied, _) = fetch_all_or_restart(&mut b, &store);
+    assert_eq!(applied.trashed, vec!["r1".to_owned()]);
+    assert!(b.engine.record(ZONE, "r2").is_some());
     Ok(())
 }
