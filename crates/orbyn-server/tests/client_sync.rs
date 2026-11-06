@@ -10,7 +10,7 @@ use axum::http::{Method, Request, StatusCode, header};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use orbyn_auth_client as auth;
-use orbyn_client::{Engine, trusted_peers};
+use orbyn_client::Engine;
 use orbyn_contracts as wire;
 use orbyn_core::accounts::AuthSecrets;
 use orbyn_core::{Accounts, Database};
@@ -27,6 +27,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tower::ServiceExt;
 use uuid::Uuid;
+
+/// A record's ciphertext and wrapped key; both `None` for a tombstone.
+type StoredBytes = (Option<Vec<u8>>, Option<Vec<u8>>);
 
 struct Up;
 impl Readiness for Up {
@@ -255,8 +258,8 @@ fn value<T: Serialize>(v: &T) -> Value {
 }
 
 impl Device {
-    async fn peers(&self, server: &Server) -> Vec<orbyn_client::Peer> {
-        let list: wire::DeviceList = server
+    async fn devices(&self, server: &Server) -> wire::DeviceList {
+        server
             .ok(
                 Method::GET,
                 "/v1/devices",
@@ -264,8 +267,7 @@ impl Device {
                 None,
                 StatusCode::OK,
             )
-            .await;
-        trusted_peers(&list).expect("peers")
+            .await
     }
 
     /// Uploads until nothing waits, merging any conflict on the way.
@@ -354,13 +356,15 @@ async fn two_devices_sync_encrypted_tasks_through_the_server() {
 
     let now = 1_800_000_000_000;
     let mut a = Device {
-        engine: Engine::new(copy(&a_keys)),
+        engine: Engine::new(copy(&a_keys), &a_session.account_id, &a_session.device_id)
+            .expect("engine"),
         token: a_session.token.clone(),
         id: a_session.device_id.clone(),
         now,
     };
     let mut b = Device {
-        engine: Engine::new(copy(&b_keys)),
+        engine: Engine::new(copy(&b_keys), &b_session.account_id, &b_session.device_id)
+            .expect("engine"),
         token: b_session.token.clone(),
         id: b_session.device_id.clone(),
         now,
@@ -377,9 +381,13 @@ async fn two_devices_sync_encrypted_tasks_through_the_server() {
         )
         .await;
     a.engine.create_zone_key(ZONE).expect("key");
-    let peers = a.peers(&server).await;
-    assert_eq!(peers.len(), 2);
-    let envelopes = a.engine.envelopes_for(ZONE, &peers).expect("envelopes");
+    let devices = a.devices(&server).await;
+    assert_eq!(
+        a.engine.verify_devices(&devices).len(),
+        2,
+        "b's approval verifies"
+    );
+    let envelopes = a.engine.envelopes_for(ZONE, &devices).expect("envelopes");
     assert_eq!(envelopes.len(), 1);
     assert_eq!(envelopes[0].recipient_device_id, b.id);
     let (status, body) = server
@@ -414,8 +422,8 @@ async fn two_devices_sync_encrypted_tasks_through_the_server() {
         )
         .await;
     assert_eq!(list.envelopes[0].sender_device_id, a.id);
-    let peers = b.peers(&server).await;
-    let accepted = b.engine.accept_envelopes(&list.envelopes, &peers);
+    let devices = b.devices(&server).await;
+    let accepted = b.engine.accept_envelopes(&list.envelopes, &devices);
     assert_eq!(accepted.zones, [ZONE]);
     assert!(accepted.refused.is_empty());
     let mut changed = b.fetch(&server).await;
@@ -457,8 +465,32 @@ async fn two_devices_sync_encrypted_tasks_through_the_server() {
     assert!(!a.engine.has_pending(ZONE) && !b.engine.has_pending(ZONE));
     assert_eq!(a.engine.token(ZONE), b.engine.token(ZONE));
 
+    // A signed delete reaches b through the real store.
+    a.engine.delete(ZONE, "t2").expect("delete");
+    a.upload(&server).await;
+    let (status, page) = server
+        .call(
+            Method::GET,
+            &format!("/v1/zones/{ZONE}/changes"),
+            Some(&b.token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let tombstone = page["records"]
+        .as_array()
+        .and_then(|r| r.iter().find(|r| r["record_id"] == "t2"))
+        .expect("tombstone");
+    assert!(tombstone["delete_proof"].is_string(), "{tombstone}");
+    let removed = b.fetch(&server).await;
+    assert!(removed.is_empty(), "a tombstone is not a change");
+    assert!(
+        b.engine.record(ZONE, "t2").is_none(),
+        "the signed delete applied"
+    );
+
     // The server's bytes never contain the titles or notes.
-    let stored: Vec<(Vec<u8>, Vec<u8>)> = orbyn_core::sqlx::query_as(
+    let stored: Vec<StoredBytes> = orbyn_core::sqlx::query_as(
         "SELECT r.ciphertext, r.wrapped_key FROM records r JOIN zones z ON z.id = r.zone_id
          JOIN accounts a ON a.id = z.owner_id WHERE a.email = $1",
     )
@@ -467,6 +499,45 @@ async fn two_devices_sync_encrypted_tasks_through_the_server() {
     .await
     .expect("records");
     assert_eq!(stored.len(), 2);
+    // No zone key, raw or encoded, is anywhere in the database.
+    let snapshot = a.engine.snapshot();
+    let zone_keys: Vec<Vec<u8>> = snapshot.zones[ZONE]
+        .keys
+        .values()
+        .map(|k| URL_SAFE_NO_PAD.decode(k).expect("key"))
+        .collect();
+    assert!(!zone_keys.is_empty());
+    let tables: Vec<String> = orbyn_core::sqlx::query_scalar(
+        "SELECT tablename::text FROM pg_tables WHERE schemaname = 'public'",
+    )
+    .fetch_all(server.db.pool())
+    .await
+    .expect("tables");
+    let mut dump = String::new();
+    for table in tables {
+        let text: Option<String> = orbyn_core::sqlx::query_scalar(
+            // The names come from pg_tables and are quoted.
+            orbyn_core::sqlx::AssertSqlSafe(format!(
+                "SELECT string_agg(t::text, ' ') FROM \"{table}\" t"
+            )),
+        )
+        .fetch_one(server.db.pool())
+        .await
+        .expect("dump");
+        dump.push_str(&text.unwrap_or_default());
+    }
+    assert!(dump.contains(&b.id), "the dump has this test's rows");
+    for key in &zone_keys {
+        let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+        let forms = [
+            hex,
+            URL_SAFE_NO_PAD.encode(key),
+            base64::engine::general_purpose::STANDARD.encode(key),
+        ];
+        for form in forms {
+            assert!(!dump.contains(&form), "a zone key is in the database");
+        }
+    }
     let envelopes: Vec<Vec<u8>> = orbyn_core::sqlx::query_scalar(
         "SELECT envelope FROM key_envelopes WHERE recipient_device_id = $1",
     )
@@ -476,7 +547,7 @@ async fn two_devices_sync_encrypted_tasks_through_the_server() {
     .expect("envelopes");
     let mut all: Vec<u8> = stored
         .into_iter()
-        .flat_map(|(c, w)| [c, w].concat())
+        .flat_map(|(c, w)| [c.unwrap_or_default(), w.unwrap_or_default()].concat())
         .collect();
     all.extend(envelopes.concat());
     for secret in ["oat milk", "dentist", "rye bread", "blue cap"] {
