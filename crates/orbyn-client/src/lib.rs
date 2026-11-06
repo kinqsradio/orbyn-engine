@@ -57,6 +57,9 @@ pub const TRASH_MILLIS: u64 = 30 * 24 * 60 * 60 * 1000;
 pub const MAX_QUARANTINE: usize = 1000;
 pub const MAX_QUARANTINE_BYTES: usize = 16 * 1024 * 1024;
 
+/// Restarts of one refetch before the host is told to stop.
+pub const MAX_REFETCH_RESTARTS: u8 = 3;
+
 /// What went wrong. Messages never include record content or keys.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ClientError {
@@ -208,6 +211,8 @@ struct ZoneState {
     /// Records this device held at the server's version when the zone expired,
     /// not yet seen again. `None` outside a refetch.
     refetch: Option<BTreeSet<String>>,
+    /// Restarts of the running refetch, because the zone expired again.
+    refetch_restarts: u8,
 }
 
 impl ZoneState {
@@ -353,6 +358,8 @@ pub struct ZoneSnapshot {
     /// `token_expired`; see [`Engine::token_expired`].
     #[serde(default)]
     refetch: Option<BTreeSet<String>>,
+    #[serde(default)]
+    refetch_restarts: u8,
 }
 
 /// One device's sync engine.
@@ -429,6 +436,7 @@ impl Engine {
                     quarantine: z.quarantine,
                     trash: z.trash,
                     refetch: z.refetch,
+                    refetch_restarts: z.refetch_restarts,
                 },
             );
         }
@@ -458,6 +466,7 @@ impl Engine {
                     trash: z.trash.clone(),
                     in_flight: z.in_flight.clone(),
                     refetch: z.refetch.clone(),
+                    refetch_restarts: z.refetch_restarts,
                 };
                 (name.clone(), snapshot)
             })
@@ -886,29 +895,44 @@ impl Engine {
     /// No tombstone is left to verify, so the trash is what keeps a wrong
     /// answer from losing data.
     ///
-    /// The refetch is bounded: if the zone expires again while one is still
-    /// running, this returns [`ClientError::ExpiredAgain`] and the host stops
-    /// and tries later, instead of starting over without end. The refetch in
-    /// progress is left as it was.
+    /// If the zone expires again while a refetch is running (the server purged
+    /// more before it ended, so its page tokens expired), the refetch starts
+    /// over from the beginning with the records it still has to check kept, so
+    /// none is trashed early. After [`MAX_REFETCH_RESTARTS`] restarts in a row
+    /// this returns [`ClientError::ExpiredAgain`] with the state already reset
+    /// to a clean start, so the host can stop and the next sync begins afresh
+    /// instead of getting stuck on a token the server no longer accepts.
     pub fn token_expired(&mut self, zone: &str) -> Result<()> {
         let z = self.zone_mut(zone)?;
-        if z.refetch.is_some() {
-            return Err(ClientError::ExpiredAgain);
-        }
         z.token = None;
         z.in_flight = None;
-        z.refetch = Some(
-            z.records
-                .iter()
-                .filter(|(_, local)| local.version.is_some())
-                .map(|(id, _)| id.clone())
-                .collect(),
-        );
+        let held = z
+            .records
+            .iter()
+            .filter(|(_, local)| local.version.is_some())
+            .map(|(id, _)| id.clone());
+        let again = z.refetch.is_some();
+        // Records already seen in the abandoned run stay to be checked: the
+        // restart lists them again, and one deleted and purged meanwhile is
+        // then caught like the rest.
+        let mut unseen = z.refetch.take().unwrap_or_default();
+        unseen.extend(held);
+        z.refetch = Some(unseen);
+        if !again {
+            z.refetch_restarts = 0;
+            return Ok(());
+        }
+        if z.refetch_restarts >= MAX_REFETCH_RESTARTS {
+            z.refetch_restarts = 0;
+            return Err(ClientError::ExpiredAgain);
+        }
+        z.refetch_restarts += 1;
         Ok(())
     }
 
     /// Ends a refetch after its last page, settling the records it did not list.
     fn finish_refetch(z: &mut ZoneState, applied: &mut Applied, now_millis: u64) {
+        z.refetch_restarts = 0;
         let Some(unseen) = z.refetch.take() else {
             return;
         };

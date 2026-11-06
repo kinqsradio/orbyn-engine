@@ -65,12 +65,15 @@ async fn purge_step(pool: &PgPool, retention: Duration, batch: i64) -> Result<Pu
     let secs = retention.as_secs_f64();
     let mut done = Purged::default();
 
-    // A deleted zone past the window: its records in batches, then the zone.
+    // A deleted zone past the window, or one already being purged (a longer
+    // window set meanwhile must not strand it, since it cannot be restored):
+    // its records in batches, then the zone.
     let mut tx = pool.begin().await?;
     let zone: Option<(Uuid, i64)> = sqlx::query_as(
         "SELECT id, seq FROM zones
-         WHERE deleted_at IS NOT NULL AND deleted_at < now() - make_interval(secs => $1)
-         ORDER BY deleted_at LIMIT 1 FOR UPDATE SKIP LOCKED",
+         WHERE deleted_at IS NOT NULL
+           AND (purging OR deleted_at < now() - make_interval(secs => $1))
+         ORDER BY purging DESC, deleted_at LIMIT 1 FOR UPDATE SKIP LOCKED",
     )
     .bind(secs)
     .fetch_optional(&mut *tx)

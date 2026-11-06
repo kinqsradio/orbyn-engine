@@ -144,7 +144,14 @@ impl FakeStore {
 
     pub fn changes(&self, zone: &str, since: Option<&str>) -> wire::ZoneChanges {
         let z = &self.zones[zone];
-        let after: i64 = since.map_or(0, |t| t[1..].parse().expect("token"));
+        let after: i64 = since.map_or(0, |t| {
+            t[1..]
+                .split(':')
+                .next()
+                .expect("token")
+                .parse()
+                .expect("token")
+        });
         let mut records: Vec<&wire::Record> =
             z.records.values().filter(|r| r.version > after).collect();
         records.sort_by_key(|r| r.version);
@@ -161,7 +168,7 @@ impl FakeStore {
         wire::ZoneChanges {
             records: records.into_iter().cloned().collect(),
             token: if partial {
-                format!("p{next}")
+                format!("p{next}:{}", z.floor)
             } else {
                 token(next)
             },
@@ -189,11 +196,15 @@ impl FakeStore {
     /// Like [`FakeStore::changes`], but `None` when the token is older than a
     /// purge: the server's `token_expired`.
     pub fn try_changes(&self, zone: &str, since: Option<&str>) -> Option<wire::ZoneChanges> {
-        // From the start always works; a token must not be older than the floor.
-        let expired = since
-            .filter(|t| t.starts_with('t'))
-            .map(|t| t[1..].parse::<i64>().expect("token"))
-            .is_some_and(|after| after < self.zones[zone].floor);
+        // The real server's rule: an ordinary token must not be older than the
+        // floor; a mid-refetch token is good only under the floor it was made under.
+        let floor = self.zones[zone].floor;
+        let expired = since.is_some_and(|t| match t.strip_prefix('p') {
+            Some(rest) => rest
+                .split_once(':')
+                .is_none_or(|(_, made_under)| made_under.parse::<i64>().expect("floor") != floor),
+            None => t[1..].parse::<i64>().expect("token") < floor,
+        });
         (!expired).then(|| self.changes(zone, since))
     }
 

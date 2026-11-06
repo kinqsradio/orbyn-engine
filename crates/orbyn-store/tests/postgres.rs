@@ -1940,3 +1940,51 @@ async fn a_busy_zone_does_not_end_the_run() {
     .expect("count");
     assert_eq!(busy_left, 0, "and purged on the next run");
 }
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_zone_being_purged_is_finished_even_if_the_window_grows() {
+    let (store, db) = store().await;
+    let me = trusted(&db).await;
+    store.create_zone(&me, "list").await.expect("zone");
+    let ids: Vec<String> = (0..5).map(|n| format!("r{n}")).collect();
+    store
+        .upload(
+            &me,
+            "list",
+            &batch(ids.iter().map(|id| save(id, None, b"x")).collect()),
+        )
+        .await
+        .expect("upload");
+    store.delete_zone(&me, "list", None).await.expect("delete");
+
+    let turn = PURGING.lock().await;
+    // Older than any other test's zone, so the first step takes this one.
+    age_zone(&db, &me, "list", 800).await;
+    // One step under the 30-day window starts the purge.
+    orbyn_store::purge(db.pool(), MONTH, 2, 1)
+        .await
+        .expect("first step");
+    // The operator then raises the window far past the zone's age. A zone that
+    // cannot be restored must still be finished, not left in `purging`.
+    let decade = Duration::from_secs(3650 * 24 * 60 * 60);
+    let mut finished = false;
+    for _ in 0..10 {
+        orbyn_store::purge(db.pool(), decade, 2, 1)
+            .await
+            .expect("step");
+        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM zones WHERE owner_id = $1")
+            .bind(me.account_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("count");
+        if left == 0 {
+            finished = true;
+            break;
+        }
+    }
+    drop(turn);
+    assert!(finished, "the zone row is gone");
+    let (zone, created) = store.create_zone(&me, "list").await.expect("name is free");
+    assert!(created && zone.token.seq() == 0);
+}
