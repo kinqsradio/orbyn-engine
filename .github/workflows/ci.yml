@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Linux runs everything, including the Postgres tests against a service container.
+  linux:
+    name: Rust (Linux, Postgres)
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:17-bookworm
+        env:
+          POSTGRES_USER: orbyn
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: orbyn
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U orbyn -d orbyn"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      DATABASE_URL: postgres://orbyn@localhost:5432/orbyn
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace -- --include-ignored
+      - name: Device crates build for the web
+        run: cargo check -p orbyn-crypto -p orbyn-sync -p orbyn-contracts --target wasm32-unknown-unknown
+      - name: Generated wire types are committed
+        run: |
+          git add --intent-to-add crates/orbyn-contracts/bindings
+          git diff --exit-code --stat -- crates/orbyn-contracts/bindings
+
+  # Device crates run on people's computers, so they are tested on macOS and Windows too.
+  desktop:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, windows-2022]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - run: cargo test --workspace
+
+  docker:
+    name: Docker image
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: docker build -f docker/Dockerfile -t orbyn-engine:ci .
+      - name: The image starts and answers its health check
+        run: |
+          docker network create orbyn
+          docker run -d --name db --network orbyn -e POSTGRES_USER=orbyn -e POSTGRES_HOST_AUTH_METHOD=trust -e POSTGRES_DB=orbyn postgres:17-bookworm
+          for i in $(seq 1 30); do docker exec db pg_isready -U orbyn -d orbyn && break; sleep 1; done
+          docker run --rm --network orbyn -e DATABASE_URL=postgres://orbyn@db:5432/orbyn orbyn-engine:ci migrate
+          docker run -d --name api --network orbyn -p 8080:8080 -e DATABASE_URL=postgres://orbyn@db:5432/orbyn orbyn-engine:ci serve
+          for i in $(seq 1 30); do curl -fsS http://localhost:8080/health && break; sleep 1; done
+          curl -fsS http://localhost:8080/health | grep -q '"database":"ok"'
+          docker exec api /usr/local/bin/orbyn health 127.0.0.1:8080
