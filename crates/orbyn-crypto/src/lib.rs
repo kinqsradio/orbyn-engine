@@ -79,6 +79,20 @@ impl SymmetricKey {
         &self.0
     }
 
+    /// A key derived with HKDF-SHA256 from `secret` (at least 32 bytes), for
+    /// one purpose named by `label`. A device uses it to seal what it stores
+    /// locally under a secret its platform keeps.
+    pub fn derive(secret: &[u8], label: &str) -> Result<Self, CryptoError> {
+        if secret.len() < 32 {
+            return Err(CryptoError::InvalidKey);
+        }
+        let hk = Hkdf::<Sha256>::new(None, secret);
+        let mut okm = Zeroizing::new([0u8; 32]);
+        hk.expand(label.as_bytes(), okm.as_mut())
+            .map_err(|_| CryptoError::Derive)?;
+        Ok(Self(*okm))
+    }
+
     fn cipher(&self) -> XChaCha20Poly1305 {
         XChaCha20Poly1305::new(&self.0.into())
     }
@@ -554,6 +568,20 @@ mod tests {
             zone_key
         );
         assert!(DeviceKeys::from_bytes(&[0; 63]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn derived_keys_depend_on_the_secret_and_the_label() -> R {
+        let secret = [3u8; 32];
+        let a = SymmetricKey::derive(&secret, "orbyn/local/a")?;
+        assert_eq!(a, SymmetricKey::derive(&secret, "orbyn/local/a")?);
+        assert_ne!(a, SymmetricKey::derive(&secret, "orbyn/local/b")?);
+        assert_ne!(a, SymmetricKey::derive(&[4u8; 32], "orbyn/local/a")?);
+        assert_eq!(
+            SymmetricKey::derive(&[3u8; 31], "orbyn/local/a"),
+            Err(CryptoError::InvalidKey)
+        );
         Ok(())
     }
 
