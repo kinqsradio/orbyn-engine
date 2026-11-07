@@ -137,23 +137,18 @@ async fn main() -> ExitCode {
     }
 }
 
-/// `orbyn invite ...`: stdout and exit status 0, or stderr and exit status 1.
+/// `orbyn invite ...`: stdout and exit status 0, or stderr and exit status 1. The arguments are
+/// read first, so help and a mistake in them never touch the database.
 async fn invite_command(config: Config, args: &[String]) -> ExitCode {
-    // Help needs no database.
-    let needs_db = matches!(
-        args.first().map(String::as_str),
-        Some("create" | "list" | "revoke")
-    ) && !args.iter().any(|a| a == "-h" || a == "--help");
-    let outcome = if needs_db {
-        match Database::connect_with_pool(&config.database_url, 2).await {
-            Ok(db) => invite::run(db.pool(), args).await,
-            Err(error) => Err(error.to_string()),
-        }
-    } else {
-        // Nothing to ask the database: a lazy pool that is never used.
-        match Database::connect_lazy_with_pool(&config.database_url, 2) {
-            Ok(db) => invite::run(db.pool(), args).await,
-            Err(error) => Err(error.to_string()),
+    let outcome = match invite::parse(args) {
+        Err(text) => Err(text),
+        Ok(invite::Command::Help(text)) => Ok(text),
+        Ok(command) => {
+            match Database::connect_with_pool(&config.database_url, 2).await {
+                Ok(db) => invite::execute(db.pool(), command).await,
+                // Never the error itself: it can hold the address and the password.
+                Err(_) => Err(invite::database_unreachable(invite::DATABASE_URL_SETTING)),
+            }
         }
     };
     match outcome {
