@@ -1463,8 +1463,17 @@ fn proof_at(session: &Value, keys: &DeviceKeys, action: &str, code: &str, at: i6
     json!({"device_signature": b64(&signature), "signed_at": at})
 }
 
+/// The current second, or one after the last time this test process signed, as a client does:
+/// each signed change is accepted once, so two in the same second need distinct times.
+fn next_signed_at() -> i64 {
+    static LAST: std::sync::Mutex<i64> = std::sync::Mutex::new(0);
+    let mut last = LAST.lock().expect("clock");
+    *last = (now_secs() as i64).max(*last + 1);
+    *last
+}
+
 fn proof(session: &Value, keys: &DeviceKeys, action: &str, code: &str) -> Value {
-    proof_at(session, keys, action, code, now_secs() as i64)
+    proof_at(session, keys, action, code, next_signed_at())
 }
 
 /// The body of a confirmation: the code, and the device's signature over it.
@@ -2219,7 +2228,8 @@ async fn a_signed_change_is_accepted_once_and_only_a_later_one_follows() {
     let _turn = TURN.lock().await;
     let server = server().await;
     let p = protected(&server).await;
-    let now = now_secs() as i64;
+    // After every time this device has signed so far; the steps below count up from here.
+    let now = next_signed_at();
     let call = |path: &'static str, body: Value| {
         server.call(Method::POST, path, Some(token(&p.session)), Some(body))
     };
@@ -2265,13 +2275,46 @@ async fn a_signed_change_is_accepted_once_and_only_a_later_one_follows() {
             "{what}"
         );
     }
+    // A request whose change failed is spent too: a disable sent while the factor is off, sent
+    // again after the owner turns it on, changes nothing.
+    let (status, body) = call(
+        "/v1/accounts/totp/disable",
+        proof_at(&p.session, &p.laptop, "disable", "", now + 4),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let early = proof_at(&p.session, &p.laptop, "disable", "", now + 5);
+    let (status, body) = call("/v1/accounts/totp/disable", early.clone()).await;
+    assert!(
+        status.is_client_error() && status != StatusCode::UNAUTHORIZED,
+        "{status} {body}"
+    );
+    let (status, body) = call(
+        "/v1/accounts/totp",
+        proof_at(&p.session, &p.laptop, "enrol", "", now + 6),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let secret = base32_decode(body["secret"].as_str().expect("secret"));
+    let code = code_for(&secret, 1);
+    let mut confirm = proof_at(&p.session, &p.laptop, "confirm", &code, now + 6);
+    confirm["code"] = json!(code);
+    let (status, body) = call("/v1/accounts/totp/confirm", confirm).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, answer) = call("/v1/accounts/totp/disable", early).await;
+    assert_eq!(
+        (status, &answer["code"]),
+        (StatusCode::UNAUTHORIZED, &json!("device_proof_required")),
+        "a disable whose first send failed"
+    );
+
     // The factor is still on, and a later signed disable still works.
     server
         .password_step(&p.email, b"pw", &DeviceKeys::generate().expect("keys"))
         .await;
     let (status, body) = call(
         "/v1/accounts/totp/disable",
-        proof_at(&p.session, &p.laptop, "disable", "", now + 4),
+        proof_at(&p.session, &p.laptop, "disable", "", now + 7),
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");

@@ -583,7 +583,10 @@ impl Accounts {
         orbyn_crypto::verify(&keys, TOTP_MANAGE_CONTEXT, &message, &proof.signature)
             .map_err(|_| AccountError::DeviceProofRequired)?;
         // Each signed change is accepted once: its time must be after the last one accepted for
-        // this device and action. In the same transaction, so a change that fails leaves no mark.
+        // this device and action. The mark commits on its own, before the change runs, so even a
+        // request whose change then fails (factor not on yet, a wrong code, the limit) cannot be
+        // sent again later in its window, when the change would succeed. The caller's transaction
+        // has locked no device row, so this does not wait on it.
         let newer: Option<i64> = sqlx::query_scalar(
             "INSERT INTO totp_manage_seen (device_id, action, signed_at) VALUES ($1, $2, $3)
              ON CONFLICT (device_id, action) DO UPDATE SET signed_at = EXCLUDED.signed_at
@@ -593,7 +596,7 @@ impl Accounts {
         .bind(session.device_id)
         .bind(action.as_str())
         .bind(proof.signed_at)
-        .fetch_optional(&mut **tx)
+        .fetch_optional(&self.pool)
         .await?;
         if newer.is_none() {
             return Err(AccountError::DeviceProofRequired);
