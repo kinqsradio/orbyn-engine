@@ -30,18 +30,23 @@ const FINISHED_JOBS_KEPT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const FINISHED_JOBS_BATCH: i64 = 1000;
 const PURGE_STEPS: usize = 50;
 
-/// How the reason starts when a message could not be built at all.
-const BUILD_FAILED: &str = "the message couldn't be built";
+/// The log line for an email job given up on, with its kind in words: `email job <id>
+/// (<kind>) gave up: <reason>`. The reason is one of the designed sentences (the message couldn't
+/// be built, the mail server refused it for good, it waited in the queue and expired) and never
+/// holds an address or the body.
+pub fn email_gave_up_line(job: impl std::fmt::Display, kind: &str, reason: &str) -> String {
+    format!(
+        "email job {job} ({}) gave up: {reason}",
+        mail::kind_in_words(kind)
+    )
+}
 
-/// The log line for an email job given up on: `email job <id> gave up after <n> tries: <reason>`,
-/// with `1 try` for a first try that was also the last.
-pub fn email_gave_up_line(job: impl std::fmt::Display, attempts: i32, reason: &str) -> String {
-    let tries = if attempts == 1 {
-        "1 try".to_owned()
-    } else {
-        format!("{attempts} tries")
-    };
-    format!("email job {job} gave up after {tries}: {reason}")
+/// The log line for an email job whose account was deleted under it.
+pub fn email_dropped_line(job: impl std::fmt::Display, kind: &str) -> String {
+    format!(
+        "email job {job} ({}) dropped: its account was deleted",
+        mail::kind_in_words(kind)
+    )
 }
 
 /// What a handler decided about a job.
@@ -82,8 +87,8 @@ impl Mailer {
 pub async fn deliver_email(job: &jobs::Job, mailer: &Mailer) -> Outcome {
     match mail::deliver(job, mailer.secrets.as_deref(), mailer.sender.as_ref()).await {
         Delivery::Sent => Outcome::Done,
-        Delivery::Retry(reason) => Outcome::Retry(reason.to_owned()),
-        Delivery::GiveUp(reason) => Outcome::GiveUp(reason.to_owned()),
+        Delivery::Retry(reason) => Outcome::Retry(reason),
+        Delivery::GiveUp(reason) => Outcome::GiveUp(reason),
     }
 }
 
@@ -239,15 +244,18 @@ pub async fn run(
                     tracing::warn!(job = %job.id, kind = %job.kind, "lease lost; result abandoned");
                     continue;
                 };
+                let email_kind = (job.kind == mail::JOB_KIND)
+                    .then(|| job.payload["kind"].as_str().unwrap_or("").to_owned());
                 let result = match outcome {
                     Outcome::Done => jobs::complete(db.pool(), job.id, &worker_id).await,
                     Outcome::GiveUp(reason) => {
-                        if job.kind == mail::JOB_KIND && reason.starts_with(BUILD_FAILED) {
-                            // The designed line: the job, the tries, the reason; never the address
-                            // or the body.
-                            tracing::warn!("{}", email_gave_up_line(job.id, job.attempts, &reason));
-                        } else {
-                            tracing::warn!(job = %job.id, kind = %job.kind, "job given up: {reason}");
+                        match &email_kind {
+                            Some(kind) => {
+                                tracing::warn!("{}", email_gave_up_line(job.id, kind, &reason));
+                            }
+                            None => {
+                                tracing::warn!(job = %job.id, kind = %job.kind, "job given up: {reason}");
+                            }
                         }
                         jobs::abandon(db.pool(), job.id, &worker_id, &reason).await
                     }
@@ -263,6 +271,14 @@ pub async fn run(
                         .await
                     }
                 };
+                // An email job whose row is gone was deleted with its account (that deletion removes
+                // the jobs that name it): say so, once, and nothing more.
+                if let (Ok(false), Some(kind)) = (&result, &email_kind)
+                    && matches!(jobs::exists(db.pool(), job.id).await, Ok(false))
+                {
+                    tracing::info!("{}", email_dropped_line(job.id, kind));
+                    continue;
+                }
                 if let Err(err) = result {
                     tracing::error!(job = %job.id, error = %err, "could not record the job result");
                 }
@@ -329,7 +345,7 @@ mod tests {
         );
         assert_eq!(capture.sent(), vec![mail.clone()]);
         let busy = Says(Err(SendError {
-            reason: "the mail server did not take the message",
+            reason: "the mail server did not take the message".into(),
             permanent: false,
         }));
         assert!(matches!(
@@ -337,7 +353,7 @@ mod tests {
             Outcome::Retry(_)
         ));
         let refused = Says(Err(SendError {
-            reason: "refused",
+            reason: "refused".into(),
             permanent: true,
         }));
         assert_eq!(
@@ -450,16 +466,46 @@ mod tests {
     }
 
     #[test]
-    fn the_give_up_line_has_the_job_the_tries_and_the_reason_and_nothing_personal() {
+    fn the_email_log_lines_have_the_job_and_the_kind_in_words_and_nothing_personal() {
         let id = uuid::Uuid::nil();
-        let reason = "the message couldn't be built (it has no code)";
+        let nil = "00000000-0000-0000-0000-000000000000";
+        for (kind, words) in [
+            ("verify_email", "verification code"),
+            ("sign_up_attempt", "sign-up notice"),
+            ("deletion_scheduled", "account deletion notice"),
+        ] {
+            assert_eq!(
+                email_gave_up_line(id, kind, "the message couldn't be built (it has no code)"),
+                format!(
+                    "email job {nil} ({words}) gave up: the message couldn't be built (it has no code)"
+                )
+            );
+            assert_eq!(
+                email_dropped_line(id, kind),
+                format!("email job {nil} ({words}) dropped: its account was deleted")
+            );
+        }
         assert_eq!(
-            email_gave_up_line(id, 1, reason),
-            "email job 00000000-0000-0000-0000-000000000000 gave up after 1 try: the message couldn't be built (it has no code)"
+            email_gave_up_line(
+                id,
+                "verify_email",
+                "the mail server refused it for good (550 5.1.1 <address>: user unknown)"
+            ),
+            format!(
+                "email job {nil} (verification code) gave up: the mail server refused it for good (550 5.1.1 <address>: user unknown)"
+            )
         );
         assert_eq!(
-            email_gave_up_line(id, 7, reason),
-            "email job 00000000-0000-0000-0000-000000000000 gave up after 7 tries: the message couldn't be built (it has no code)"
+            email_gave_up_line(
+                id,
+                "verify_email",
+                "it waited in the queue for 24 hours 3 minutes and expired"
+            ),
+            format!(
+                "email job {nil} (verification code) gave up: it waited in the queue for 24 hours 3 minutes and expired"
+            )
         );
+        // No "after N tries" in any of them.
+        assert!(!email_gave_up_line(id, "verify_email", "x").contains("tries"));
     }
 }

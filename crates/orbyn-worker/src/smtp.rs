@@ -5,7 +5,7 @@ use lettre::message::{Mailbox, MultiPart};
 use lettre::transport::smtp::AsyncSmtpTransport;
 use lettre::transport::smtp::client::{Certificate, Tls, TlsParameters};
 use lettre::{AsyncTransport, Message, Tokio1Executor};
-use orbyn_core::mail::{Mail, SendError, SendFuture, Sender};
+use orbyn_core::mail::{Mail, SendError, SendFuture, Sender, scrub};
 use rustls_pki_types::pem::PemObject;
 
 /// Sends through one SMTP server as one sender address.
@@ -47,9 +47,7 @@ impl Smtp {
             ca_subjects = subjects;
         }
         let transport = builder.build();
-        let from = from
-            .parse::<Mailbox>()
-            .map_err(|_| "ORBYN_MAIL_FROM is not an email address".to_owned())?;
+        let from = from.parse::<Mailbox>().map_err(|_| mail_from_refused())?;
         Ok(Self {
             transport,
             from,
@@ -427,25 +425,57 @@ fn name_text(name: &[u8]) -> Option<String> {
     Some(parts.join(", "))
 }
 
-/// The address with its password replaced by `***`, so no message ever shows it.
-fn masked(url: &url::Url) -> String {
-    let mut shown = url.clone();
-    if shown.password().is_some() {
-        let _ = shown.set_password(Some("***"));
+/// The only part of the address a message may show: `scheme://[user:***@]host[:port]`, built from
+/// what parsed, never copied from the text as typed. **Nothing after the host is shown** (no path,
+/// no query, no fragment), because a password with an unencoded `#`, `?` or `/` parses as a short
+/// host followed by a fragment, query or path that holds the rest of the secret, and then no
+/// password is found to hide. `None` when the address cannot be trusted that far: an `@` after the
+/// authority means a password was split that way, and even the host is doubtful.
+fn shown_base(raw: &str, parsed: &url::Url) -> Option<String> {
+    let (_, rest) = raw.split_once("://")?;
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    if rest[authority_end..].contains('@') {
+        return None;
     }
-    shown.to_string()
+    let host = parsed.host_str().filter(|host| !host.is_empty())?;
+    let mut shown = format!("{}://", parsed.scheme());
+    if parsed.password().is_some() {
+        shown.push_str(&format!("{}:***@", parsed.username()));
+    } else if !parsed.username().is_empty() {
+        shown.push_str(&format!("{}@", parsed.username()));
+    }
+    shown.push_str(host);
+    if let Some(port) = parsed.port() {
+        shown.push_str(&format!(":{port}"));
+    }
+    Some(shown)
 }
 
 /// Replaces the password, and the whole address as given, in a message from elsewhere.
 fn redact(message: &str, url: &str) -> String {
     let mut out = message.to_owned();
     if let Ok(parsed) = url::Url::parse(url) {
+        // The address as given first (it holds the password), then the password wherever else.
+        if let Some(base) = shown_base(url, &parsed) {
+            out = out.replace(url, &base);
+        }
         if let Some(password) = parsed.password().filter(|p| !p.is_empty()) {
             out = out.replace(password, "***");
         }
-        out = out.replace(url, &masked(&parsed));
     }
     out
+}
+
+/// A setting or a value as it is shown: printable, and not too long.
+fn printable(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).take(40).collect()
+}
+
+/// `ORBYN_MAIL_FROM` is not an address, as designed. It never shows what was given.
+fn mail_from_refused() -> String {
+    format!(
+        "{OPERATOR_ERROR}ORBYN_MAIL_FROM isn't an email address\n  It should look like: Orbyn <hello@orbyn.dev>\n  or just: hello@orbyn.dev"
+    )
 }
 
 fn not_an_address() -> String {
@@ -469,6 +499,13 @@ fn bad_scheme(scheme: &str) -> String {
 /// The mail library refused the address; what it said, with the password and the address as given
 /// taken out of it.
 fn library_refused(url: &str, message: &str) -> String {
+    // An address whose host is doubtful is no address: say that, and nothing the library said.
+    let trusted = url::Url::parse(url)
+        .ok()
+        .is_some_and(|parsed| shown_base(url, &parsed).is_some());
+    if !trusted {
+        return not_an_address();
+    }
     format!(
         "{OPERATOR_ERROR}the mail library didn't accept ORBYN_SMTP_URL\n  The library said: {}.\n  Check the host, the port, and any special characters in the\n  password (write them as %xx).",
         redact(message.trim_end_matches('.'), url)
@@ -523,6 +560,9 @@ fn require_tls(url: &str) -> Result<(), String> {
     if parsed.host_str().is_none_or(str::is_empty) {
         return Err(no_host());
     }
+    // An `@` after the authority means a password with a `#`, `?` or `/` in it was split there, and
+    // even the host the address names is doubtful: it is no address.
+    let base = shown_base(url, &parsed).ok_or_else(not_an_address)?;
     if parsed.scheme() == "smtps" {
         return Ok(());
     }
@@ -538,11 +578,8 @@ fn require_tls(url: &str) -> Result<(), String> {
             .fragment()
             .is_some_and(|f| f.to_ascii_lowercase().contains(wanted))
         {
-            let mut without = parsed.clone();
-            without.set_fragment(None);
             return Err(format!(
-                "{OPERATOR_ERROR}ORBYN_SMTP_URL has tls=required after a '#', where it has no effect\n  Put it before the '#':\n    {}",
-                with_tls(&without)
+                "{OPERATOR_ERROR}ORBYN_SMTP_URL has tls=required after a '#', where it has no effect\n  Put it before the '#':\n    {base}?tls=required"
             ));
         }
         if let Some((key, value)) = parsed.query_pairs().find(|(key, value)| {
@@ -551,15 +588,12 @@ fn require_tls(url: &str) -> Result<(), String> {
                 .contains(wanted)
         }) {
             return Err(format!(
-                "{OPERATOR_ERROR}ORBYN_SMTP_URL has \"tls=required\" inside another setting ({key}={value})\n  Write it as its own setting: ?tls=required"
+                "{OPERATOR_ERROR}ORBYN_SMTP_URL has \"tls=required\" inside another setting ({})\n  Write it as its own setting: ?tls=required",
+                printable(&format!("{key}={value}"))
             ));
         }
-        let mut shown = parsed.clone();
-        shown.set_fragment(None);
         return Err(format!(
-            "{OPERATOR_ERROR}ORBYN_SMTP_URL ({}) doesn't say how to encrypt\n  Orbyn only sends mail over TLS. Add ?tls=required to the address:\n    {}\n  Or use smtps://{}:465.",
-            masked(&parsed),
-            with_tls(&shown),
+            "{OPERATOR_ERROR}ORBYN_SMTP_URL ({base}) doesn't say how to encrypt\n  Orbyn only sends mail over TLS. Add ?tls=required to the address:\n    {base}?tls=required\n  Or use smtps://{}:465.",
             parsed.host_str().unwrap_or_default()
         ));
     }
@@ -571,40 +605,22 @@ fn require_tls(url: &str) -> Result<(), String> {
         }
     }
     if distinct.len() > 1 {
+        let shown: Vec<String> = values
+            .iter()
+            .map(|value| format!("tls={}", printable(value)))
+            .collect();
         return Err(format!(
             "{OPERATOR_ERROR}ORBYN_SMTP_URL has more than one tls= setting ({})\n  Keep one: ?tls=required",
-            shown_values(&values).join(", ")
+            shown.join(", ")
         ));
     }
     if distinct[0] != "required" {
         return Err(format!(
             "{OPERATOR_ERROR}ORBYN_SMTP_URL asks for tls={}, which can send mail without encryption\n  Orbyn only sends mail over TLS. Use tls=required, or use smtps://.",
-            shown_values(&values)[0]
+            printable(&values[0])
         ));
     }
     Ok(())
-}
-
-/// Values of a setting as they are shown: printable, and not too long.
-fn shown_values(values: &[String]) -> Vec<String> {
-    values
-        .iter()
-        .map(|v| v.chars().filter(|c| !c.is_control()).take(40).collect())
-        .collect()
-}
-
-/// The address (password hidden) with `tls=required` added as a setting of its own.
-fn with_tls(url: &url::Url) -> String {
-    let mut shown = url.clone();
-    let has_query = shown.query().is_some_and(|q| !q.is_empty());
-    if shown.query() == Some("") {
-        shown.set_query(None);
-    }
-    format!(
-        "{}{}tls=required",
-        masked(&shown),
-        if has_query { "&" } else { "?" }
-    )
 }
 
 impl Sender for Smtp {
@@ -612,13 +628,13 @@ impl Sender for Smtp {
         Box::pin(async move {
             // An address that cannot be parsed will not parse later either.
             let to: Mailbox = mail.to.parse().map_err(|_| SendError {
-                reason: "the address is not an email address",
+                reason: "the address is not an email address".to_owned(),
                 permanent: true,
             })?;
             // Subject, plain text and HTML, sent together as designed. A message without the value
             // its kind needs cannot be sent.
-            let rendered = mail.render().ok_or(SendError {
-                reason: mail.cannot_build_reason(),
+            let rendered = mail.render().ok_or_else(|| SendError {
+                reason: mail.cannot_build_reason().to_owned(),
                 permanent: true,
             })?;
             let message = Message::builder()
@@ -629,22 +645,50 @@ impl Sender for Smtp {
                     rendered.text,
                     rendered.html,
                 ))
-                .map_err(|_| SendError {
-                    reason: "the message couldn't be built (the mail library refused it)",
+                .map_err(|error| SendError {
+                    reason: format!(
+                        "the message couldn't be built (the mail library refused it: {})",
+                        scrub(&error.to_string())
+                    ),
                     permanent: true,
                 })?;
             match self.transport.send(message).await {
                 Ok(_) => Ok(()),
                 Err(error) if error.is_permanent() => Err(SendError {
-                    reason: "the mail server refused the message for good",
+                    reason: refused_for_good(&error),
                     permanent: true,
                 }),
                 Err(_) => Err(SendError {
-                    reason: "the mail server did not take the message",
+                    reason: "the mail server did not take the message".to_owned(),
                     permanent: false,
                 }),
             }
         })
+    }
+}
+
+/// `the mail server refused it for good (<code> <server text>)`, with the server's text cleaned
+/// of any address (servers echo the recipient) and cut short.
+fn refused_for_good(error: &lettre::transport::smtp::Error) -> String {
+    use std::error::Error as _;
+    let code = error
+        .status()
+        .map(|code| code.to_string())
+        .unwrap_or_default();
+    let text = error
+        .source()
+        .map(|s| scrub(&s.to_string()))
+        .unwrap_or_default();
+    let said = [code.as_str(), text.as_str()]
+        .iter()
+        .filter(|part| !part.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if said.is_empty() {
+        "the mail server refused it for good".to_owned()
+    } else {
+        format!("the mail server refused it for good ({said})")
     }
 }
 
@@ -741,11 +785,12 @@ mod tests {
         );
         assert_eq!(
             url_error("smtp://mail.example.com:25?"),
-            "error: ORBYN_SMTP_URL (smtp://mail.example.com:25?) doesn't say how to encrypt\n  Orbyn only sends mail over TLS. Add ?tls=required to the address:\n    smtp://mail.example.com:25?tls=required\n  Or use smtps://mail.example.com:465."
+            "error: ORBYN_SMTP_URL (smtp://mail.example.com:25) doesn't say how to encrypt\n  Orbyn only sends mail over TLS. Add ?tls=required to the address:\n    smtp://mail.example.com:25?tls=required\n  Or use smtps://mail.example.com:465."
         );
+        // Nothing after the host is ever shown, so other settings are left out of the hint.
         assert!(
             url_error("smtp://mail.example.com:587?x=1")
-                .contains("    smtp://mail.example.com:587?x=1&tls=required\n")
+                .contains("    smtp://mail.example.com:587?tls=required\n")
         );
         // A value that can send without encryption.
         for value in ["opportunistic", "none"] {
@@ -759,7 +804,7 @@ mod tests {
         // More than one setting, and they disagree.
         assert_eq!(
             url_error("smtp://mail.example.com:587?tls=required&tls=opportunistic"),
-            "error: ORBYN_SMTP_URL has more than one tls= setting (required, opportunistic)\n  Keep one: ?tls=required"
+            "error: ORBYN_SMTP_URL has more than one tls= setting (tls=required, tls=opportunistic)\n  Keep one: ?tls=required"
         );
         // tls=required where it has no effect: after a '#', and inside another setting.
         for hidden in [
@@ -774,7 +819,7 @@ mod tests {
         }
         assert_eq!(
             url_error("smtp://user:hunter2@mail.example.com:587?x=1#tls=required"),
-            "error: ORBYN_SMTP_URL has tls=required after a '#', where it has no effect\n  Put it before the '#':\n    smtp://user:***@mail.example.com:587?x=1&tls=required"
+            "error: ORBYN_SMTP_URL has tls=required after a '#', where it has no effect\n  Put it before the '#':\n    smtp://user:***@mail.example.com:587?tls=required"
         );
         assert_eq!(
             url_error("smtp://mail.example.com:587?other=tls=required"),
@@ -808,7 +853,7 @@ mod tests {
         let shown = library_refused(url, &format!("bad url {url} for user:hunter2 at host."));
         assert_eq!(
             shown,
-            "error: the mail library didn't accept ORBYN_SMTP_URL\n  The library said: bad url smtp://user:***@mail.example.com:587?tls=required for user:*** at host.\n  Check the host, the port, and any special characters in the\n  password (write them as %xx)."
+            "error: the mail library didn't accept ORBYN_SMTP_URL\n  The library said: bad url smtp://user:***@mail.example.com:587 for user:*** at host.\n  Check the host, the port, and any special characters in the\n  password (write them as %xx)."
         );
         assert!(!shown.contains("hunter2"));
         // No password in the address: the message is only tidied.
@@ -1074,6 +1119,9 @@ mod tests {
                                     return;
                                 }
                             }
+                        } else if upper.starts_with("RCPT TO") && upper.contains("REFUSED@") {
+                            // A server that refuses the recipient and echoes it back.
+                            b"550 5.1.1 <refused@example.com>: user unknown\r\n"
                         } else if upper.starts_with("DATA") {
                             if stream.write_all(b"354 go\r\n").await.is_err() {
                                 return;
@@ -1833,6 +1881,124 @@ mod tests {
                 ),
                 "block {n}"
             );
+        }
+    }
+
+    /// A password with an unencoded `#`, `?` or `/` parses as a short host, with the rest of the
+    /// secret in the fragment, query or path and no password to hide. None of it may be printed.
+    #[test]
+    fn no_part_of_a_password_reaches_any_url_message() {
+        let not_an_address = not_an_address();
+        for leaky in [
+            "smtp://user:#s3cret@mail.example.com:587",
+            "smtp://user:?s3cret@mail.example.com:587",
+            "smtp://user:/s3cret@mail.example.com:587",
+            "smtp://123:#s3cret@mail.example.com:587",
+            "smtp://user:123#s3cret@mail.example.com:587",
+            "smtp://user:123?s3cret@mail.example.com:587",
+            "smtp://user:123/s3cret@mail.example.com:587?tls=required",
+            "smtp://user:#s3cret@mail.example.com:587?tls=none",
+            "smtp://user:?s3cret@mail.example.com:587#tls=required",
+        ] {
+            // The host is doubtful, so it is no address at all.
+            assert_eq!(url_error(leaky), not_an_address, "{leaky}");
+        }
+        // With no `@` the secret may be all there is after the host; it is still never shown.
+        for hidden in [
+            "smtp://user:#s3cret",
+            "smtp://user:?s3cret",
+            "smtp://user:/s3cret",
+        ] {
+            let error = url_error(hidden);
+            assert!(!error.contains("s3cret"), "{hidden}: {error}");
+        }
+        // Every other message, with a secret in every place a password or a setting can sit.
+        for url in [
+            "smtp://u:s3cret@h.example.com",
+            "smtp://u:s3cret@h.example.com?tls=none",
+            "smtp://u:s3cret@h.example.com?tls=required&tls=none",
+            "smtp://u:s3cret@h.example.com#tls=required",
+            "smtp://u:s3cret@h.example.com?o=tls=required",
+            "smtp://u:s3cret@h.example.com:25?",
+            "smtp://u:s3cret@h.example.com/s3cret?x=s3cret#s3cret",
+            "ftp://u:s3cret@h.example.com",
+            "smtps://u:s3cret@",
+            "u:s3cret@h.example.com",
+        ] {
+            let error = url_error(url);
+            assert!(!error.contains("s3cret"), "{url}: {error}");
+        }
+        // The library's own words are cleaned the same way, and a doubtful address gets no library
+        // message at all.
+        assert!(
+            !library_refused("smtp://u:s3cret@h.example.com/x", "bad u:s3cret").contains("s3cret")
+        );
+        assert_eq!(
+            library_refused("smtp://user:#s3cret@h.example.com", "said s3cret"),
+            not_an_address
+        );
+    }
+
+    #[test]
+    fn a_setting_shown_in_a_message_has_no_control_characters_and_is_cut_short() {
+        let long = "x".repeat(80);
+        let error = url_error(&format!("smtp://h.example.com?{long}=tls=required\u{7}"));
+        let line = error.lines().next().expect("first line");
+        assert!(!error.contains('\u{7}'), "{error:?}");
+        assert!(
+            line.contains(&"x".repeat(40)) && !line.contains(&"x".repeat(41)),
+            "{line}"
+        );
+        let error = url_error("smtp://h.example.com?tls=%0Aopportunistic%07");
+        assert!(
+            !error.chars().any(|c| c.is_control() && c != '\n'),
+            "{error:?}"
+        );
+        assert_eq!(error.lines().count(), 2, "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn a_server_refusing_for_good_is_reported_without_the_address_it_echoed() {
+        let pki = pki("Orbyn test CA");
+        let server = tls_server(&pki, true).await;
+        let file = PemFile::new(&pki.ca_pem);
+        let url = format!("smtps://127.0.0.1:{}", server.port);
+        let smtp = Smtp::new(&url, "hello@example.com", Some(file.path())).expect("settings");
+        let mut refused = mail();
+        refused.to = "refused@example.com".into();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(30), smtp.send(&refused))
+            .await
+            .expect("no hang")
+            .expect_err("refused");
+        assert!(error.permanent);
+        assert_eq!(
+            error.reason,
+            "the mail server refused it for good (550 5.1.1 <address>: user unknown)"
+        );
+        assert!(!error.reason.contains("refused@") && !error.reason.contains("example.com"));
+    }
+
+    #[test]
+    fn the_mail_from_error_is_as_designed_and_never_shows_what_was_given() {
+        let error = Smtp::new("smtps://mail.example.com", "not an address, hunter2", None)
+            .expect_err("refused");
+        assert_eq!(
+            error,
+            "error: ORBYN_MAIL_FROM isn't an email address\n  It should look like: Orbyn <hello@orbyn.dev>\n  or just: hello@orbyn.dev"
+        );
+        assert!(Smtp::new("smtps://mail.example.com", "Orbyn <hello@orbyn.dev>", None).is_ok());
+        assert!(Smtp::new("smtps://mail.example.com", "hello@orbyn.dev", None).is_ok());
+    }
+
+    #[test]
+    fn nothing_says_the_address_wouldnt_encrypt() {
+        for url in [
+            "smtp://mail.example.com:587",
+            "smtp://mail.example.com:587?tls=none",
+            "smtp://mail.example.com:587#tls=required",
+            "smtp://mail.example.com:25?",
+        ] {
+            assert!(!url_error(url).contains("wouldn't encrypt"), "{url}");
         }
     }
 }
