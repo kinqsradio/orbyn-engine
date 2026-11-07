@@ -4,6 +4,8 @@
 //!   zone keys and service keys are all symmetric keys.
 //! - [`DeviceKeys`] is a device's identity: an Ed25519 key that signs its changes and
 //!   an X25519 key that other devices wrap keys to.
+//! - [`wrap_key_p256`] and [`unwrap_key_p256`] are the separate suite that seals a key to the
+//!   account's service key, a NIST P-256 key (see the [`wrap_p256`] module docs).
 //! - [`wrap_key`] and [`unwrap_key`] seal a symmetric key to a device's public key and
 //!   sign it, so one trusted device can hand a zone key to another and the receiver
 //!   knows which device it came from.
@@ -11,6 +13,8 @@
 //!
 //! Every operation binds a context string into the authenticated data, so a value
 //! sealed for one purpose can never be opened as another.
+
+mod wrap_p256;
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -24,6 +28,11 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// Length of a nonce for XChaCha20-Poly1305.
 pub const NONCE_LEN: usize = 24;
+
+pub use wrap_p256::{
+    P256_POINT_LEN, P256Keys, P256Point, WRAP_P256_CONTEXT, WRAP_P256_FORMAT, WrappedKeyP256,
+    derive_input, open_with_shared_secret, unwrap_key_p256, wrap_key_p256,
+};
 
 /// What went wrong. Messages never include key material or plaintext.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
