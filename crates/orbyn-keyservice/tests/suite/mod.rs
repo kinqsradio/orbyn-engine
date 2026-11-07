@@ -1,14 +1,11 @@
 //! The behaviour every HSM implementation must have, run against each of them.
 
-use orbyn_crypto::P256Point;
 use orbyn_crypto::{
     DeviceKeys, P256Keys, SymmetricKey, WrappedKeyP256, service_key_statement,
     service_key_statement_hash, unwrap_key_p256, verify_service_key_statement, wrap_key_p256,
 };
-use orbyn_keyservice::{
-    Hsm, HsmError, IdentityMessage, KeyService, KeyServiceError, MessageKind, SessionKey,
-    WrappedAccountKey,
-};
+use orbyn_keyservice::testing::Spy;
+use orbyn_keyservice::{Hsm, HsmError, KeyService, KeyServiceError, MessageKind};
 
 const ACCOUNT: [u8; 16] = [3; 16];
 const LABEL: &[u8] = b"orbyn/zone-key/v1|account|inbox|key-1";
@@ -244,72 +241,6 @@ pub fn an_envelope_that_does_not_match_is_refused_and_leaves_no_session_object<H
     assert_eq!(live(), 0, "every path out destroyed its session object");
 }
 
-/// An HSM that delegates to another, records what it was asked, and can be made to fail.
-pub struct Spy<H: Hsm> {
-    pub inner: H,
-    pub fail_derive: bool,
-    pub unwraps: std::sync::atomic::AtomicUsize,
-    pub signed: std::sync::Mutex<Vec<MessageKind>>,
-}
-
-impl<H: Hsm> Spy<H> {
-    pub fn new(inner: H, fail_derive: bool) -> Self {
-        Self {
-            inner,
-            fail_derive,
-            unwraps: Default::default(),
-            signed: Default::default(),
-        }
-    }
-}
-
-impl<H: Hsm> Hsm for Spy<H> {
-    fn kek_exists(&self) -> Result<bool, HsmError> {
-        self.inner.kek_exists()
-    }
-    fn generate_kek(&self) -> Result<(), HsmError> {
-        self.inner.generate_kek()
-    }
-    fn identity_exists(&self, version: u32) -> Result<bool, HsmError> {
-        self.inner.identity_exists(version)
-    }
-    fn generate_identity(&self, version: u32) -> Result<[u8; 32], HsmError> {
-        self.inner.generate_identity(version)
-    }
-    fn identity_public(&self, version: u32) -> Result<[u8; 32], HsmError> {
-        self.inner.identity_public(version)
-    }
-    fn sign_with_identity(
-        &self,
-        version: u32,
-        message: &IdentityMessage,
-    ) -> Result<[u8; 64], HsmError> {
-        self.signed.lock().expect("signed").push(message.kind());
-        self.inner.sign_with_identity(version, message)
-    }
-    fn generate_account_key(&self) -> Result<WrappedAccountKey, HsmError> {
-        self.inner.generate_account_key()
-    }
-    fn unwrap_account_key(&self, wrapped: &[u8]) -> Result<SessionKey, HsmError> {
-        self.unwraps
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.inner.unwrap_account_key(wrapped)
-    }
-    fn derive(
-        &self,
-        key: &SessionKey,
-        ephemeral: &P256Point,
-    ) -> Result<zeroize::Zeroizing<[u8; 32]>, HsmError> {
-        if self.fail_derive {
-            return Err(HsmError::Failed("derive failed on purpose".into()));
-        }
-        self.inner.derive(key, ephemeral)
-    }
-    fn destroy(&self, key: SessionKey) -> Result<(), HsmError> {
-        self.inner.destroy(key)
-    }
-}
-
 /// An HSM error in the middle of an open leaves no session object behind: the guard destroys it.
 pub fn a_failing_derive_still_destroys_the_session_object<H: Hsm>(
     inner: H,
@@ -415,48 +346,4 @@ pub fn an_identity_signs_only_service_key_statements<H: Hsm>(inner: H) {
             MessageKind::ServiceKeyStatement
         ]
     );
-}
-
-/// An HSM shared between the key service and the check that counts its live objects.
-pub struct Shared<H: Hsm>(pub std::sync::Arc<H>);
-
-impl<H: Hsm> Hsm for Shared<H> {
-    fn kek_exists(&self) -> Result<bool, HsmError> {
-        self.0.kek_exists()
-    }
-    fn generate_kek(&self) -> Result<(), HsmError> {
-        self.0.generate_kek()
-    }
-    fn identity_exists(&self, version: u32) -> Result<bool, HsmError> {
-        self.0.identity_exists(version)
-    }
-    fn generate_identity(&self, version: u32) -> Result<[u8; 32], HsmError> {
-        self.0.generate_identity(version)
-    }
-    fn identity_public(&self, version: u32) -> Result<[u8; 32], HsmError> {
-        self.0.identity_public(version)
-    }
-    fn sign_with_identity(
-        &self,
-        version: u32,
-        message: &IdentityMessage,
-    ) -> Result<[u8; 64], HsmError> {
-        self.0.sign_with_identity(version, message)
-    }
-    fn generate_account_key(&self) -> Result<WrappedAccountKey, HsmError> {
-        self.0.generate_account_key()
-    }
-    fn unwrap_account_key(&self, wrapped: &[u8]) -> Result<SessionKey, HsmError> {
-        self.0.unwrap_account_key(wrapped)
-    }
-    fn derive(
-        &self,
-        key: &SessionKey,
-        ephemeral: &P256Point,
-    ) -> Result<zeroize::Zeroizing<[u8; 32]>, HsmError> {
-        self.0.derive(key, ephemeral)
-    }
-    fn destroy(&self, key: SessionKey) -> Result<(), HsmError> {
-        self.0.destroy(key)
-    }
 }

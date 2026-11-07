@@ -144,7 +144,8 @@ jobs:
       # Formatting ran in "Cheap checks".
       # SoftHSM runs the key service's PKCS#11 tests on this lane only. The tests are ignored without
       # ORBYN_SOFTHSM_MODULE, so the other lanes, which have no SoftHSM, skip them; here
-      # ORBYN_SOFTHSM_REQUIRED makes a missing module a failure instead of a silent skip.
+      # ORBYN_SOFTHSM_REQUIRED makes a missing module a failure instead of a silent skip (an empty
+      # value counts as unset).
       - name: SoftHSM for the key service tests
         if: env.RUN == 'true'
         run: |

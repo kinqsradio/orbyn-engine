@@ -24,6 +24,8 @@
 pub mod memory;
 #[cfg(feature = "pkcs11")]
 pub mod pkcs11;
+#[cfg(feature = "test-support")]
+pub mod testing;
 
 use orbyn_crypto::{
     CryptoError, DevicePublic, P256Point, SymmetricKey, WrappedKeyP256, derive_input,
@@ -129,8 +131,46 @@ pub struct WrappedAccountKey {
     pub public: P256Point,
 }
 
+/// The supertrait that seals [`Hsm`]. It is in a private module, so no type outside this crate can
+/// name it, and so none can implement `Hsm`.
+mod sealed {
+    pub trait Sealed {}
+}
+
 /// The HSM operations the key service uses, and no others.
-pub trait Hsm {
+///
+/// **Sealed**: only this crate's `Pkcs11Hsm`, `MemoryHsm` and the `test-support` wrappers in
+/// [`testing`] implement it. A wrapper outside the crate that forwards to a real HSM but returns a
+/// public key of its own from [`Hsm::generate_account_key`] would make the key service certify a
+/// key the HSM never generated; the type rules that out.
+///
+/// A complete implementation outside the crate still does not compile, only because of the seal
+/// (every method is present, so the one error is the missing private supertrait):
+///
+/// ```compile_fail,E0277
+/// use orbyn_crypto::P256Point;
+/// use orbyn_keyservice::{Hsm, HsmError, IdentityMessage, SessionKey, WrappedAccountKey};
+/// use zeroize::Zeroizing;
+///
+/// struct Outside;
+/// impl Hsm for Outside {
+///     fn kek_exists(&self) -> Result<bool, HsmError> { unimplemented!() }
+///     fn generate_kek(&self) -> Result<(), HsmError> { unimplemented!() }
+///     fn identity_exists(&self, _: u32) -> Result<bool, HsmError> { unimplemented!() }
+///     fn generate_identity(&self, _: u32) -> Result<[u8; 32], HsmError> { unimplemented!() }
+///     fn identity_public(&self, _: u32) -> Result<[u8; 32], HsmError> { unimplemented!() }
+///     fn sign_with_identity(&self, _: u32, _: &IdentityMessage) -> Result<[u8; 64], HsmError> {
+///         unimplemented!()
+///     }
+///     fn generate_account_key(&self) -> Result<WrappedAccountKey, HsmError> { unimplemented!() }
+///     fn unwrap_account_key(&self, _: &[u8]) -> Result<SessionKey, HsmError> { unimplemented!() }
+///     fn derive(&self, _: &SessionKey, _: &P256Point) -> Result<Zeroizing<[u8; 32]>, HsmError> {
+///         unimplemented!()
+///     }
+///     fn destroy(&self, _: SessionKey) -> Result<(), HsmError> { unimplemented!() }
+/// }
+/// ```
+pub trait Hsm: sealed::Sealed {
     /// Whether the KEK exists.
     fn kek_exists(&self) -> Result<bool, HsmError>;
     /// Makes the KEK: AES-256, non-extractable, for wrapping and unwrapping only.

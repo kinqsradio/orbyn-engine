@@ -278,6 +278,8 @@ impl Pkcs11Hsm {
     }
 }
 
+impl crate::sealed::Sealed for Pkcs11Hsm {}
+
 impl Hsm for Pkcs11Hsm {
     fn kek_exists(&self) -> Result<bool, HsmError> {
         let session = self.session()?;

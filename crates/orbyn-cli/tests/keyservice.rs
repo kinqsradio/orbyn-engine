@@ -48,9 +48,10 @@ fn init(slot: &str) -> Output {
 #[ignore = "needs SoftHSM"]
 fn init_prints_the_identity_key_once_and_then_refuses() {
     if std::env::var("ORBYN_SOFTHSM_MODULE").is_err() {
-        // CI sets ORBYN_SOFTHSM_REQUIRED, so the test cannot skip there unnoticed.
+        // CI sets ORBYN_SOFTHSM_REQUIRED, so the test cannot skip there unnoticed. An empty value
+        // counts as unset.
         assert!(
-            std::env::var("ORBYN_SOFTHSM_REQUIRED").is_err(),
+            !std::env::var("ORBYN_SOFTHSM_REQUIRED").is_ok_and(|v| !v.is_empty()),
             "ORBYN_SOFTHSM_REQUIRED is set but ORBYN_SOFTHSM_MODULE is not"
         );
         eprintln!("skipped: ORBYN_SOFTHSM_MODULE is not set");
