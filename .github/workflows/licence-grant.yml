@@ -1,0 +1,26 @@
+# Interim licence grant for outside contributors. See orbyn-dev/.github.
+name: Licence grant
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+  issue_comment:
+    types: [created, edited]
+  workflow_dispatch:
+    inputs:
+      pull:
+        description: Pull request number to check again
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  statuses: write
+
+jobs:
+  licence-grant:
+    uses: orbyn-dev/.github/.github/workflows/licence-grant.yml@7ffc2e19d919760137b8e4b61a796d85f0dc679c # orbyn-dev/.github main
+    with:
+      pull: ${{ inputs.pull }}
+    secrets: inherit
