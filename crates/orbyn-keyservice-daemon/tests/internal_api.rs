@@ -81,11 +81,16 @@ async fn a_certification_appears_in_the_next_head_and_verifies_under_the_pinned_
         .await
         .expect("head");
     let signature = h.state.keys.sign_head(&head).expect("sign");
-    h.state
+    let head_id = h
+        .state
         .store
         .commit_head(&head, &signature)
         .await
         .expect("commit");
+    // Stored and signed is not enough: the witnesses have not cosigned it, so it is not published.
+    let read = ok.get(&A).await.expect("read").expect("there");
+    assert_eq!(read.head_covers_entry, Some(false));
+    h.state.store.publish_head(head_id).await.expect("publish");
     let read = ok.get(&A).await.expect("read").expect("there");
     assert_eq!(read.head_covers_entry, Some(true));
     assert_eq!(head.size, 1);
