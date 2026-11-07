@@ -1075,6 +1075,38 @@ async fn the_runtime_role_must_be_a_plain_role_and_public_cannot_create() {
         matches!(result, Err(StoreError::UnsafeRole)),
         "createrole: {result:?}"
     );
+    // A *member* of a superuser role, and of a CREATEROLE role, can `SET ROLE` to it: refused too.
+    run(
+        admin,
+        format!("CREATE ROLE \"{name}_suparent\" NOLOGIN SUPERUSER"),
+    )
+    .await
+    .expect("su parent");
+    run(
+        admin,
+        format!("CREATE ROLE \"{name}_crparent\" NOLOGIN CREATEROLE"),
+    )
+    .await
+    .expect("cr parent");
+    run(
+        admin,
+        format!("CREATE ROLE \"{name}_insu\" LOGIN IN ROLE \"{name}_suparent\""),
+    )
+    .await
+    .expect("member of su");
+    run(
+        admin,
+        format!("CREATE ROLE \"{name}_incr\" LOGIN IN ROLE \"{name}_crparent\""),
+    )
+    .await
+    .expect("member of cr");
+    for member in ["insu", "incr"] {
+        let result = migrate(&db.owner, &format!("{name}_{member}")).await;
+        assert!(
+            matches!(result, Err(StoreError::UnsafeRole)),
+            "member {member}: {result:?}"
+        );
+    }
     // The real runtime role is accepted again, and some other role cannot create in public either.
     migrate(&db.owner, &db.runtime_role)
         .await
@@ -1150,7 +1182,16 @@ async fn the_runtime_role_must_be_a_plain_role_and_public_cannot_create() {
     for role in [&dbo_member, &dbo_role] {
         let _ = run(admin, format!("DROP ROLE IF EXISTS \"{role}\"")).await;
     }
-    for suffix in ["_su", "_member", "_other", "_cr"] {
+    for suffix in [
+        "_insu",
+        "_incr",
+        "_suparent",
+        "_crparent",
+        "_su",
+        "_member",
+        "_other",
+        "_cr",
+    ] {
         let _ = run(admin, format!("DROP ROLE IF EXISTS \"{name}{suffix}\"")).await;
     }
     db.cleanup().await;
@@ -1358,6 +1399,42 @@ async fn a_store_refuses_a_pool_whose_role_could_undo_the_guards() {
     .await
     .expect("creator");
     let as_creator = pool_as(options.clone().database(&name), &creator).await;
+    // Members of a superuser role and of a CREATEROLE role: logins that are plain themselves.
+    for (parent, attribute) in [("suparent", "SUPERUSER"), ("crparent", "CREATEROLE")] {
+        run(
+            &db.admin,
+            format!("CREATE ROLE \"{name}_c{parent}\" NOLOGIN {attribute}"),
+        )
+        .await
+        .expect("parent");
+        run(
+            &db.admin,
+            format!("CREATE ROLE \"{name}_cm{parent}\" LOGIN IN ROLE \"{name}_c{parent}\""),
+        )
+        .await
+        .expect("member");
+        let pool = pool_as(
+            options.clone().database(&name),
+            &format!("{name}_cm{parent}"),
+        )
+        .await;
+        let result = within(Store::connect(pool.clone())).await;
+        assert!(
+            matches!(result, Err(StoreError::UnsafeRole)),
+            "member of {attribute}: {result:?}"
+        );
+        within(pool.close()).await;
+        let _ = run(
+            &db.admin,
+            format!("DROP ROLE IF EXISTS \"{name}_cm{parent}\""),
+        )
+        .await;
+        let _ = run(
+            &db.admin,
+            format!("DROP ROLE IF EXISTS \"{name}_c{parent}\""),
+        )
+        .await;
+    }
     for (what, pool) in [
         ("owner", &db.owner),
         ("member of the owner", &as_member),
