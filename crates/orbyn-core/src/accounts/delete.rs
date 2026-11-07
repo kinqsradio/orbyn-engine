@@ -155,7 +155,7 @@ impl Accounts {
         .fetch_one(&mut *tx)
         .await?;
         let token = URL_SAFE_NO_PAD.encode(token);
-        let link = match &self.app_url {
+        let link = match &self.account_url {
             Some(url) => format!("{url}/cancel-deletion#{token}"),
             None => token,
         };

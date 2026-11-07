@@ -4036,7 +4036,7 @@ impl Server {
     }
 
     /// The cancel tokens in the deletion emails sent to `email`, oldest first (from the link's
-    /// fragment, or the token alone when the deployment has no app URL).
+    /// fragment, or the token alone when the deployment has no account URL).
     async fn cancel_tokens(&self, email: &str) -> Vec<String> {
         let to = normalized(email);
         self.mailbox()

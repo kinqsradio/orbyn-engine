@@ -68,7 +68,7 @@ pub struct Mail {
     pub to: String,
     /// The one value a message carries: a verification code, or for a deletion notice the time the
     /// account will be deleted (RFC 3339), a newline, and the cancel link (or its token alone when
-    /// the deployment has no app URL).
+    /// the deployment has no account URL).
     pub code: Option<String>,
 }
 
