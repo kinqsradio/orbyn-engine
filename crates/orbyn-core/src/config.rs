@@ -80,6 +80,7 @@ impl ConfigError {
                 | Self::LogCodesNotStaging
                 | Self::LogCodesNeedsInvite
                 | Self::LogCodesProductionHost(_)
+                | Self::LogCodesNeedsAuthSetup
         )
     }
 }
@@ -149,6 +150,11 @@ pub enum ConfigError {
         "error: ORBYN_MAIL=log-codes can't be used with a production address ({0})\n  Remove api.orbyn.dev, account.orbyn.dev, engineer.orbyn.dev and orbyn.dev from the account URL and the allowed origins.\n  Production never writes codes to the log."
     )]
     LogCodesProductionHost(String),
+    /// Without the setup the worker cannot open a queued message, so no code would be logged.
+    #[error(
+        "error: ORBYN_MAIL=log-codes needs ORBYN_AUTH_SETUP\n  Without it the worker can\u{2019}t open messages, so no codes would be logged. Set ORBYN_AUTH_SETUP, or set ORBYN_SMTP_URL to send real email."
+    )]
+    LogCodesNeedsAuthSetup,
 }
 
 /// The hosts of the production deployment. A match is on the host name itself, case-insensitively
@@ -299,6 +305,11 @@ impl Config {
                 .chain(allowed_origins.iter().map(String::as_str));
             if let Some(host) = production_host(named) {
                 return Err(ConfigError::LogCodesProductionHost(host));
+            }
+            // Last: the worker opens each queued message with the setup, so without it there is
+            // no code to write, and the mode would run and say nothing.
+            if optional("ORBYN_AUTH_SETUP").is_none() {
+                return Err(ConfigError::LogCodesNeedsAuthSetup);
             }
         }
         Ok(Self {
@@ -548,6 +559,7 @@ mod tests {
             ("DATABASE_URL", "postgres://x"),
             ("ORBYN_MAIL", "log-codes"),
             ("ORBYN_ENV", "staging"),
+            ("ORBYN_AUTH_SETUP", "a-setup"),
         ];
         pairs.extend_from_slice(extra);
         // A later pair for the same name replaces an earlier one.
@@ -568,6 +580,7 @@ mod tests {
                 "DATABASE_URL" => Some("postgres://x".to_owned()),
                 "ORBYN_MAIL" => Some("log-codes".to_owned()),
                 "ORBYN_ENV" => Some("staging".to_owned()),
+                "ORBYN_AUTH_SETUP" => Some("a-setup".to_owned()),
                 _ => None,
             }
         }
@@ -629,6 +642,51 @@ mod tests {
             );
         }
         assert!(ConfigError::LogCodesNotStaging.is_operator_message());
+    }
+
+    #[test]
+    fn log_codes_is_refused_without_the_setup_that_opens_messages() {
+        assert_eq!(
+            Config::from_lookup(without("ORBYN_AUTH_SETUP")).err(),
+            Some(ConfigError::LogCodesNeedsAuthSetup)
+        );
+        // Blank is not set.
+        assert_eq!(
+            log_codes(&[("ORBYN_AUTH_SETUP", "  ")]).err(),
+            Some(ConfigError::LogCodesNeedsAuthSetup)
+        );
+        assert!(ConfigError::LogCodesNeedsAuthSetup.is_operator_message());
+        assert_eq!(
+            ConfigError::LogCodesNeedsAuthSetup.to_string(),
+            "error: ORBYN_MAIL=log-codes needs ORBYN_AUTH_SETUP\n  Without it the worker can\u{2019}t open messages, so no codes would be logged. Set ORBYN_AUTH_SETUP, or set ORBYN_SMTP_URL to send real email."
+        );
+        // It is the last of the four: the others are named first when they are wrong too.
+        let nothing_set = |extra: &[(&str, &str)]| {
+            let mut pairs = vec![
+                ("DATABASE_URL", "postgres://x"),
+                ("ORBYN_MAIL", "log-codes"),
+            ];
+            pairs.extend_from_slice(extra);
+            Config::from_lookup(lookup(&pairs)).err()
+        };
+        assert_eq!(nothing_set(&[]), Some(ConfigError::LogCodesNotStaging));
+        assert_eq!(
+            nothing_set(&[("ORBYN_ENV", "staging"), ("ORBYN_SIGNUP", "open")]),
+            Some(ConfigError::LogCodesNeedsInvite)
+        );
+        assert_eq!(
+            nothing_set(&[
+                ("ORBYN_ENV", "staging"),
+                ("ORBYN_ACCOUNT_URL", "https://account.orbyn.dev")
+            ]),
+            Some(ConfigError::LogCodesProductionHost(
+                "account.orbyn.dev".into()
+            ))
+        );
+        assert_eq!(
+            nothing_set(&[("ORBYN_ENV", "staging")]),
+            Some(ConfigError::LogCodesNeedsAuthSetup)
+        );
     }
 
     #[test]

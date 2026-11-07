@@ -500,12 +500,20 @@ mod tests {
         (logs, guard)
     }
 
-    const STAGING: [(&str, &str); 2] = [("ORBYN_MAIL", "log-codes"), ("ORBYN_ENV", "staging")];
+    /// The settings of a staging worker, with a real setup to open messages.
+    fn staging(setup: &str) -> [(&str, &str); 3] {
+        [
+            ("ORBYN_MAIL", "log-codes"),
+            ("ORBYN_ENV", "staging"),
+            ("ORBYN_AUTH_SETUP", setup),
+        ]
+    }
 
     #[tokio::test]
     async fn the_worker_in_log_codes_mode_warns_at_start_and_writes_each_code_to_the_log() {
         let (logs, _guard) = capture();
-        let mailer = mailer(&config(&STAGING)).expect("the worker starts");
+        let setup = orbyn_core::accounts::AuthSecrets::generate();
+        let mailer = mailer(&config(&staging(setup.as_str()))).expect("the worker starts");
         let started = String::from_utf8_lossy(&logs.0.lock().expect("lock")).into_owned();
         assert_eq!(started.matches("WARN").count(), 1, "{started}");
         assert!(started.contains("ORBYN_MAIL=log-codes: codes are written to this log with the address they belong to, and no email is sent. This is for staging only."), "{started}");
@@ -543,8 +551,13 @@ mod tests {
                 vec![
                     ("ORBYN_MAIL", "log-codes"),
                     ("ORBYN_ENV", "staging"),
+                    ("ORBYN_AUTH_SETUP", "a-setup"),
                     ("ORBYN_ACCOUNT_URL", "https://account.orbyn.dev"),
                 ],
+            ),
+            (
+                "no ORBYN_AUTH_SETUP",
+                vec![("ORBYN_MAIL", "log-codes"), ("ORBYN_ENV", "staging")],
             ),
         ] {
             let mut all = vec![("DATABASE_URL", "postgres://x")];
