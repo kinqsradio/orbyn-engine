@@ -1,10 +1,14 @@
 //! The behaviour every HSM implementation must have, run against each of them.
 
+use orbyn_crypto::P256Point;
 use orbyn_crypto::{
     DeviceKeys, P256Keys, SymmetricKey, WrappedKeyP256, service_key_statement,
     service_key_statement_hash, unwrap_key_p256, verify_service_key_statement, wrap_key_p256,
 };
-use orbyn_keyservice::{Hsm, HsmError, KeyService, KeyServiceError};
+use orbyn_keyservice::{
+    Hsm, HsmError, IdentityMessage, KeyService, KeyServiceError, MessageKind, SessionKey,
+    WrappedAccountKey,
+};
 
 const ACCOUNT: [u8; 16] = [3; 16];
 const LABEL: &[u8] = b"orbyn/zone-key/v1|account|inbox|key-1";
@@ -238,4 +242,221 @@ pub fn an_envelope_that_does_not_match_is_refused_and_leaves_no_session_object<H
         ));
     }
     assert_eq!(live(), 0, "every path out destroyed its session object");
+}
+
+/// An HSM that delegates to another, records what it was asked, and can be made to fail.
+pub struct Spy<H: Hsm> {
+    pub inner: H,
+    pub fail_derive: bool,
+    pub unwraps: std::sync::atomic::AtomicUsize,
+    pub signed: std::sync::Mutex<Vec<MessageKind>>,
+}
+
+impl<H: Hsm> Spy<H> {
+    pub fn new(inner: H, fail_derive: bool) -> Self {
+        Self {
+            inner,
+            fail_derive,
+            unwraps: Default::default(),
+            signed: Default::default(),
+        }
+    }
+}
+
+impl<H: Hsm> Hsm for Spy<H> {
+    fn kek_exists(&self) -> Result<bool, HsmError> {
+        self.inner.kek_exists()
+    }
+    fn generate_kek(&self) -> Result<(), HsmError> {
+        self.inner.generate_kek()
+    }
+    fn identity_exists(&self, version: u32) -> Result<bool, HsmError> {
+        self.inner.identity_exists(version)
+    }
+    fn generate_identity(&self, version: u32) -> Result<[u8; 32], HsmError> {
+        self.inner.generate_identity(version)
+    }
+    fn identity_public(&self, version: u32) -> Result<[u8; 32], HsmError> {
+        self.inner.identity_public(version)
+    }
+    fn sign_with_identity(
+        &self,
+        version: u32,
+        message: &IdentityMessage,
+    ) -> Result<[u8; 64], HsmError> {
+        self.signed.lock().expect("signed").push(message.kind());
+        self.inner.sign_with_identity(version, message)
+    }
+    fn generate_account_key(&self) -> Result<WrappedAccountKey, HsmError> {
+        self.inner.generate_account_key()
+    }
+    fn unwrap_account_key(&self, wrapped: &[u8]) -> Result<SessionKey, HsmError> {
+        self.unwraps
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.unwrap_account_key(wrapped)
+    }
+    fn derive(
+        &self,
+        key: &SessionKey,
+        ephemeral: &P256Point,
+    ) -> Result<zeroize::Zeroizing<[u8; 32]>, HsmError> {
+        if self.fail_derive {
+            return Err(HsmError::Failed("derive failed on purpose".into()));
+        }
+        self.inner.derive(key, ephemeral)
+    }
+    fn destroy(&self, key: SessionKey) -> Result<(), HsmError> {
+        self.inner.destroy(key)
+    }
+}
+
+/// An HSM error in the middle of an open leaves no session object behind: the guard destroys it.
+pub fn a_failing_derive_still_destroys_the_session_object<H: Hsm>(
+    inner: H,
+    live: impl Fn() -> usize,
+) {
+    let svc = KeyService::new(Spy::new(inner, true));
+    svc.init().expect("init");
+    let key = svc.new_account_key(1, &ACCOUNT).expect("account key");
+    let sender = DeviceKeys::generate().expect("sender");
+    let zone_key = SymmetricKey::generate().expect("key");
+    let envelope = wrap_key_p256(
+        &sender,
+        &key.public,
+        1,
+        &key.statement_hash,
+        LABEL,
+        &zone_key,
+    )
+    .expect("wrap");
+    let opened = svc.open_envelope(
+        &key.wrapped,
+        &key.public,
+        &sender.public(),
+        1,
+        &key.statement_hash,
+        LABEL,
+        &envelope,
+    );
+    assert!(matches!(opened, Err(KeyServiceError::Hsm(_))), "{opened:?}");
+    assert_eq!(
+        svc.hsm().unwraps.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the key was unwrapped, so there was something to destroy"
+    );
+    assert_eq!(
+        live(),
+        0,
+        "the guard destroyed the session object on the way out"
+    );
+}
+
+/// An envelope whose sender signature does not verify costs no HSM work at all.
+pub fn a_bad_sender_signature_never_reaches_the_hsm<H: Hsm>(inner: H) {
+    let svc = KeyService::new(Spy::new(inner, false));
+    svc.init().expect("init");
+    let key = svc.new_account_key(1, &ACCOUNT).expect("account key");
+    let sender = DeviceKeys::generate().expect("sender");
+    let stranger = DeviceKeys::generate().expect("stranger");
+    let zone_key = SymmetricKey::generate().expect("key");
+    let envelope = wrap_key_p256(
+        &sender,
+        &key.public,
+        1,
+        &key.statement_hash,
+        LABEL,
+        &zone_key,
+    )
+    .expect("wrap");
+    for wrong in [
+        // Not from this sender, another label, another certification.
+        (&stranger.public(), LABEL, 1, key.statement_hash),
+        (
+            &sender.public(),
+            b"other label".as_slice(),
+            1,
+            key.statement_hash,
+        ),
+        (&sender.public(), LABEL, 2, key.statement_hash),
+        (&sender.public(), LABEL, 1, [9u8; 32]),
+    ] {
+        let opened = svc.open_envelope(
+            &key.wrapped,
+            &key.public,
+            wrong.0,
+            wrong.2,
+            &wrong.3,
+            wrong.1,
+            &envelope,
+        );
+        assert!(
+            matches!(opened, Err(KeyServiceError::Crypto(_))),
+            "{opened:?}"
+        );
+    }
+    assert_eq!(
+        svc.hsm().unwraps.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "nothing was unwrapped for an envelope that did not verify"
+    );
+}
+
+/// The only thing an identity is ever asked to sign is a service-key statement.
+pub fn an_identity_signs_only_service_key_statements<H: Hsm>(inner: H) {
+    let svc = KeyService::new(Spy::new(inner, false));
+    svc.init().expect("init");
+    for account in [[1u8; 16], [2; 16]] {
+        svc.new_account_key(1, &account).expect("account key");
+    }
+    assert_eq!(
+        *svc.hsm().signed.lock().expect("signed"),
+        [
+            MessageKind::ServiceKeyStatement,
+            MessageKind::ServiceKeyStatement
+        ]
+    );
+}
+
+/// An HSM shared between the key service and the check that counts its live objects.
+pub struct Shared<H: Hsm>(pub std::sync::Arc<H>);
+
+impl<H: Hsm> Hsm for Shared<H> {
+    fn kek_exists(&self) -> Result<bool, HsmError> {
+        self.0.kek_exists()
+    }
+    fn generate_kek(&self) -> Result<(), HsmError> {
+        self.0.generate_kek()
+    }
+    fn identity_exists(&self, version: u32) -> Result<bool, HsmError> {
+        self.0.identity_exists(version)
+    }
+    fn generate_identity(&self, version: u32) -> Result<[u8; 32], HsmError> {
+        self.0.generate_identity(version)
+    }
+    fn identity_public(&self, version: u32) -> Result<[u8; 32], HsmError> {
+        self.0.identity_public(version)
+    }
+    fn sign_with_identity(
+        &self,
+        version: u32,
+        message: &IdentityMessage,
+    ) -> Result<[u8; 64], HsmError> {
+        self.0.sign_with_identity(version, message)
+    }
+    fn generate_account_key(&self) -> Result<WrappedAccountKey, HsmError> {
+        self.0.generate_account_key()
+    }
+    fn unwrap_account_key(&self, wrapped: &[u8]) -> Result<SessionKey, HsmError> {
+        self.0.unwrap_account_key(wrapped)
+    }
+    fn derive(
+        &self,
+        key: &SessionKey,
+        ephemeral: &P256Point,
+    ) -> Result<zeroize::Zeroizing<[u8; 32]>, HsmError> {
+        self.0.derive(key, ephemeral)
+    }
+    fn destroy(&self, key: SessionKey) -> Result<(), HsmError> {
+        self.0.destroy(key)
+    }
 }

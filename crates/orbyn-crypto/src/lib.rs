@@ -36,7 +36,7 @@ pub use service_key::{
 };
 pub use wrap_p256::{
     P256_POINT_LEN, P256Keys, P256Point, WRAP_P256_CONTEXT, WRAP_P256_FORMAT, WrappedKeyP256,
-    derive_input, open_with_shared_secret, unwrap_key_p256, wrap_key_p256,
+    derive_input, open_with_shared_secret, unwrap_key_p256, verify_wrap_sender, wrap_key_p256,
 };
 
 /// What went wrong. Messages never include key material or plaintext.

@@ -30,3 +30,22 @@ fn an_envelope_that_does_not_match_is_refused_and_leaves_no_session_object() {
         svc.hsm().live_session_objects()
     });
 }
+
+#[test]
+fn a_failing_derive_still_destroys_the_session_object() {
+    let hsm = std::sync::Arc::new(MemoryHsm::new());
+    let live = hsm.clone();
+    suite::a_failing_derive_still_destroys_the_session_object(suite::Shared(hsm), move || {
+        live.live_session_objects()
+    });
+}
+
+#[test]
+fn a_bad_sender_signature_never_reaches_the_hsm() {
+    suite::a_bad_sender_signature_never_reaches_the_hsm(MemoryHsm::new());
+}
+
+#[test]
+fn an_identity_signs_only_service_key_statements() {
+    suite::an_identity_signs_only_service_key_statements(MemoryHsm::new());
+}

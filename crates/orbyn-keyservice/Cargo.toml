@@ -13,6 +13,14 @@ pkcs11 = ["dep:cryptoki"]
 # The in-memory HSM for tests. Never enabled by a build the key service ships in.
 test-support = ["dep:ed25519-dalek"]
 
+[[test]]
+name = "softhsm"
+required-features = ["pkcs11", "test-support"]
+
+[[test]]
+name = "memory"
+required-features = ["test-support"]
+
 [dependencies]
 cryptoki = { workspace = true, optional = true }
 ed25519-dalek = { workspace = true, optional = true }

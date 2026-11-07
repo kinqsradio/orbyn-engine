@@ -11,8 +11,22 @@
 //!   token, non-extractable) and used with `CKM_ECDH1_DERIVE` and `CKD_NULL`, the peer given as the
 //!   uncompressed point of a validated [`P256Point`]; the derived value is read and destroyed.
 //! - SoftHSM has no `CKM_HKDF_DERIVE`, so HKDF runs in the key service, in memory.
+//!
+//! Every key template sets every usage flag, true only for what the key is for.
+//!
+//! **Accepted limits.** The derived secret is read with `C_GetAttributeValue` through `cryptoki`,
+//! which hands back a `Vec`; it is moved into a `Zeroizing` buffer at once, but the crate does not
+//! expose the raw function list, so the read cannot go straight into a buffer of ours, and this
+//! crate forbids `unsafe`. Copies `cryptoki` makes inside the call are not under our control; the
+//! secret exists only for the one derive. **Required for production, not done on SoftHSM:** the KEK
+//! should be marked `CKA_TRUSTED` by the Security Officer at `init`, and account keys created with
+//! `CKA_WRAP_WITH_TRUSTED`, so that only the trusted KEK can wrap them. SoftHSM cannot do this
+//! cleanly: the Security Officer cannot see the user's private objects, so it cannot set the
+//! attribute on the KEK, and a key with `CKA_WRAP_WITH_TRUSTED` is refused by an untrusted KEK
+//! (`CKR_KEY_NOT_WRAPPABLE`). A cloud HSM with an administrative role that can mark the key
+//! should turn it on (see docs/key-service.md).
 
-use crate::{Hsm, HsmError, SessionKey, WrappedAccountKey};
+use crate::{Hsm, HsmError, IdentityMessage, SessionKey, WrappedAccountKey};
 use cryptoki::context::{CInitializeArgs, CInitializeFlags, Pkcs11};
 use cryptoki::error::{Error as CkError, RvError};
 use cryptoki::mechanism::Mechanism;
@@ -38,6 +52,59 @@ fn identity_label(version: u32) -> Vec<u8> {
     format!("orbyn-identity-v{version}").into_bytes()
 }
 
+/// What a key may be used for. Every template sets **every** usage flag, true only for what the
+/// key is for, so nothing depends on a token's default (some default to true).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Use {
+    Sign,
+    Verify,
+    SignRecover,
+    VerifyRecover,
+    Encrypt,
+    Decrypt,
+    Wrap,
+    Unwrap,
+    Derive,
+}
+
+fn on(allowed: &[Use], what: Use) -> bool {
+    allowed.contains(&what)
+}
+
+/// The flags of a secret key.
+fn secret_usage(allowed: &[Use]) -> Vec<Attribute> {
+    vec![
+        Attribute::Encrypt(on(allowed, Use::Encrypt)),
+        Attribute::Decrypt(on(allowed, Use::Decrypt)),
+        Attribute::Sign(on(allowed, Use::Sign)),
+        Attribute::Verify(on(allowed, Use::Verify)),
+        Attribute::Wrap(on(allowed, Use::Wrap)),
+        Attribute::Unwrap(on(allowed, Use::Unwrap)),
+        Attribute::Derive(on(allowed, Use::Derive)),
+    ]
+}
+
+/// The flags of a private key.
+fn private_usage(allowed: &[Use]) -> Vec<Attribute> {
+    vec![
+        Attribute::Decrypt(on(allowed, Use::Decrypt)),
+        Attribute::Sign(on(allowed, Use::Sign)),
+        Attribute::SignRecover(on(allowed, Use::SignRecover)),
+        Attribute::Unwrap(on(allowed, Use::Unwrap)),
+        Attribute::Derive(on(allowed, Use::Derive)),
+    ]
+}
+
+/// The flags of a public key.
+fn public_usage(allowed: &[Use]) -> Vec<Attribute> {
+    vec![
+        Attribute::Encrypt(on(allowed, Use::Encrypt)),
+        Attribute::Verify(on(allowed, Use::Verify)),
+        Attribute::VerifyRecover(on(allowed, Use::VerifyRecover)),
+        Attribute::Wrap(on(allowed, Use::Wrap)),
+    ]
+}
+
 fn failed(err: CkError) -> HsmError {
     HsmError::Failed(err.to_string())
 }
@@ -47,7 +114,8 @@ fn failed(err: CkError) -> HsmError {
 pub struct Pkcs11Config {
     pub module: PathBuf,
     pub slot: u64,
-    pub pin: String,
+    /// The user PIN, wiped from memory when the configuration is dropped.
+    pub pin: Zeroizing<String>,
 }
 
 impl std::fmt::Debug for Pkcs11Config {
@@ -79,7 +147,7 @@ impl Pkcs11Config {
                 .trim()
                 .parse()
                 .map_err(|_| "ORBYN_HSM_SLOT is not a slot number".to_owned())?,
-            pin: need("ORBYN_HSM_PIN")?,
+            pin: Zeroizing::new(need("ORBYN_HSM_PIN")?),
         })
     }
 }
@@ -134,6 +202,18 @@ impl Pkcs11Hsm {
     #[cfg(feature = "test-support")]
     pub fn raw_session(&self) -> Result<Session, HsmError> {
         self.session()
+    }
+
+    /// Attributes of an unwrapped session key, as the HSM reports them. Only with `test-support`.
+    #[cfg(feature = "test-support")]
+    pub fn session_key_attribute_values(
+        &self,
+        key: &SessionKey,
+        types: &[AttributeType],
+    ) -> Result<Vec<Attribute>, HsmError> {
+        let live = self.live();
+        let (session, handle) = live.get(&key.0).ok_or(HsmError::NotFound)?;
+        session.get_attributes(*handle, types).map_err(failed)
     }
 
     /// Whether an unwrapped session key is on the token, extractable and sensitive, as the HSM
@@ -209,22 +289,17 @@ impl Hsm for Pkcs11Hsm {
         if Self::find(&session, ObjectClass::SECRET_KEY, KEK_LABEL)?.is_some() {
             return Err(HsmError::AlreadyExists);
         }
+        let mut template = vec![
+            Attribute::Token(true),
+            Attribute::Private(true),
+            Attribute::Sensitive(true),
+            Attribute::Extractable(false),
+            Attribute::ValueLen(32.into()),
+            Attribute::Label(KEK_LABEL.to_vec()),
+        ];
+        template.extend(secret_usage(&[Use::Wrap, Use::Unwrap]));
         session
-            .generate_key(
-                &Mechanism::AesKeyGen,
-                &[
-                    Attribute::Token(true),
-                    Attribute::Private(true),
-                    Attribute::Sensitive(true),
-                    Attribute::Extractable(false),
-                    Attribute::Wrap(true),
-                    Attribute::Unwrap(true),
-                    Attribute::Encrypt(false),
-                    Attribute::Decrypt(false),
-                    Attribute::ValueLen(32.into()),
-                    Attribute::Label(KEK_LABEL.to_vec()),
-                ],
-            )
+            .generate_key(&Mechanism::AesKeyGen, &template)
             .map_err(failed)?;
         Ok(())
     }
@@ -240,23 +315,25 @@ impl Hsm for Pkcs11Hsm {
         if Self::find(&session, ObjectClass::PRIVATE_KEY, &label)?.is_some() {
             return Err(HsmError::AlreadyExists);
         }
+        let mut public_template = vec![
+            Attribute::Token(true),
+            Attribute::EcParams(ED25519_PARAMS.to_vec()),
+            Attribute::Label(label.clone()),
+        ];
+        public_template.extend(public_usage(&[Use::Verify]));
+        let mut private_template = vec![
+            Attribute::Token(true),
+            Attribute::Private(true),
+            Attribute::Sensitive(true),
+            Attribute::Extractable(false),
+            Attribute::Label(label),
+        ];
+        private_template.extend(private_usage(&[Use::Sign]));
         let (public, _private) = session
             .generate_key_pair(
                 &Mechanism::EccEdwardsKeyPairGen,
-                &[
-                    Attribute::Token(true),
-                    Attribute::Verify(true),
-                    Attribute::EcParams(ED25519_PARAMS.to_vec()),
-                    Attribute::Label(label.clone()),
-                ],
-                &[
-                    Attribute::Token(true),
-                    Attribute::Private(true),
-                    Attribute::Sensitive(true),
-                    Attribute::Extractable(false),
-                    Attribute::Sign(true),
-                    Attribute::Label(label),
-                ],
+                &public_template,
+                &private_template,
             )
             .map_err(failed)?;
         ed25519_public(&Self::point_of(&session, public)?)
@@ -269,7 +346,11 @@ impl Hsm for Pkcs11Hsm {
         ed25519_public(&Self::point_of(&session, public)?)
     }
 
-    fn sign_with_identity(&self, version: u32, message: &[u8]) -> Result<[u8; 64], HsmError> {
+    fn sign_with_identity(
+        &self,
+        version: u32,
+        message: &IdentityMessage,
+    ) -> Result<[u8; 64], HsmError> {
         let session = self.session()?;
         let key = Self::find(&session, ObjectClass::PRIVATE_KEY, &identity_label(version))?
             .ok_or(HsmError::NotFound)?;
@@ -277,7 +358,7 @@ impl Hsm for Pkcs11Hsm {
             .sign(
                 &Mechanism::Eddsa(EddsaParams::new(EddsaSignatureScheme::Pure)),
                 key,
-                message,
+                message.signed_bytes(),
             )
             .map_err(failed)?;
         signature.try_into().map_err(|_| HsmError::BadKey)
@@ -288,20 +369,23 @@ impl Hsm for Pkcs11Hsm {
         let kek = Self::kek(&session)?;
         // Session objects, never on the token. The private half must be extractable for the
         // wrap, and sensitive, so it can leave only wrapped.
+        let mut public_template = vec![
+            Attribute::Token(false),
+            Attribute::EcParams(P256_PARAMS.to_vec()),
+        ];
+        public_template.extend(public_usage(&[]));
+        let mut private_template = vec![
+            Attribute::Token(false),
+            Attribute::Private(true),
+            Attribute::Sensitive(true),
+            Attribute::Extractable(true),
+        ];
+        private_template.extend(private_usage(&[Use::Derive]));
         let (public, private) = session
             .generate_key_pair(
                 &Mechanism::EccKeyPairGen,
-                &[
-                    Attribute::Token(false),
-                    Attribute::EcParams(P256_PARAMS.to_vec()),
-                ],
-                &[
-                    Attribute::Token(false),
-                    Attribute::Private(true),
-                    Attribute::Sensitive(true),
-                    Attribute::Extractable(true),
-                    Attribute::Derive(true),
-                ],
+                &public_template,
+                &private_template,
             )
             .map_err(failed)?;
         let result = (|| {
@@ -324,21 +408,17 @@ impl Hsm for Pkcs11Hsm {
     fn unwrap_account_key(&self, wrapped: &[u8]) -> Result<SessionKey, HsmError> {
         let session = self.session()?;
         let kek = Self::kek(&session)?;
+        let mut template = vec![
+            Attribute::Class(ObjectClass::PRIVATE_KEY),
+            Attribute::KeyType(KeyType::EC),
+            Attribute::Token(false),
+            Attribute::Private(true),
+            Attribute::Sensitive(true),
+            Attribute::Extractable(false),
+        ];
+        template.extend(private_usage(&[Use::Derive]));
         let handle = session
-            .unwrap_key(
-                &Mechanism::AesKeyWrapPad,
-                kek,
-                wrapped,
-                &[
-                    Attribute::Class(ObjectClass::PRIVATE_KEY),
-                    Attribute::KeyType(KeyType::EC),
-                    Attribute::Token(false),
-                    Attribute::Private(true),
-                    Attribute::Sensitive(true),
-                    Attribute::Extractable(false),
-                    Attribute::Derive(true),
-                ],
-            )
+            .unwrap_key(&Mechanism::AesKeyWrapPad, kek, wrapped, &template)
             .map_err(failed)?;
         let mut next = self.next.lock().unwrap_or_else(PoisonError::into_inner);
         let id = *next;
@@ -355,18 +435,20 @@ impl Hsm for Pkcs11Hsm {
         let live = self.live();
         let (session, handle) = live.get(&key.0).ok_or(HsmError::NotFound)?;
         let peer = ephemeral.uncompressed();
+        let mut template = vec![
+            Attribute::Class(ObjectClass::SECRET_KEY),
+            Attribute::KeyType(KeyType::GENERIC_SECRET),
+            Attribute::ValueLen(32.into()),
+            Attribute::Token(false),
+            Attribute::Sensitive(false),
+            Attribute::Extractable(true),
+        ];
+        template.extend(secret_usage(&[]));
         let derived = session
             .derive_key(
                 &Mechanism::Ecdh1Derive(Ecdh1DeriveParams::new(EcKdf::null(), &peer)),
                 *handle,
-                &[
-                    Attribute::Class(ObjectClass::SECRET_KEY),
-                    Attribute::KeyType(KeyType::GENERIC_SECRET),
-                    Attribute::ValueLen(32.into()),
-                    Attribute::Token(false),
-                    Attribute::Sensitive(false),
-                    Attribute::Extractable(true),
-                ],
+                &template,
             )
             .map_err(failed)?;
         let value = session

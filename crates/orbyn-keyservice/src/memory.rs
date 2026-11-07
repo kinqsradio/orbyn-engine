@@ -3,7 +3,7 @@
 //! objects that must be destroyed) with ordinary software crypto. It is not a security boundary
 //! and exists only behind the `test-support` feature.
 
-use crate::{Hsm, HsmError, SessionKey, WrappedAccountKey};
+use crate::{Hsm, HsmError, IdentityMessage, SessionKey, WrappedAccountKey};
 use ed25519_dalek::{Signer, SigningKey};
 use orbyn_crypto::{P256Keys, P256Point, Sealed, SymmetricKey};
 use std::collections::HashMap;
@@ -83,11 +83,15 @@ impl Hsm for MemoryHsm {
             .ok_or(HsmError::NotFound)
     }
 
-    fn sign_with_identity(&self, version: u32, message: &[u8]) -> Result<[u8; 64], HsmError> {
+    fn sign_with_identity(
+        &self,
+        version: u32,
+        message: &IdentityMessage,
+    ) -> Result<[u8; 64], HsmError> {
         self.state()
             .identities
             .get(&version)
-            .map(|k| k.sign(message).to_bytes())
+            .map(|k| k.sign(message.signed_bytes()).to_bytes())
             .ok_or(HsmError::NotFound)
     }
 

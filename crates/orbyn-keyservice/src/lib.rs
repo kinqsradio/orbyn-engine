@@ -5,6 +5,11 @@
 //!   leaves it, account P-256 keys that come out only wrapped under the KEK, and an ECDH derive
 //!   with such a key after it was unwrapped into a session object. There is no operation that
 //!   exports a private key, and none that takes a key to sign.
+//! - **No signing oracle.** An identity signs only an [`IdentityMessage`], a closed set of messages
+//!   this crate builds itself ([`MessageKind`]); the type cannot be constructed outside the crate, so
+//!   no caller can have an identity sign bytes it chose. Today the only message is the
+//!   service-key statement; the transparency-log head and the recovery approval join the enum when
+//!   they exist.
 //! - [`KeyService`] is the API on top: [`KeyService::init`], [`KeyService::new_account_key`]
 //!   (which generates an account's service key **and** certifies it in the same call) and
 //!   [`KeyService::open_envelope`] (validate, derive in the HSM, HKDF in memory, open). It has no
@@ -23,7 +28,7 @@ pub mod pkcs11;
 use orbyn_crypto::{
     CryptoError, DevicePublic, P256Point, SymmetricKey, WrappedKeyP256, derive_input,
     open_with_shared_secret, service_key_signed_bytes, service_key_statement,
-    service_key_statement_hash,
+    service_key_statement_hash, verify_wrap_sender,
 };
 use zeroize::Zeroizing;
 
@@ -53,6 +58,64 @@ pub enum KeyServiceError {
     Crypto(#[from] CryptoError),
 }
 
+/// What kind of message an [`IdentityMessage`] is. Closed: a new kind is a change to this crate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MessageKind {
+    /// An account service key's certification (`orbyn/service-key/v1`).
+    ServiceKeyStatement,
+}
+
+/// A message an identity may sign. Only this crate can make one, and only of a [`MessageKind`] it
+/// builds itself, so an [`Hsm`] is never asked to sign bytes a caller chose.
+///
+/// A caller outside the crate has no way to call [`Hsm::sign_with_identity`]:
+///
+/// ```compile_fail
+/// use orbyn_keyservice::Hsm;
+/// fn oracle(hsm: &impl Hsm) {
+///     let _ = hsm.sign_with_identity(1, b"any bytes at all");
+/// }
+/// ```
+///
+/// nor build the message that method takes:
+///
+/// ```compile_fail
+/// use orbyn_keyservice::{IdentityMessage, MessageKind};
+/// let _ = IdentityMessage { kind: MessageKind::ServiceKeyStatement, bytes: vec![1, 2, 3] };
+/// ```
+///
+/// and the control, which does compile: the same trait, used for what is allowed.
+///
+/// ```
+/// use orbyn_keyservice::{Hsm, MessageKind};
+/// fn kinds(_: &impl Hsm) -> MessageKind { MessageKind::ServiceKeyStatement }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityMessage {
+    kind: MessageKind,
+    bytes: Vec<u8>,
+}
+
+impl IdentityMessage {
+    /// The certification of a service key: the statement under its context.
+    pub(crate) fn service_key_statement(statement: &[u8]) -> Self {
+        Self {
+            kind: MessageKind::ServiceKeyStatement,
+            bytes: service_key_signed_bytes(statement),
+        }
+    }
+
+    pub fn kind(&self) -> MessageKind {
+        self.kind
+    }
+
+    /// The exact bytes to sign (pure Ed25519). For an [`Hsm`] implementation.
+    pub fn signed_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 /// A private key held as a session object in the HSM: not on the token, not extractable. Made by
 /// [`Hsm::unwrap_account_key`], used by [`Hsm::derive`], and ended by [`Hsm::destroy`].
 #[derive(Debug, PartialEq, Eq)]
@@ -80,9 +143,13 @@ pub trait Hsm {
     fn generate_identity(&self, version: u32) -> Result<[u8; 32], HsmError>;
     /// The public key of identity `version`.
     fn identity_public(&self, version: u32) -> Result<[u8; 32], HsmError>;
-    /// Signs `message` with identity `version` (pure Ed25519). The key service only calls this with
-    /// bytes it built itself; see [`KeyService`].
-    fn sign_with_identity(&self, version: u32, message: &[u8]) -> Result<[u8; 64], HsmError>;
+    /// Signs `message` with identity `version` (pure Ed25519, over [`IdentityMessage::signed_bytes`]).
+    /// The message type cannot be made outside this crate, so nothing else can ask for a signature.
+    fn sign_with_identity(
+        &self,
+        version: u32,
+        message: &IdentityMessage,
+    ) -> Result<[u8; 64], HsmError>;
 
     /// Makes a P-256 key pair. The private half is returned only wrapped under the KEK and is
     /// gone from the HSM when this returns.
@@ -152,7 +219,9 @@ impl<H: Hsm> KeyService<H> {
         Self { hsm }
     }
 
-    /// The HSM, for tests and tools that need to look at what it holds.
+    /// The HSM, for tests that need to look at what it holds. Only with `test-support`: a key
+    /// service that ships hands out no HSM handle.
+    #[cfg(feature = "test-support")]
     pub fn hsm(&self) -> &H {
         &self.hsm
     }
@@ -185,9 +254,10 @@ impl<H: Hsm> KeyService<H> {
         }
         let WrappedAccountKey { wrapped, public } = self.hsm.generate_account_key()?;
         let statement = service_key_statement(identity_version, account_id, &public);
-        let signature = self
-            .hsm
-            .sign_with_identity(identity_version, &service_key_signed_bytes(&statement))?;
+        let signature = self.hsm.sign_with_identity(
+            identity_version,
+            &IdentityMessage::service_key_statement(&statement),
+        )?;
         Ok(CertifiedServiceKey {
             wrapped,
             public,
@@ -221,6 +291,17 @@ impl<H: Hsm> KeyService<H> {
         envelope: &WrappedKeyP256,
     ) -> Result<SymmetricKey, KeyServiceError> {
         let ephemeral = derive_input(&envelope.ephemeral)?;
+        // The sender's signature needs no secret, so it is checked before any HSM work: an envelope
+        // that is not from `sender`, or is for another certification, never costs an unwrap.
+        verify_wrap_sender(
+            &ephemeral,
+            service_public,
+            sender,
+            identity_version,
+            statement_hash,
+            label,
+            envelope,
+        )?;
         let guard = SessionGuard {
             hsm: &self.hsm,
             key: Some(self.hsm.unwrap_account_key(wrapped)?),
