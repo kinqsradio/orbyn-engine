@@ -26,7 +26,7 @@ The plan lives in the [Orbyn platform plan](https://claude.ai/artifact/BBhxZSmXR
 | `orbyn-core` | Configuration, Postgres, migrations, job queue, accounts and devices | Server |
 | `orbyn-store` | The CloudKit-style record store: zones, encrypted records, change tokens, uploads, live notices | Server |
 | `orbyn-keyservice` | The key service library: the `Hsm` trait, service-key certification, opening service envelopes, and `orbyn keyservice init`. PKCS#11 (SoftHSM, cloud HSMs) is behind its `pkcs11` feature, and an in-memory HSM for tests behind `test-support`. No HTTP and no deployment yet | Key service |
-| `orbyn-translog` | The transparency log's RFC 9162 Merkle tree: roots, inclusion and consistency proofs and their verifiers, an append-only accumulator. Pure, no IO; entry and head encodings and the maps come in later steps (see [key-service-3c.md](key-service-3c.md)) | Key service and devices (native and WebAssembly) |
+| `orbyn-translog` | The transparency log's RFC 9162 Merkle tree: roots, inclusion and consistency proofs and their verifiers, an append-only accumulator; and the path-compressed sparse Merkle map with membership and non-membership proofs and the witness's update function. Pure, no IO; entry and head encodings come in later steps (see [key-service-3c.md](key-service-3c.md)) | Key service and devices (native and WebAssembly) |
 | `orbyn-server` | HTTP API and the `/v1/sync` WebSocket | Server |
 | `orbyn-worker` | Job runner | Server |
 | `orbyn-cli` | The `orbyn` binary with every role | Server |

@@ -9,9 +9,15 @@
 //!
 //! It runs on the key service and on devices (native and WebAssembly): a device verifies with the
 //! very code the key service builds with. What an entry or a head holds is not here yet.
+//!
+//! [`map`] is the path-compressed sparse Merkle map that holds the key service's two maps (the
+//! service-key map and the identity map): membership and non-membership proofs, their verifier,
+//! and the update function a witness replays (an old path plus a new value gives the new root).
 
+pub mod map;
 pub mod merkle;
 
+pub use map::{End, Lookup, Map, MapError, Proof, Step};
 pub use merkle::{
     Accumulator, Hash, Subtrees, consistency_proof, empty_root, inclusion_proof, leaf_hash,
     node_hash, tree_root, verify_consistency, verify_inclusion,

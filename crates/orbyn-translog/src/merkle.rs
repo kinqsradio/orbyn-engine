@@ -298,7 +298,7 @@ impl Accumulator {
         let mut hash = leaf;
         let mut s = self.size;
         while s & 1 == 1 {
-            let left = self.nodes.pop().unwrap_or_default();
+            let left = self.nodes.pop().expect("frontier matches size");
             hash = node_hash(&left, &hash);
             s >>= 1;
         }
