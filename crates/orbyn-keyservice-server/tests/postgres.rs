@@ -114,8 +114,15 @@ impl TestDb {
     }
 
     async fn cleanup(self) {
-        self.owner.close().await;
-        self.runtime.close().await;
+        // A pool waits for every checked-out connection to come back; a test that forgot one must
+        // fail here, not hang.
+        let closing = async {
+            self.owner.close().await;
+            self.runtime.close().await;
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(20), closing)
+            .await
+            .expect("a pool did not close: a test left a connection checked out");
         let _ = run(
             &self.admin,
             format!("DROP DATABASE IF EXISTS \"{}\" WITH (FORCE)", self.name),
@@ -1158,21 +1165,26 @@ async fn a_writer_that_cannot_get_the_lock_gets_a_retryable_error() {
         .append(&entry(MapId::Service, 1, [0; 32], 0))
         .await
         .expect("append");
-    // A statement past its limit is the same kind of error.
-    let slow = db.store().with_timeouts(orbyn_keyservice_server::Timeouts {
-        lock: "10s".to_owned(),
-        statement: "1ms".to_owned(),
-    });
-    let mut busy = 0;
-    for i in 1..30u64 {
-        if matches!(
-            slow.append(&entry(MapId::Service, 2, [0; 32], i)).await,
-            Err(StoreError::Busy)
-        ) {
-            busy += 1;
-        }
-    }
-    assert!(busy > 0, "a 1 ms statement timeout fired at least once");
+    // A statement past its limit is the same kind of error: a statement that sleeps past a short
+    // statement timeout, converted the way every store call converts its errors.
+    let mut tx = db.runtime.begin().await.expect("tx");
+    sqlx::query("SET LOCAL statement_timeout = '50ms'")
+        .execute(&mut *tx)
+        .await
+        .expect("set");
+    let error = sqlx::query("SELECT pg_sleep(2)")
+        .execute(&mut *tx)
+        .await
+        .expect_err("past the limit");
+    assert!(matches!(StoreError::from(error), StoreError::Busy));
+    // End the transaction: a connection still checked out would make `cleanup` wait for it forever.
+    tx.rollback().await.expect("rollback");
+    // Any other database error stays a database error.
+    let error = sqlx::query("SELECT 1 / 0")
+        .execute(&db.runtime)
+        .await
+        .expect_err("division");
+    assert!(matches!(StoreError::from(error), StoreError::Db(_)));
     db.cleanup().await;
 }
 
