@@ -377,6 +377,7 @@ impl Accounts {
             return Err(AccountError::InvalidRequest);
         }
         let mut tx = self.pool.begin().await?;
+        Self::lock_account_shared(&mut tx, session.account_id).await?;
         self.require_trusted(&mut tx, session).await?;
         if device_id == session.device_id {
             return Err(AccountError::InvalidRequest);
@@ -447,6 +448,7 @@ impl Accounts {
         nonce: &[u8; 32],
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
+        Self::lock_account_shared(&mut tx, session.account_id).await?;
         let view = self
             .open_approval(&mut tx, session, approval_id, false)
             .await?;

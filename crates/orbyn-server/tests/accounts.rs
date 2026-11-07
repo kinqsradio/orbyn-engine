@@ -5217,3 +5217,47 @@ async fn the_email_link_cancels_once_without_a_sign_in_and_a_repeat_request_keep
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(server.exists(account).await);
 }
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn an_approval_waits_for_the_account_lock_before_touching_its_rows() {
+    let _turn = TURN.lock().await;
+    let server = server().await;
+    let p = pair(&server).await;
+    server.approve_fully(&p).await; // both devices trusted: either can start another approval
+    let account = p.account_id;
+    // An open approval row already exists, so a second `create_approval` has a row to update.
+    let (status, body, _) = server.start_approval(&p).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // The deletion holds the account lock (it takes it first, then deletes the account's rows).
+    let mut deleting = server.db.pool().begin().await.expect("tx");
+    orbyn_core::sqlx::query("SELECT id FROM accounts WHERE id = $1 FOR UPDATE")
+        .bind(account)
+        .execute(&mut *deleting)
+        .await
+        .expect("lock");
+    let again = server.start_approval(&p);
+    let check = async {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // The request is waiting for the account. It has not locked the approval row: taking that
+        // row without waiting works. Before the fix it held the row and waited for the account, the
+        // opposite order of the deletion, which deadlocks.
+        let mut other = server.db.pool().begin().await.expect("tx");
+        let row = orbyn_core::sqlx::query(
+            "SELECT id FROM device_approvals WHERE account_id = $1 FOR UPDATE NOWAIT",
+        )
+        .bind(account)
+        .fetch_all(&mut *other)
+        .await;
+        other.rollback().await.expect("rollback");
+        deleting.commit().await.expect("release");
+        row.is_ok()
+    };
+    let ((status, body, _), row_free) = tokio::join!(again, check);
+    assert!(
+        row_free,
+        "the approval request locked its row before the account"
+    );
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}

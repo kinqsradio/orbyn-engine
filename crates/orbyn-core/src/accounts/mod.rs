@@ -828,6 +828,12 @@ impl Accounts {
         name: &str,
     ) -> Result<NewSession> {
         let mut tx = self.pool.begin().await?;
+        // The account first, exclusively (it serializes the pending-device cap below, and the deletion
+        // takes it before the devices), then the device row.
+        sqlx::query("SELECT id FROM accounts WHERE id = $1 FOR UPDATE")
+            .bind(account_id)
+            .execute(&mut *tx)
+            .await?;
         let existing: Option<(Uuid, Vec<u8>, String)> = sqlx::query_as(
             "SELECT id, agreement_key, state FROM devices
              WHERE account_id = $1 AND signing_key = $2 AND state <> 'removed' FOR UPDATE",
@@ -844,11 +850,7 @@ impl Accounts {
                 (id, DeviceState::parse(&state)?)
             }
             None => {
-                // Lock the account so concurrent sign-ins cannot pass the cap together.
-                sqlx::query("SELECT id FROM accounts WHERE id = $1 FOR UPDATE")
-                    .bind(account_id)
-                    .execute(&mut *tx)
-                    .await?;
+                // The account is locked above, so concurrent sign-ins cannot pass the cap together.
                 let pending: i64 = sqlx::query_scalar(
                     "SELECT count(*) FROM devices WHERE account_id = $1 AND state = 'pending'",
                 )
@@ -990,10 +992,11 @@ impl Accounts {
         .await?)
     }
 
-    /// Takes the account's row lock shared and refuses while a deletion is scheduled: for the steps
-    /// that must not run during the grace period. A scheduling holds the lock exclusively, so
-    /// either this sees the schedule, or the schedule waits for this step to finish.
-    pub(super) async fn refuse_during_deletion_shared(
+    /// Takes the account's row lock shared, as the first statement of a transaction that will write
+    /// an audit row or touch the account's devices, sessions or approvals. The account deletion holds
+    /// this lock exclusively and then deletes those rows, so every writer takes the account first and
+    /// the rows after: the other order can deadlock with it.
+    pub(super) async fn lock_account_shared(
         tx: &mut Transaction<'_, Postgres>,
         account_id: Uuid,
     ) -> Result<()> {
@@ -1001,6 +1004,17 @@ impl Accounts {
             .bind(account_id)
             .execute(&mut **tx)
             .await?;
+        Ok(())
+    }
+
+    /// Takes the account's row lock shared and refuses while a deletion is scheduled: for the steps
+    /// that must not run during the grace period. A scheduling holds the lock exclusively, so
+    /// either this sees the schedule, or the schedule waits for this step to finish.
+    pub(super) async fn refuse_during_deletion_shared(
+        tx: &mut Transaction<'_, Postgres>,
+        account_id: Uuid,
+    ) -> Result<()> {
+        Self::lock_account_shared(tx, account_id).await?;
         Self::refuse_during_deletion(tx, account_id).await
     }
 
