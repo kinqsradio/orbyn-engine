@@ -5469,6 +5469,7 @@ async fn adding_a_device_waits_while_a_deletion_is_scheduled() {
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
     let (status, body, _) = server.start_approval(&p).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
+}
 
 // ---- Deleting an unused account ----
 
