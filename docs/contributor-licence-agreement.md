@@ -4,7 +4,7 @@
 
 ## Why one is needed
 
-The engine is dual-licensed by side: app-side crates under MIT or Apache 2.0, server-side crates under AGPL 3.0 only (see the README). The Product Line Plan keeps the right to relicense later, and to run the server in the hosted plans without publishing every change. Both depend on holding the rights to all of the code. An outside contribution under the inbound licence alone would not grant that.
+The engine is open source under MIT or Apache 2.0, at the user's choice (see the README). The Product Line Plan keeps the right to relicense later, which depends on holding the rights to all of the code. An outside contribution under the inbound licence alone would not grant that.
 
 ## What it would grant
 

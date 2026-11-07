@@ -1,6 +1,6 @@
 [package]
 name = "orbyn-store"
-license = "AGPL-3.0-only"
+license = "MIT OR Apache-2.0"
 description = "The CloudKit-style record store: zones, encrypted records, change tokens and live notifications."
 version.workspace = true
 edition.workspace = true

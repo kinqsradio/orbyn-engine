@@ -1,6 +1,6 @@
 [package]
 name = "orbyn-core"
-license = "AGPL-3.0-only"
+license = "MIT OR Apache-2.0"
 description = "Server-side foundation for orbyn-engine: configuration, database, migrations and the job queue."
 version.workspace = true
 edition.workspace = true
