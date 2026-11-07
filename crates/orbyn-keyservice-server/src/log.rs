@@ -43,6 +43,10 @@ impl LogStore {
     /// map, or zeros for the first; anything else is [`StoreError::ChainMismatch`].
     pub async fn append(conn: &mut PgConnection, entry: &Entry) -> Result<Appended> {
         let payload = entry.encode().map_err(|_| StoreError::BadEntry)?;
+        // What goes into the log for good must be readable back: the exact inverse of encode.
+        if Entry::decode(&payload).as_ref() != Ok(entry) {
+            return Err(StoreError::BadEntry);
+        }
         let leaf = orbyn_translog::merkle::leaf_hash(&payload);
         let map = map_column(entry.map);
 
@@ -125,13 +129,18 @@ impl LogStore {
         Ok(accumulator.root())
     }
 
-    /// The entries after `seq`, in order.
-    pub async fn entries_after(conn: &mut PgConnection, seq: u64) -> Result<Vec<StoredEntry>> {
+    /// The entries after `seq`, in order, at most `limit` of them.
+    pub async fn entries_after(
+        conn: &mut PgConnection,
+        seq: u64,
+        limit: u64,
+    ) -> Result<Vec<StoredEntry>> {
         let rows = sqlx::query(
             "SELECT seq, map, map_key, chain_index, leaf_hash FROM log_entries \
-             WHERE seq > $1 ORDER BY seq",
+             WHERE seq > $1 ORDER BY seq LIMIT $2",
         )
         .bind(to_i64(seq)?)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
         .fetch_all(conn)
         .await?;
         rows.into_iter()

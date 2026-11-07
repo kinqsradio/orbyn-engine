@@ -46,6 +46,8 @@ pub enum EntryError {
     Encoding,
     #[error("the entry's fields are too long")]
     TooLong,
+    #[error("the entry's kind is not one that is built")]
+    Kind,
 }
 
 /// One log entry.
@@ -64,6 +66,11 @@ impl Entry {
     /// The canonical bytes: `version ‖ kind ‖ map ‖ map_key ‖ prev ‖ time_ms (u64 big endian) ‖
     /// fields length (u32 big endian) ‖ fields`.
     pub fn encode(&self) -> Result<Vec<u8>, EntryError> {
+        // Only kinds `decode` accepts: an entry that cannot be read back must never be hashed
+        // into a log that cannot be edited.
+        if !matches!(self.kind, 1 | 2) {
+            return Err(EntryError::Kind);
+        }
         if self.fields.len() > MAX_FIELDS {
             return Err(EntryError::TooLong);
         }
@@ -80,7 +87,7 @@ impl Entry {
         Ok(out)
     }
 
-    /// Reads canonical bytes. It refuses another version, a kind that is not built, an unknown
+    /// Reads canonical bytes, the exact inverse of [`Entry::encode`]. It refuses another version, a kind that is not built, an unknown
     /// map, a length that does not match, and trailing bytes.
     pub fn decode(bytes: &[u8]) -> Result<Self, EntryError> {
         let bad = EntryError::Encoding;
@@ -200,6 +207,19 @@ mod tests {
         };
         let bytes = identity.encode().expect("encode");
         assert_eq!(Entry::decode(&bytes), Ok(identity));
+    }
+
+    #[test]
+    fn only_built_kinds_encode_so_every_leaf_can_be_read_back() {
+        for kind in [0u8, 3, 4, 5, 6, 255] {
+            let e = Entry { kind, ..entry() };
+            assert_eq!(e.encode(), Err(EntryError::Kind), "kind {kind}");
+            assert_eq!(e.hash(), Err(EntryError::Kind));
+        }
+        for kind in [1u8, 2] {
+            let e = Entry { kind, ..entry() };
+            assert_eq!(Entry::decode(&e.encode().expect("built")), Ok(e));
+        }
     }
 
     #[test]

@@ -28,7 +28,7 @@ pub use log::{Appended, LogStore, StoredEntry};
 pub use map::{MapStore, Node, plan_update};
 
 use orbyn_translog::{Entry, Hash, MapId, UnsignedHead};
-use sqlx::PgConnection;
+use sqlx::Row;
 use sqlx::postgres::PgPool;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -56,20 +56,50 @@ pub enum StoreError {
     Proof(#[from] orbyn_translog::MapError),
     #[error("a role name is letters, digits and underscores, starting with a letter")]
     BadRole,
+    #[error(
+        "the runtime role must exist and must not be a superuser, the owner or a member of the owner"
+    )]
+    UnsafeRole,
 }
 
 pub type Result<T, E = StoreError> = std::result::Result<T, E>;
+
+/// How long a writer waits for the lock, and how long one statement may run, so a stuck writer
+/// is an error instead of a queue.
+const LOCK_TIMEOUT: &str = "10s";
+const STATEMENT_TIMEOUT: &str = "120s";
+
+/// The most entries one head covers unless the caller says otherwise.
+pub const DEFAULT_MAX_ENTRIES: u64 = 1000;
 
 /// One lock for every writer: appends and head work are serialized, so sequence numbers have no
 /// gaps and a head is built on the last head that was stored.
 const WRITE_LOCK: i64 = 0x6f72_6279_6e5f_6b73;
 
-pub(crate) async fn lock(conn: &mut PgConnection) -> Result<()> {
+/// Starts a transaction that may write: **READ COMMITTED, whatever the database's default**,
+/// with timeouts, holding the write lock. Under REPEATABLE READ a transaction that waited for the
+/// lock would still see the snapshot from before it, and could store a head on a stale previous
+/// head; READ COMMITTED takes a fresh snapshot for each statement after the lock is held.
+/// `SET TRANSACTION` has to be the first statement.
+pub(crate) async fn begin_write(
+    pool: &PgPool,
+) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true)",
+    )
+    .bind(LOCK_TIMEOUT)
+    .bind(STATEMENT_TIMEOUT)
+    .execute(&mut *tx)
+    .await?;
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(WRITE_LOCK)
-        .execute(conn)
+        .execute(&mut *tx)
         .await?;
-    Ok(())
+    Ok(tx)
 }
 
 pub(crate) fn to_hash(bytes: Vec<u8>, what: &'static str) -> Result<Hash> {
@@ -98,6 +128,19 @@ pub async fn migrate(owner: &PgPool, runtime_role: &str) -> Result<()> {
     if !valid {
         return Err(StoreError::BadRole);
     }
+    // The runtime role must be a plain role: a superuser or the owner (or anyone in the owner's
+    // role) could drop the triggers or write what the grants forbid.
+    let row = sqlx::query(
+        "SELECT rolsuper, pg_has_role(rolname, current_user, 'MEMBER') AS owner_member \
+         FROM pg_roles WHERE rolname = $1",
+    )
+    .bind(runtime_role)
+    .fetch_optional(owner)
+    .await?
+    .ok_or(StoreError::UnsafeRole)?;
+    if row.try_get::<bool, _>("rolsuper")? || row.try_get::<bool, _>("owner_member")? {
+        return Err(StoreError::UnsafeRole);
+    }
     MIGRATOR.run(owner).await?;
     let role = format!("\"{runtime_role}\"");
     let mut tx = owner.begin().await?;
@@ -105,6 +148,8 @@ pub async fn migrate(owner: &PgPool, runtime_role: &str) -> Result<()> {
         format!("REVOKE ALL ON ALL TABLES IN SCHEMA public FROM {role}"),
         format!("REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM {role}"),
         format!("REVOKE CREATE ON SCHEMA public FROM {role}"),
+        // Nobody else gets to create objects either (the default before Postgres 15).
+        "REVOKE CREATE ON SCHEMA public FROM PUBLIC".to_owned(),
         format!("GRANT USAGE ON SCHEMA public TO {role}"),
         format!(
             "GRANT SELECT, INSERT ON service_keys, log_entries, log_nodes, map_nodes, heads TO {role}"
@@ -138,8 +183,7 @@ impl Store {
     /// Appends an entry: gapless sequence number, its account's chain checked, and the log's
     /// complete subtrees written, in one transaction.
     pub async fn append(&self, entry: &Entry) -> Result<Appended> {
-        let mut tx = self.pool.begin().await?;
-        lock(&mut tx).await?;
+        let mut tx = begin_write(&self.pool).await?;
         let appended = LogStore::append(&mut tx, entry).await?;
         tx.commit().await?;
         Ok(appended)
@@ -164,28 +208,40 @@ impl Store {
         MapStore::prove(&mut conn, root, key).await
     }
 
-    /// Applies every entry the last head does not cover to both maps and returns the next head,
-    /// unsigned. It stores no head: building twice without committing gives the same head (apart
+    /// Applies the entries the last head does not cover (at most `max_entries`, which defaults to
+    /// [`DEFAULT_MAX_ENTRIES`]; the rest wait for the next head) to both maps and returns the
+    /// next head, unsigned. It stores no head: building twice without committing gives the same head (apart
     /// from the time it is given). With nothing pending it is an idle head: the same size and
     /// roots, a later time.
-    pub async fn build_head(&self, time_ms: u64, log_key_version: u32) -> Result<UnsignedHead> {
-        let mut tx = self.pool.begin().await?;
-        lock(&mut tx).await?;
-        let built = head::build(&mut tx, time_ms, log_key_version).await?;
+    pub async fn build_head(
+        &self,
+        time_ms: u64,
+        log_key_version: u32,
+        max_entries: Option<u64>,
+    ) -> Result<UnsignedHead> {
+        let mut tx = begin_write(&self.pool).await?;
+        let built = head::build(
+            &mut tx,
+            time_ms,
+            log_key_version,
+            max_entries.unwrap_or(DEFAULT_MAX_ENTRIES),
+        )
+        .await?;
         tx.commit().await?;
         Ok(built)
     }
 
     /// Stores a head that was built here and signed, with its cosignatures, and marks the entries
-    /// it covers as included. Refused if another head was stored since it was built.
+    /// it covers as included. It replays the entries the head covers onto the last head's roots
+    /// and refuses a head whose log root or either map root differs, so a head that could never
+    /// be extended is never stored. Refused if another head was stored since it was built.
     pub async fn commit_head(
         &self,
         head: &UnsignedHead,
         log_signature: &[u8; 64],
         cosignatures: &[u8],
     ) -> Result<i64> {
-        let mut tx = self.pool.begin().await?;
-        lock(&mut tx).await?;
+        let mut tx = begin_write(&self.pool).await?;
         let id = head::commit(&mut tx, head, log_signature, cosignatures).await?;
         tx.commit().await?;
         Ok(id)

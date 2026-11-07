@@ -29,6 +29,9 @@ CREATE TABLE heads (
     prev_head_hash    bytea NOT NULL CHECK (length(prev_head_hash) = 32),
     log_key_version   integer NOT NULL,
     head_hash         bytea NOT NULL UNIQUE CHECK (length(head_hash) = 32),
+    -- One head per previous head: the chain cannot fork, whatever the isolation level of the
+    -- transaction that stores a head.
+    UNIQUE (prev_head_hash),
     log_signature     bytea NOT NULL CHECK (length(log_signature) = 64),
     -- Opaque until the witness protocol defines them.
     cosignatures      bytea NOT NULL DEFAULT ''::bytea,
@@ -105,12 +108,14 @@ $$;
 
 CREATE FUNCTION ks_log_entries_update() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
+    -- Only the head that covers the entry: its size reaches the entry's position.
     IF OLD.included_in_head IS NULL
        AND NEW.included_in_head IS NOT NULL
-       AND (to_jsonb(NEW) - 'included_in_head') = (to_jsonb(OLD) - 'included_in_head') THEN
+       AND (to_jsonb(NEW) - 'included_in_head') = (to_jsonb(OLD) - 'included_in_head')
+       AND (SELECT size FROM heads WHERE id = NEW.included_in_head) >= NEW.seq THEN
         RETURN NEW;
     END IF;
-    RAISE EXCEPTION 'log_entries is append-only: only included_in_head may be set, once, from null'
+    RAISE EXCEPTION 'log_entries is append-only: only included_in_head may be set, once, from null, to a head that covers the entry'
         USING ERRCODE = 'restrict_violation';
 END;
 $$;
