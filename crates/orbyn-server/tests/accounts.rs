@@ -7338,7 +7338,10 @@ async fn a_retry_wakes_only_the_devices_that_failed_and_the_handler_is_bounded()
     sender.0.lock().expect("lock").clear();
     let second = handle_zone_changed(pool, Some(&secrets), &sender, &job).await;
     assert!(matches!(second, PushDelivery::Retry(_)));
-    assert_eq!(sender.0.lock().expect("lock").as_slice(), [bad.clone()]);
+    assert_eq!(
+        sender.0.lock().expect("lock").as_slice(),
+        std::slice::from_ref(&bad)
+    );
     // A new job is a new wake-up for everyone.
     sender.0.lock().expect("lock").clear();
     let other = zone_job(p.account_id, Uuid::new_v4(), a_id);
