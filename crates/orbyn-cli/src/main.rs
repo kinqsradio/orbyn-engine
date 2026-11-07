@@ -216,6 +216,7 @@ fn mailer(config: &Config) -> Result<orbyn_worker::Mailer, String> {
             }
             Ok(orbyn_worker::Mailer {
                 secrets,
+                account_url: config.account_url.clone(),
                 sender: std::sync::Arc::new(sender),
             })
         }
@@ -227,6 +228,7 @@ fn mailer(config: &Config) -> Result<orbyn_worker::Mailer, String> {
             tracing::warn!("ORBYN_MAIL=log: email is logged as not sent, and nothing is sent");
             Ok(orbyn_worker::Mailer {
                 secrets,
+                account_url: config.account_url.clone(),
                 sender: std::sync::Arc::new(orbyn_core::mail::LogOnly),
             })
         }

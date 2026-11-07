@@ -72,6 +72,16 @@ pub struct Limits {
     /// token is never counted and never refused, so someone guessing from another address cannot
     /// lock the owner out of the link.
     pub cancel_by_mail_wrong_per_address: Limit,
+    /// Requests for an unused-account deletion link from one IP prefix: 20 an hour, counted for
+    /// every request whatever the address is, so the refusal tells nothing.
+    pub delete_unused_per_prefix: Limit,
+    /// Requests for one address: 10 an hour. A request over it is answered like any other and
+    /// queues nothing.
+    pub delete_unused_per_address: Limit,
+    /// Link emails to one account: 3 an hour; only a mail that goes out counts.
+    pub delete_unused_mail_per_account: Limit,
+    /// Wrong delete-unused tokens from one IP prefix: 10 an hour. A right token is never counted.
+    pub delete_unused_wrong_per_prefix: Limit,
 }
 
 impl Default for Limits {
@@ -97,6 +107,10 @@ impl Default for Limits {
             email_verify_fail_per_ip: Limit::new(30, Duration::from_secs(60 * MINUTE)),
             account_delete_per_device: Limit::new(5, Duration::from_secs(60 * MINUTE)),
             cancel_by_mail_wrong_per_address: Limit::new(10, Duration::from_secs(60 * MINUTE)),
+            delete_unused_per_prefix: Limit::new(20, Duration::from_secs(60 * MINUTE)),
+            delete_unused_per_address: Limit::new(10, Duration::from_secs(60 * MINUTE)),
+            delete_unused_mail_per_account: Limit::new(3, Duration::from_secs(60 * MINUTE)),
+            delete_unused_wrong_per_prefix: Limit::new(10, Duration::from_secs(60 * MINUTE)),
             account_delete_schedules_per_account: Limit::new(
                 3,
                 Duration::from_secs(24 * 60 * MINUTE),

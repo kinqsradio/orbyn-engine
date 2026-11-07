@@ -63,6 +63,9 @@ pub enum Outcome {
 #[derive(Clone)]
 pub struct Mailer {
     pub secrets: Option<Arc<AuthSecrets>>,
+    /// Where the account site is served (`ORBYN_ACCOUNT_URL`), for the link in the unused-account
+    /// deletion email. Without it that email has no link.
+    pub account_url: Option<String>,
     pub sender: Arc<dyn Sender>,
 }
 
@@ -77,6 +80,7 @@ impl Mailer {
     pub fn log_only() -> Self {
         Self {
             secrets: None,
+            account_url: None,
             sender: Arc::new(mail::LogOnly),
         }
     }
@@ -89,6 +93,23 @@ pub async fn deliver_email(job: &jobs::Job, mailer: &Mailer) -> Outcome {
         Delivery::Sent => Outcome::Done,
         Delivery::Retry(reason) => Outcome::Retry(reason),
         Delivery::GiveUp(reason) => Outcome::GiveUp(reason),
+    }
+}
+
+/// Decides one request for an unused-account deletion link: the email is queued only for an
+/// unused account (the decision is made here so the request itself never reads the account). A
+/// worker with no auth setup cannot open the request and gives it up.
+async fn delete_unused_request(job: &jobs::Job, db: &Database, mailer: &Mailer) -> Outcome {
+    let Some(secrets) = mailer.secrets.clone() else {
+        return Outcome::GiveUp("this worker has no ORBYN_AUTH_SETUP to open the request".into());
+    };
+    let mut accounts = orbyn_core::Accounts::with_shared_secrets(db.pool().clone(), secrets);
+    if let Some(url) = &mailer.account_url {
+        accounts = accounts.with_account_url(url);
+    }
+    match accounts.run_delete_unused_request(job).await {
+        Ok(()) => Outcome::Done,
+        Err(_) => Outcome::Retry("the request could not be decided".into()),
     }
 }
 
@@ -232,6 +253,8 @@ pub async fn run(
                 let work = async {
                     if job.kind == mail::JOB_KIND {
                         deliver_email(&job, &mailer).await
+                    } else if job.kind == orbyn_core::accounts::DELETE_UNUSED_JOB_KIND {
+                        delete_unused_request(&job, &db, &mailer).await
                     } else {
                         handle(&job).await
                     }
@@ -335,6 +358,7 @@ mod tests {
         j.payload = mail::payload(&secrets, j.id, &mail, now).expect("payload");
         let mailer = |sender: Arc<dyn Sender>| Mailer {
             secrets: Some(secrets.clone()),
+            account_url: None,
             sender,
         };
 

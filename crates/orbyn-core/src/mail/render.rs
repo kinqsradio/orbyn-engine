@@ -8,7 +8,8 @@
 //!
 //! A message's one value, [`super::Mail::code`], is the verification code for a code email, and
 //! `<time as RFC 3339>\n<link or empty>` for the other two: the attempt time and the sign-in link,
-//! or the deletion time and the cancel link. It travels only in the sealed queue entry.
+//! or the deletion time and the cancel link. For the unused-account email it is the link alone,
+//! empty when there is none. It travels only in the sealed queue entry.
 
 use chrono::{DateTime, Utc};
 
@@ -48,6 +49,8 @@ pub(super) fn render(mail: &Mail) -> Option<Rendered> {
             let (at, link) = time_and_link(value)?;
             Some(delete_email(&mail.to, at, link))
         }
+        // The value is the link, or empty when the server has no account site.
+        Kind::DeleteUnused => Some(delete_unused_email(&mail.to, http_link(value))),
     }
 }
 
@@ -58,6 +61,11 @@ fn time_and_link(value: &str) -> Option<(DateTime<Utc>, Option<&str>)> {
     let at = DateTime::parse_from_rfc3339(when).ok()?.with_timezone(&Utc);
     let link = (link.starts_with("https://") || link.starts_with("http://")).then_some(link);
     Some((at, link))
+}
+
+/// A value that is an `http(s)` address; anything else counts as no link.
+fn http_link(value: &str) -> Option<&str> {
+    (value.starts_with("https://") || value.starts_with("http://")).then_some(value)
 }
 
 /// "Saturday 14 November 2026 at 12:00 UTC".
@@ -218,6 +226,72 @@ fn delete_email(to: &str, at: DateTime<Utc>, link: Option<&str>) -> Rendered {
         "If you asked for this, there’s nothing else to do. If you didn’t, cancel now and then {}.",
         escape(&check_html)
     ));
+    Rendered {
+        subject,
+        text,
+        html: html.finish(),
+    }
+}
+
+/// The link that deletes an unused account (Account Designs v33, `so-email` and `so-email-local`).
+/// How long the link lasts is [`crate::accounts::DELETE_UNUSED_TTL`], said in words.
+fn delete_unused_email(to: &str, link: Option<&str>) -> Rendered {
+    let subject = "Delete your unused Orbyn account".to_owned();
+    let lasts = super::lifetime_words(crate::accounts::DELETE_UNUSED_TTL.as_secs());
+    let (text, mut html) = match link {
+        Some(link) => {
+            let text = format!(
+                "Delete your unused Orbyn account\n\n\
+                 You asked to delete the Orbyn account {to} so\n\
+                 you can sign up again. It has nothing stored in it.\n\n\
+                 Delete this account:\n{link}\n\n\
+                 This link works once and expires in {lasts}. It doesn't need\n\
+                 you to sign in. It only deletes an account with nothing\n\
+                 stored in it. If the account has anything in it, nothing\n\
+                 is deleted.\n\n\
+                 If you didn't ask for this, ignore this email. Nothing\n\
+                 happens unless the link is opened and the button pressed.\n\n{FOOTER_TEXT}\n"
+            );
+            let mut html = Html::new(&subject);
+            html.heading("Delete your empty Orbyn account");
+            html.raw_paragraph(&format!(
+                "You asked to delete the Orbyn account {} so you can sign up again. It has nothing stored in it.",
+                escape(to)
+            ));
+            html.button(link, "Delete this account");
+            html.quiet(&format!(
+                "The button works once and expires in {lasts}. It doesn’t need you to sign in. It only deletes an account with nothing stored in it. If the account has anything in it, nothing is deleted."
+            ));
+            (text, html)
+        }
+        None => {
+            let text = format!(
+                "Your empty Orbyn account\n\n\
+                 You asked to delete the Orbyn account {to} so\n\
+                 you can sign up again. It has nothing stored in it.\n\n\
+                 This server has no account site, so there's no link. Ask\n\
+                 whoever runs this server to delete the empty account\n\
+                 {to}. Then sign up again.\n\n\
+                 If you didn't ask for this, you can ignore this email.\n\n{FOOTER_TEXT}\n"
+            );
+            let mut html = Html::new(&subject);
+            html.heading("Your empty Orbyn account");
+            html.raw_paragraph(&format!(
+                "You asked to delete the Orbyn account {} so you can sign up again. It has nothing stored in it.",
+                escape(to)
+            ));
+            html.raw_paragraph(&format!(
+                "This server has no account site, so there’s no link. Ask whoever runs this server to delete the empty account {}. Then sign up again.",
+                escape(to)
+            ));
+            (text, html)
+        }
+    };
+    html.quiet(if link.is_some() {
+        "If you didn’t ask for this, ignore this email. Nothing happens unless the button is pressed."
+    } else {
+        "If you didn’t ask for this, you can ignore this email."
+    });
     Rendered {
         subject,
         text,
@@ -599,5 +673,69 @@ mod tests {
             mail(Kind::DeletionScheduled, Some("later\n")).cannot_build_reason(),
             "the message couldn't be built (its time can't be read)"
         );
+    }
+
+    #[test]
+    fn the_unused_account_email_is_as_designed() {
+        let link = "https://account.example.com/delete-unused#tok";
+        let r = rendered(Kind::DeleteUnused, link);
+        assert_eq!(r.subject, "Delete your unused Orbyn account");
+        assert_eq!(
+            r.text,
+            format!(
+                "Delete your unused Orbyn account\n\n\
+                 You asked to delete the Orbyn account sam@example.com so\n\
+                 you can sign up again. It has nothing stored in it.\n\n\
+                 Delete this account:\n{link}\n\n\
+                 This link works once and expires in 24 hours. It doesn't need\n\
+                 you to sign in. It only deletes an account with nothing\n\
+                 stored in it. If the account has anything in it, nothing\n\
+                 is deleted.\n\n\
+                 If you didn't ask for this, ignore this email. Nothing\n\
+                 happens unless the link is opened and the button pressed.\n\n{FOOTER_LINES}"
+            )
+        );
+        common(&r.html);
+        assert!(r.html.contains(">Delete your empty Orbyn account</h1>"));
+        assert!(r.html.contains("You asked to delete the Orbyn account sam@example.com so you can sign up again. It has nothing stored in it."));
+        assert!(
+            r.html.contains(&format!("href=\"{link}\""))
+                && r.html.contains(">Delete this account</a>")
+        );
+        assert!(r.html.contains("The button works once and expires in 24 hours. It doesn’t need you to sign in. It only deletes an account with nothing stored in it. If the account has anything in it, nothing is deleted."));
+        assert!(r.html.contains("If you didn’t ask for this, ignore this email. Nothing happens unless the button is pressed."));
+        assert_eq!(remote_things(&r.html), vec![link.to_owned()]);
+        // The lifetime comes from the constant, not from the text.
+        assert_eq!(
+            crate::accounts::DELETE_UNUSED_TTL,
+            std::time::Duration::from_secs(24 * 3600)
+        );
+    }
+
+    #[test]
+    fn without_an_account_url_the_unused_account_email_has_no_link() {
+        let r = rendered(Kind::DeleteUnused, "");
+        assert_eq!(r.subject, "Delete your unused Orbyn account");
+        assert_eq!(
+            r.text,
+            format!(
+                "Your empty Orbyn account\n\n\
+                 You asked to delete the Orbyn account sam@example.com so\n\
+                 you can sign up again. It has nothing stored in it.\n\n\
+                 This server has no account site, so there's no link. Ask\n\
+                 whoever runs this server to delete the empty account\n\
+                 sam@example.com. Then sign up again.\n\n\
+                 If you didn't ask for this, you can ignore this email.\n\n{FOOTER_LINES}"
+            )
+        );
+        common(&r.html);
+        assert!(r.html.contains(">Your empty Orbyn account</h1>"));
+        assert!(r.html.contains("This server has no account site, so there’s no link. Ask whoever runs this server to delete the empty account sam@example.com. Then sign up again."));
+        assert!(
+            r.html
+                .contains("If you didn’t ask for this, you can ignore this email.")
+        );
+        assert!(!r.html.contains("<a "));
+        assert!(remote_things(&r.html).is_empty());
     }
 }

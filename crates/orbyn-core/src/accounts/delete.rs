@@ -342,7 +342,7 @@ impl Accounts {
     }
 
     /// The deletion itself, with the account row locked and its schedule checked.
-    async fn erase(
+    pub(super) async fn erase(
         &self,
         tx: &mut Transaction<'_, Postgres>,
         account_id: Uuid,
@@ -407,6 +407,15 @@ impl Accounts {
                 self.address_digest("signup-address", email),
             ),
             ("signup-notice", self.address_digest("signup-notice", email)),
+            (
+                "delete-unused-address",
+                self.address_digest("delete-unused-address", email),
+            ),
+            (
+                "delete-unused-mail",
+                self.secrets
+                    .digest("delete-unused-mail", account_id.as_bytes()),
+            ),
             (
                 "email-verify-address",
                 self.address_digest("email-verify-address", email),

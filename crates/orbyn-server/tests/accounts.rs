@@ -5469,4 +5469,565 @@ async fn adding_a_device_waits_while_a_deletion_is_scheduled() {
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
     let (status, body, _) = server.start_approval(&p).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
+
+// ---- Deleting an unused account ----
+
+const UNUSED: &str = "/v1/accounts/delete-unused";
+const UNUSED_CONFIRM: &str = "/v1/accounts/delete-unused/confirm";
+
+/// An audit row as the scrub leaves it: action, account, device, address digest, subject.
+type AuditRow = (
+    String,
+    Option<Uuid>,
+    Option<Uuid>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+);
+
+fn unused_limits() -> Limits {
+    Limits {
+        delete_unused_per_prefix: Limit::new(1000, Duration::from_secs(3600)),
+        delete_unused_per_address: Limit::new(1000, Duration::from_secs(3600)),
+        delete_unused_mail_per_account: Limit::new(1000, Duration::from_secs(3600)),
+        delete_unused_wrong_per_prefix: Limit::new(1000, Duration::from_secs(3600)),
+        ..Limits::default()
+    }
+}
+
+impl Server {
+    /// A request with every header of the answer, for comparing answers byte for byte.
+    async fn raw(
+        &self,
+        ip: IpAddr,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Vec<(String, String)>, Vec<u8>) {
+        let mut request = Request::builder().method(method).uri(path);
+        let body = match body {
+            Some(value) => {
+                request = request.header(header::CONTENT_TYPE, "application/json");
+                Body::from(value.to_string())
+            }
+            None => Body::empty(),
+        };
+        let mut request = request.body(body).expect("request");
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::new(ip, 40_000)));
+        let response = self.app.clone().oneshot(request).await.expect("response");
+        let status = response.status();
+        let mut headers: Vec<(String, String)> = response
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("?").to_owned()))
+            .collect();
+        headers.sort();
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.expect("body");
+        (status, headers, bytes.to_vec())
+    }
+
+    async fn ask_unused(&self, email: &str) -> (StatusCode, Value) {
+        self.call(Method::POST, UNUSED, None, Some(json!({"email": email})))
+            .await
+    }
+
+    async fn confirm_unused(&self, token: &str) -> (StatusCode, Value) {
+        self.call(
+            Method::POST,
+            UNUSED_CONFIRM,
+            None,
+            Some(json!({"token": token})),
+        )
+        .await
+    }
+
+    /// What the worker does with the queued requests: decide each one, under `limits`.
+    async fn decide_requests(&self, limits: Limits) -> usize {
+        let secrets = AuthSecrets::from_encoded(SETUP.get().expect("setup")).expect("setup");
+        let accounts = Accounts::new(self.db.pool().clone(), secrets)
+            .with_limits(limits)
+            .with_account_url(ACCOUNT_URL);
+        let rows: Vec<(Uuid, Value)> = orbyn_core::sqlx::query_as(
+            "SELECT id, payload FROM jobs WHERE kind = $1 AND state = 'queued'",
+        )
+        .bind(orbyn_core::accounts::DELETE_UNUSED_JOB_KIND)
+        .fetch_all(self.db.pool())
+        .await
+        .expect("jobs");
+        for (id, payload) in &rows {
+            let job = orbyn_core::jobs::Job {
+                id: *id,
+                kind: orbyn_core::accounts::DELETE_UNUSED_JOB_KIND.to_owned(),
+                payload: payload.clone(),
+                attempts: 0,
+                idempotency_key: None,
+            };
+            accounts
+                .run_delete_unused_request(&job)
+                .await
+                .expect("decide");
+            orbyn_core::sqlx::query("UPDATE jobs SET state = 'done' WHERE id = $1")
+                .bind(id)
+                .execute(self.db.pool())
+                .await
+                .expect("done");
+        }
+        rows.len()
+    }
+
+    /// The tokens in the unused-account emails sent to `email`, oldest first.
+    async fn unused_tokens(&self, email: &str) -> Vec<String> {
+        let to = auth::normalize_email(email).unwrap_or_else(|| email.to_owned());
+        self.mailbox()
+            .await
+            .sent()
+            .into_iter()
+            .filter(|m| m.to == to && m.kind == Kind::DeleteUnused)
+            .map(|m| {
+                let link = m.code.expect("a link");
+                assert!(link.starts_with(&format!("{ACCOUNT_URL}/delete-unused#")));
+                link.rsplit('#').next().expect("token").to_owned()
+            })
+            .collect()
+    }
+
+    async fn account_exists(&self, email: &str) -> bool {
+        orbyn_core::sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM accounts WHERE email = $1)")
+            .bind(normalized(email))
+            .fetch_one(self.db.pool())
+            .await
+            .expect("exists")
+    }
+
+    /// Stores a zone for the account, as a first write would.
+    async fn store_zone(&self, account: Uuid) {
+        orbyn_core::sqlx::query("INSERT INTO zones (id, owner_id, name) VALUES ($1, $2, 'inbox')")
+            .bind(Uuid::new_v4())
+            .bind(account)
+            .execute(self.db.pool())
+            .await
+            .expect("zone");
+    }
+}
+
+/// An unused account, signed up and verified. Returns its address, device keys and session.
+async fn unused_account(server: &Server) -> (String, DeviceKeys, Value) {
+    let email = email();
+    let keys = DeviceKeys::generate().expect("keys");
+    let session = server.register(&email, b"correct horse", &keys).await;
+    (email, keys, session)
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn requests_for_an_unknown_an_ineligible_and_an_eligible_address_are_indistinguishable() {
+    let _turn = TURN.lock().await;
+    let (server, trace) = server_traced(unused_limits()).await;
+    let (eligible, _, _) = unused_account(&server).await;
+    let (stored, _, session) = unused_account(&server).await;
+    server.store_zone(uuid_of(&session["account_id"])).await;
+    let unknown = email();
+    let malformed = "not an address".to_owned();
+
+    // The request reads no account: with the whole table locked, every case still answers.
+    let mut lock = server.db.pool().begin().await.expect("tx");
+    orbyn_core::sqlx::query("LOCK TABLE accounts IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await
+        .expect("lock");
+    let mut answers = Vec::new();
+    let mut traces = Vec::new();
+    let mut medians = Vec::new();
+    for address in [&eligible, &stored, &unknown, &malformed] {
+        trace.lock().expect("trace").clear();
+        let mut times = Vec::new();
+        let mut first = None;
+        for round in 0..15 {
+            // A fresh address each round for the unknown one keeps its job inserts real.
+            let asked = if round == 0 {
+                address.clone()
+            } else {
+                format!("r{round}-{address}")
+            };
+            let start = std::time::Instant::now();
+            let answer = tokio::time::timeout(
+                Duration::from_secs(20),
+                server.raw(
+                    server.ip,
+                    Method::POST,
+                    UNUSED,
+                    Some(json!({"email": asked})),
+                ),
+            )
+            .await
+            .expect("answered while the accounts table was locked");
+            times.push(start.elapsed());
+            first.get_or_insert(answer);
+            if round == 0 {
+                traces.push(trace.lock().expect("trace").clone());
+            }
+        }
+        times.sort();
+        medians.push(times[times.len() / 2]);
+        answers.push(first.expect("answer"));
+    }
+    lock.rollback().await.expect("release");
+
+    for answer in &answers {
+        assert_eq!(answer.0, StatusCode::ACCEPTED);
+        assert_eq!(answer.2, b"{}");
+        assert_eq!(answer, &answers[0], "status, headers and body alike");
+    }
+    for steps in &traces {
+        assert_eq!(steps, &vec!["ip-limit", "address-limit", "enqueue"]);
+    }
+    // The time does not depend on the account: the medians stay close. The bound is loose, since
+    // the machine may be busy; the lock above is the structural proof.
+    let (low, high) = (
+        medians.iter().min().expect("min"),
+        medians.iter().max().expect("max"),
+    );
+    assert!(
+        *high < *low * 4 + Duration::from_millis(40),
+        "medians {medians:?}"
+    );
+
+    // The decision is the worker's: only the eligible account gets mail.
+    server.decide_requests(unused_limits()).await;
+    assert_eq!(server.unused_tokens(&eligible).await.len(), 1);
+    for other in [&stored, &unknown, &malformed] {
+        assert!(server.unused_tokens(other).await.is_empty());
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn an_unused_account_is_deleted_by_its_link_and_the_address_signs_up_again() {
+    let _turn = TURN.lock().await;
+    let server = server_with(unused_limits()).await;
+    let (email, _keys, session) = unused_account(&server).await;
+    let account = uuid_of(&session["account_id"]);
+    let (status, body) = server.ask_unused(&email).await;
+    assert_eq!((status, body), (StatusCode::ACCEPTED, json!({})));
+    server.decide_requests(unused_limits()).await;
+    let tokens = server.unused_tokens(&email).await;
+    assert_eq!(tokens.len(), 1);
+
+    // No GET does anything, with or without the token.
+    for path in [
+        UNUSED.to_owned(),
+        UNUSED_CONFIRM.to_owned(),
+        format!("{UNUSED_CONFIRM}?token={}", tokens[0]),
+    ] {
+        let (status, _) = server.call(Method::GET, &path, None, None).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{path}");
+    }
+    assert!(server.account_exists(&email).await);
+
+    let (status, body) = server.confirm_unused(&tokens[0]).await;
+    assert_eq!((status, body), (StatusCode::NO_CONTENT, Value::Null));
+    assert!(!server.account_exists(&email).await);
+    // Single use.
+    let (status, body) = server.confirm_unused(&tokens[0]).await;
+    assert_eq!(
+        (status, &body["code"]),
+        (
+            StatusCode::BAD_REQUEST,
+            &json!("invalid_delete_unused_token")
+        )
+    );
+
+    // The audit rows outlive the account without an id, a device, an address or a digest of one.
+    let rows: Vec<AuditRow> = orbyn_core::sqlx::query_as(
+        "SELECT action, account_id, device_id, ip_hash, subject FROM audit_log
+             WHERE action IN ('account.delete_unused_confirmed', 'account.deleted')
+               AND subject IN (SELECT subject FROM audit_log
+                               WHERE action = 'account.delete_unused_confirmed'
+                                 AND at > now() - interval '1 minute')",
+    )
+    .fetch_all(server.db.pool())
+    .await
+    .expect("audit");
+    assert!(
+        rows.iter()
+            .any(|r| r.0 == "account.delete_unused_confirmed")
+            && rows.iter().any(|r| r.0 == "account.deleted")
+    );
+    for (_, account_id, device_id, ip_hash, subject) in &rows {
+        assert_eq!((account_id, device_id, ip_hash), (&None, &None, &None));
+        assert!(subject.is_some());
+    }
+    let none: i64 =
+        orbyn_core::sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE account_id = $1")
+            .bind(account)
+            .fetch_one(server.db.pool())
+            .await
+            .expect("count");
+    assert_eq!(none, 0);
+
+    // The same address signs up again at once.
+    let again = server
+        .register(
+            &email,
+            b"another password",
+            &DeviceKeys::generate().expect("keys"),
+        )
+        .await;
+    assert_ne!(uuid_of(&again["account_id"]), account);
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn the_token_expires_after_the_named_lifetime() {
+    let _turn = TURN.lock().await;
+    let server = server_with(unused_limits()).await;
+    let (email, _, session) = unused_account(&server).await;
+    server.ask_unused(&email).await;
+    server.decide_requests(unused_limits()).await;
+    let token = server.unused_tokens(&email).await.remove(0);
+    // The stored lifetime is the named constant, to the second.
+    let lasts: f64 = orbyn_core::sqlx::query_scalar(
+        "SELECT extract(epoch FROM delete_unused_expires_at - now())::float8 FROM accounts WHERE id = $1",
+    )
+    .bind(uuid_of(&session["account_id"]))
+    .fetch_one(server.db.pool())
+    .await
+    .expect("expiry");
+    let ttl = orbyn_core::accounts::DELETE_UNUSED_TTL.as_secs() as f64;
+    assert!((ttl - 60.0..=ttl).contains(&lasts), "{lasts}");
+    // Stored as a digest only.
+    let stored: Vec<u8> =
+        orbyn_core::sqlx::query_scalar("SELECT delete_unused_digest FROM accounts WHERE id = $1")
+            .bind(uuid_of(&session["account_id"]))
+            .fetch_one(server.db.pool())
+            .await
+            .expect("digest");
+    assert_eq!(stored.len(), 32);
+    assert_ne!(stored, unb64(&json!(token)));
+    orbyn_core::sqlx::query(
+        "UPDATE accounts SET delete_unused_expires_at = now() - interval '1 second' WHERE id = $1",
+    )
+    .bind(uuid_of(&session["account_id"]))
+    .execute(server.db.pool())
+    .await
+    .expect("expire");
+    let (status, body) = server.confirm_unused(&token).await;
+    assert_eq!(
+        (status, &body["code"]),
+        (
+            StatusCode::BAD_REQUEST,
+            &json!("invalid_delete_unused_token")
+        )
+    );
+    assert!(server.account_exists(&email).await);
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn something_stored_after_the_email_makes_the_confirm_refuse_and_delete_nothing() {
+    let _turn = TURN.lock().await;
+    let server = server_with(unused_limits()).await;
+    let (email, _, session) = unused_account(&server).await;
+    server.ask_unused(&email).await;
+    server.decide_requests(unused_limits()).await;
+    let token = server.unused_tokens(&email).await.remove(0);
+    // The race: a zone is created between the email and the press of the button.
+    server.store_zone(uuid_of(&session["account_id"])).await;
+    let (status, body) = server.confirm_unused(&token).await;
+    assert_eq!(
+        (status, &body["code"]),
+        (StatusCode::CONFLICT, &json!("delete_unused_not_possible"))
+    );
+    assert!(server.account_exists(&email).await);
+    let zones: i64 =
+        orbyn_core::sqlx::query_scalar("SELECT count(*) FROM zones WHERE owner_id = $1")
+            .bind(uuid_of(&session["account_id"]))
+            .fetch_one(server.db.pool())
+            .await
+            .expect("zones");
+    assert_eq!(zones, 1, "nothing was deleted");
+    // The refusal ended the token.
+    let (status, body) = server.confirm_unused(&token).await;
+    assert_eq!(
+        (status, &body["code"]),
+        (
+            StatusCode::BAD_REQUEST,
+            &json!("invalid_delete_unused_token")
+        )
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_zone_the_purge_removed_still_counts_as_stored() {
+    let _turn = TURN.lock().await;
+    let server = server_with(unused_limits()).await;
+    let (email, _, session) = unused_account(&server).await;
+    let account = uuid_of(&session["account_id"]);
+    server.store_zone(account).await;
+    orbyn_core::sqlx::query("DELETE FROM zones WHERE owner_id = $1")
+        .bind(account)
+        .execute(server.db.pool())
+        .await
+        .expect("purged");
+    server.ask_unused(&email).await;
+    server.decide_requests(unused_limits()).await;
+    assert!(server.unused_tokens(&email).await.is_empty());
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_device_that_proved_its_key_or_was_approved_means_no_link_and_a_refusal() {
+    let _turn = TURN.lock().await;
+    let server = server_with(unused_limits()).await;
+
+    // A pending device that signed in does not count: the person locked out can still ask.
+    let p = pair(&server).await;
+    let pending_email: String =
+        orbyn_core::sqlx::query_scalar("SELECT email FROM accounts WHERE id = $1")
+            .bind(p.account_id)
+            .fetch_one(server.db.pool())
+            .await
+            .expect("email");
+    server.ask_unused(&pending_email).await;
+    server.decide_requests(unused_limits()).await;
+    assert_eq!(server.unused_tokens(&pending_email).await.len(), 1);
+    // The sign-up session alone proves nothing, and the pending sign-in is not the first
+    // device's own: so far the account is unused. Now the first device signs in again.
+    let token = server.unused_tokens(&pending_email).await.remove(0);
+    server.login(&pending_email, b"correct horse", &p.a).await;
+    let (status, body) = server.confirm_unused(&token).await;
+    assert_eq!(
+        (status, &body["code"]),
+        (StatusCode::CONFLICT, &json!("delete_unused_not_possible")),
+        "a sign-in of the trusted device is a proof of its key"
+    );
+    assert!(server.account_exists(&pending_email).await);
+
+    // Approving a device is a proof too, and so is a signed request the server accepted.
+    for kind in ["approval", "delete_seen", "totp_seen"] {
+        let p = pair(&server).await;
+        let email: String =
+            orbyn_core::sqlx::query_scalar("SELECT email FROM accounts WHERE id = $1")
+                .bind(p.account_id)
+                .fetch_one(server.db.pool())
+                .await
+                .expect("email");
+        match kind {
+            "approval" => {
+                server.approve_fully(&p).await;
+            }
+            "delete_seen" => {
+                orbyn_core::sqlx::query(
+                    "INSERT INTO account_delete_seen (device_id, signed_at)
+                     SELECT id, 1 FROM devices WHERE account_id = $1 AND state = 'trusted'",
+                )
+                .bind(p.account_id)
+                .execute(server.db.pool())
+                .await
+                .expect("seen");
+            }
+            _ => {
+                orbyn_core::sqlx::query(
+                    "INSERT INTO totp_manage_seen (device_id, action, signed_at)
+                     SELECT id, 'enrol', 1 FROM devices WHERE account_id = $1 AND state = 'trusted'",
+                )
+                .bind(p.account_id)
+                .execute(server.db.pool())
+                .await
+                .expect("seen");
+            }
+        }
+        server.ask_unused(&email).await;
+        server.decide_requests(unused_limits()).await;
+        assert!(server.unused_tokens(&email).await.is_empty(), "{kind}");
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_scheduled_deletion_or_an_unverified_address_gets_no_link() {
+    let _turn = TURN.lock().await;
+    let server = server_with(unused_limits()).await;
+    let (email, _, session) = unused_account(&server).await;
+    let account = uuid_of(&session["account_id"]);
+    orbyn_core::sqlx::query(
+        "UPDATE accounts SET deletion_scheduled_at = now() + interval '7 days' WHERE id = $1",
+    )
+    .bind(account)
+    .execute(server.db.pool())
+    .await
+    .expect("scheduled");
+    server.ask_unused(&email).await;
+    server.decide_requests(unused_limits()).await;
+    assert!(server.unused_tokens(&email).await.is_empty());
+    orbyn_core::sqlx::query(
+        "UPDATE accounts SET deletion_scheduled_at = NULL, email_verified_at = NULL WHERE id = $1",
+    )
+    .bind(account)
+    .execute(server.db.pool())
+    .await
+    .expect("unverified");
+    server.ask_unused(&email).await;
+    server.decide_requests(unused_limits()).await;
+    assert!(server.unused_tokens(&email).await.is_empty());
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn the_limits_hold() {
+    let _turn = TURN.lock().await;
+    // Per IP prefix: visible, the same for every address.
+    let limits = Limits {
+        delete_unused_per_prefix: Limit::new(3, Duration::from_secs(3600)),
+        delete_unused_wrong_per_prefix: Limit::new(2, Duration::from_secs(3600)),
+        delete_unused_per_address: Limit::new(2, Duration::from_secs(3600)),
+        delete_unused_mail_per_account: Limit::new(1, Duration::from_secs(3600)),
+        ..Limits::default()
+    };
+    let server = server_with(limits).await;
+    let (owner, _, _) = unused_account(&server).await;
+    // The address limit is silent: the same 202, and nothing more is queued.
+    for _ in 0..2 {
+        assert_eq!(server.ask_unused(&owner).await.0, StatusCode::ACCEPTED);
+    }
+    assert_eq!(
+        server.ask_unused(&owner).await,
+        (StatusCode::ACCEPTED, json!({}))
+    );
+    assert_eq!(
+        server.decide_requests(limits).await,
+        2,
+        "the third queued nothing"
+    );
+    // The account limit: two requests were decided, one email went out.
+    let tokens = server.unused_tokens(&owner).await;
+    assert_eq!(tokens.len(), 1);
+    // The prefix limit: the fourth request from this network is 429, whatever the address.
+    let (status, body) = server.ask_unused(&email()).await;
+    assert_eq!(
+        (status, &body["code"]),
+        (StatusCode::TOO_MANY_REQUESTS, &json!("too_many_attempts"))
+    );
+    // Wrong tokens: 2 an hour from a prefix, then 429; a right token is never refused or counted.
+    let wrong = b64(&[7u8; 32]);
+    for _ in 0..2 {
+        let (status, body) = server.confirm_unused(&wrong).await;
+        assert_eq!(
+            (status, &body["code"]),
+            (
+                StatusCode::BAD_REQUEST,
+                &json!("invalid_delete_unused_token")
+            )
+        );
+    }
+    assert_eq!(
+        server.confirm_unused(&wrong).await.0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        server.confirm_unused(&tokens[0]).await.0,
+        StatusCode::NO_CONTENT
+    );
 }

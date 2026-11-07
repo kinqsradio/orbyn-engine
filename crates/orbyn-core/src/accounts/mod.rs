@@ -16,6 +16,7 @@
 //! only parses and maps.
 
 mod delete;
+mod delete_unused;
 mod devices;
 mod email;
 pub mod limits;
@@ -24,6 +25,7 @@ pub mod secrets;
 mod sessions;
 pub mod totp;
 
+pub use delete_unused::{DELETE_UNUSED_TTL, REQUEST_JOB_KIND as DELETE_UNUSED_JOB_KIND};
 pub use limits::{Limit, Limits};
 pub use second_factor::{ManageProof, TotpEnrolment};
 pub use secrets::{AuthSecrets, SecretsError};
@@ -90,6 +92,12 @@ pub enum AccountError {
     /// A wrong, used, voided or expired cancel link token look alike.
     #[error("the cancel link is not valid")]
     InvalidCancelToken,
+    /// A wrong, used, voided or expired delete-unused token look alike.
+    #[error("the link is not valid")]
+    InvalidDeleteUnusedToken,
+    /// The token is right, but the account is no longer empty (or a deletion is scheduled).
+    #[error("the account is not unused any more")]
+    DeleteUnusedNotPossible,
     #[error("the session is not valid")]
     Unauthorized,
     #[error("only a trusted device can do this")]
@@ -352,6 +360,7 @@ enum AuditAction {
     AccountDeletionScheduled,
     AccountDeletionCancelled,
     AccountDeleted,
+    AccountDeleteUnusedConfirmed,
 }
 
 impl AuditAction {
@@ -375,6 +384,7 @@ impl AuditAction {
             Self::AccountDeletionScheduled => "account.deletion_scheduled",
             Self::AccountDeletionCancelled => "account.deletion_cancelled",
             Self::AccountDeleted => "account.deleted",
+            Self::AccountDeleteUnusedConfirmed => "account.delete_unused_confirmed",
         }
     }
 }
