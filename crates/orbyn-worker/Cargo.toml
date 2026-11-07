@@ -7,12 +7,15 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+lettre.workspace = true
 orbyn-core.workspace = true
 orbyn-store.workspace = true
 tokio.workspace = true
+url.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+uuid.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
 [lints]

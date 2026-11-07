@@ -45,6 +45,24 @@ pub struct Limits {
     /// sign-in buckets, so whoever holds a password cannot use them up to lock the owner out of
     /// managing it.
     pub totp_manage_per_device: Limit,
+    /// Verification codes sent again for one pending sign-up (a decoy id counts the same).
+    pub email_resend_per_signup: Limit,
+    /// "Someone tried to sign up with your email" messages to one address, so a sign-up form
+    /// cannot be used to fill a stranger's inbox.
+    pub signup_notice_per_email: Limit,
+    /// Code mails to one address, across every sign-up and resend: 5 an hour and 10 a day. Only a
+    /// mail that goes out counts: a start or resend they refuse counts nothing. They decide only
+    /// whether a mail goes out, never the answer.
+    pub signup_codes_per_hour: Limit,
+    pub signup_codes_per_day: Limit,
+    /// Wrong guesses at one code: 5 from one IP prefix (an IPv4 /24 or an IPv6 /64), and 10 from
+    /// all of them together, after which the code is dead and the next code mail makes a new one.
+    /// With the 10 mailed codes a day an address can have, that bounds guessing at 100 a day per
+    /// address. A refused attempt is answered like any wrong code.
+    pub email_code_guess_per_prefix: Limit,
+    pub email_code_guess_per_code: Limit,
+    /// Wrong verification codes from one IP address for any sign-up id, real or not (30 an hour).
+    pub email_verify_fail_per_ip: Limit,
 }
 
 impl Default for Limits {
@@ -61,6 +79,13 @@ impl Default for Limits {
             totp_per_account_and_ip: Limit::new(10, Duration::from_secs(15 * MINUTE)),
             totp_per_account: Limit::new(30, Duration::from_secs(15 * MINUTE)),
             totp_manage_per_device: Limit::new(10, Duration::from_secs(15 * MINUTE)),
+            email_resend_per_signup: Limit::new(3, Duration::from_secs(60 * MINUTE)),
+            signup_notice_per_email: Limit::new(3, Duration::from_secs(60 * MINUTE)),
+            signup_codes_per_hour: Limit::new(5, Duration::from_secs(60 * MINUTE)),
+            signup_codes_per_day: Limit::new(10, Duration::from_secs(24 * 60 * MINUTE)),
+            email_code_guess_per_prefix: Limit::new(5, Duration::from_secs(30 * MINUTE)),
+            email_code_guess_per_code: Limit::new(10, Duration::from_secs(30 * MINUTE)),
+            email_verify_fail_per_ip: Limit::new(30, Duration::from_secs(60 * MINUTE)),
         }
     }
 }
@@ -354,13 +379,15 @@ fn lock_key(action: &str, subject: &[u8; 32]) -> i64 {
 /// it on a schedule.
 pub async fn prune(pool: &PgPool) -> Result<u64, sqlx::Error> {
     const BATCH: u64 = 5000;
-    const STATEMENTS: [&str; 4] = [
+    const STATEMENTS: [&str; 5] = [
         "DELETE FROM auth_attempts WHERE id IN (
              SELECT id FROM auth_attempts WHERE at < now() - interval '1 day' LIMIT 5000)",
         "DELETE FROM login_states WHERE id IN (
              SELECT id FROM login_states WHERE expires_at < now() LIMIT 5000)",
         "DELETE FROM second_factor_states WHERE id IN (
              SELECT id FROM second_factor_states WHERE expires_at < now() LIMIT 5000)",
+        "DELETE FROM pending_signups WHERE id IN (
+             SELECT id FROM pending_signups WHERE expires_at < now() LIMIT 5000)",
         "DELETE FROM devices WHERE id IN (
              SELECT id FROM devices WHERE state = 'pending' AND created_at < now() - interval '7 days' LIMIT 5000)",
     ];

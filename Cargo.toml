@@ -42,6 +42,8 @@ p256 = { version = "0.14", default-features = false, features = ["arithmetic", "
 # TOTP (RFC 6238) is HMAC-SHA-1. Both are the RustCrypto 0.10 generation, which the OPAQUE stack already brings in.
 hmac = "0.12"
 sha1 = { version = "0.10", default-features = false }
+# MIT OR Apache-2.0. Sends the worker's email over SMTP; TLS is rustls, with no native TLS library.
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls", "ring", "webpki-roots"] }
 jiff = { version = "0.2", default-features = false, features = ["std", "serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 serde = { version = "1", features = ["derive"] }

@@ -16,6 +16,7 @@
 //! only parses and maps.
 
 mod devices;
+mod email;
 pub mod limits;
 mod second_factor;
 pub mod secrets;
@@ -55,10 +56,6 @@ pub enum AccountError {
     InvalidEmail,
     #[error("the device name must be 1 to 100 characters")]
     InvalidDeviceName,
-    /// Sign-up only. Until email verification exists, sign-up can tell that an
-    /// address is taken; sign-in never can.
-    #[error("this email address cannot be used")]
-    EmailUnavailable,
     /// A wrong password, an unknown email and an expired sign-in all look alike.
     #[error("the email or password is wrong")]
     LoginFailed,
@@ -79,6 +76,9 @@ pub enum AccountError {
     TotpAlreadyEnabled,
     #[error("no second factor is on for this account")]
     TotpNotEnabled,
+    /// A wrong, expired or closed verification code look alike.
+    #[error("the code is wrong or has expired; ask for a new one")]
+    InvalidEmailCode,
     #[error("the session is not valid")]
     Unauthorized,
     #[error("only a trusted device can do this")]
@@ -337,6 +337,7 @@ enum AuditAction {
     TotpPassed,
     TotpFailed,
     TotpRecoveryUsed,
+    EmailVerified,
 }
 
 impl AuditAction {
@@ -356,6 +357,7 @@ impl AuditAction {
             Self::TotpPassed => "totp.passed",
             Self::TotpFailed => "totp.failed",
             Self::TotpRecoveryUsed => "totp.recovery_used",
+            Self::EmailVerified => "account.email_verified",
         }
     }
 }
@@ -367,6 +369,9 @@ pub struct Accounts {
     secrets: Arc<AuthSecrets>,
     limits: Limits,
     clock: Clock,
+    /// Where the steps of the email verification paths are recorded, for a test that checks a
+    /// real sign-up and a decoy take the same ones. `None` in production.
+    trace: Option<Arc<std::sync::Mutex<Vec<&'static str>>>>,
 }
 
 /// The time a TOTP code or a device's signature is judged against, in Unix seconds. The system
@@ -387,6 +392,7 @@ impl Accounts {
             secrets: Arc::new(secrets),
             limits: Limits::default(),
             clock: Clock(Arc::new(|| u64::try_from(unix_now_secs()).unwrap_or(0))),
+            trace: None,
         }
     }
 
@@ -399,6 +405,42 @@ impl Accounts {
     pub fn with_clock(mut self, now: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
         self.clock = Clock(Arc::new(now));
         self
+    }
+
+    /// Records the steps of the email verification paths in `sink`. For tests.
+    pub fn with_step_trace(mut self, sink: Arc<std::sync::Mutex<Vec<&'static str>>>) -> Self {
+        self.trace = Some(sink);
+        self
+    }
+
+    fn step(&self, name: &'static str) {
+        if let Some(sink) = &self.trace {
+            sink.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(name);
+        }
+    }
+
+    /// The keyed digest of the client's address prefix: an IPv4 /24, or an IPv6 /64.
+    fn ip_prefix_digest(&self, client: &Client) -> [u8; 32] {
+        let text = match client.ip {
+            Some(IpAddr::V4(ip)) => {
+                let o = ip.octets();
+                format!("{}.{}.{}.0/24", o[0], o[1], o[2])
+            }
+            Some(IpAddr::V6(ip)) => match ip.to_ipv4_mapped() {
+                Some(v4) => {
+                    let o = v4.octets();
+                    format!("{}.{}.{}.0/24", o[0], o[1], o[2])
+                }
+                None => {
+                    let s = ip.segments();
+                    format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+                }
+            },
+            None => "unknown".to_owned(),
+        };
+        self.secrets.digest("ip-prefix", text.as_bytes())
     }
 
     /// The keyed digest of the client's address. IPv6 addresses count by their
@@ -468,7 +510,12 @@ impl Accounts {
         Ok(start.message.serialize().to_vec())
     }
 
-    /// Creates the account with its first device trusted, and signs that device in.
+    /// The second sign-up step. It makes no account and no session: it keeps the password record
+    /// and the first device as a pending sign-up, sends the address a code and answers a sign-up
+    /// id, to be sent back with the code to [`Accounts::email_verify`]. The answer is the same for
+    /// every address and every state of the limits: an address that is taken, has five pending
+    /// sign-ups already, or is over its mail caps gets an id of the same shape that belongs to
+    /// nobody.
     pub async fn register_finish(
         &self,
         client: &Client,
@@ -476,7 +523,7 @@ impl Accounts {
         upload: &[u8],
         device: &NewDevice,
         signature: &[u8; 64],
-    ) -> Result<NewSession> {
+    ) -> Result<Uuid> {
         let email = normalize_email(email).ok_or(AccountError::InvalidEmail)?;
         let name = device.checked_name()?;
         self.allow_register(client).await?;
@@ -493,41 +540,11 @@ impl Accounts {
             .serialize()
             .to_vec();
 
-        let mut tx = self.pool.begin().await?;
-        let account_id: Option<Uuid> = sqlx::query_scalar(
-            "INSERT INTO accounts (id, email, password_file) VALUES ($1, $2, $3)
-             ON CONFLICT (email) DO NOTHING RETURNING id",
-        )
-        .bind(Uuid::new_v4())
-        .bind(&email)
-        .bind(&password_file)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let account_id = account_id.ok_or(AccountError::EmailUnavailable)?;
-        let device_id = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO devices (id, account_id, name, platform, signing_key, agreement_key, state, approved_at)
-             VALUES ($1, $2, $3, $4, $5, $6, 'trusted', now())",
-        )
-        .bind(device_id)
-        .bind(account_id)
-        .bind(&name)
-        .bind(device.platform.as_str())
-        .bind(device.keys.signing.as_slice())
-        .bind(device.keys.agreement.as_slice())
-        .execute(&mut *tx)
-        .await?;
-        let session = sessions::issue(&mut tx, account_id, device_id, DeviceState::Trusted).await?;
-        self.audit(
-            &mut *tx,
-            client,
-            Some(account_id),
-            Some(device_id),
-            AuditAction::AccountRegistered,
-        )
-        .await?;
-        tx.commit().await?;
-        Ok(session)
+        // Every limiter runs before a transaction opens, and counts every start whatever the
+        // address's state, so nothing about the answer depends on it.
+        let plan = self.plan_start(&email).await?;
+        self.start_signup(&plan, &email, &password_file, device, &name)
+            .await
     }
 
     /// The first sign-in step. Known and unknown emails take the same path: both

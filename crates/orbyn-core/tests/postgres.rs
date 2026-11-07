@@ -232,3 +232,76 @@ async fn the_same_key_for_different_kinds_adds_two_jobs() {
         .await
         .expect("park");
 }
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_job_of_one_kind_can_be_claimed_apart_given_a_long_budget_and_given_up_on() {
+    let _turn = TURN.lock().await;
+    let db = database().await;
+    let pool = db.pool();
+    let (kind, other_kind) = (
+        format!("test-{}", uuid::Uuid::new_v4()),
+        format!("test-{}", uuid::Uuid::new_v4()),
+    );
+    let id = jobs::enqueue_with_attempts(pool, &kind, json!({}), None, 200)
+        .await
+        .expect("enqueue");
+    let other = jobs::enqueue(pool, &other_kind, json!({}), None)
+        .await
+        .expect("enqueue");
+
+    let budget: i32 = sqlx::query_scalar("SELECT max_attempts FROM jobs WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("row");
+    assert_eq!(budget, 200);
+    let default: i32 = sqlx::query_scalar("SELECT max_attempts FROM jobs WHERE id = $1")
+        .bind(other)
+        .fetch_one(pool)
+        .await
+        .expect("row");
+    assert_eq!(default, jobs::DEFAULT_MAX_ATTEMPTS);
+
+    // Only its own kind is taken, and nothing else of that kind is left behind it.
+    let job = jobs::claim_kind(pool, "w", Duration::from_secs(30), Some(&kind))
+        .await
+        .expect("claim")
+        .expect("the job");
+    assert_eq!(job.id, id);
+    assert!(
+        jobs::claim_kind(pool, "w", Duration::from_secs(30), Some(&kind))
+            .await
+            .expect("claim")
+            .is_none()
+    );
+
+    // Giving up ends it at once, with attempts to spare, and only for the worker holding it.
+    assert!(
+        !jobs::abandon(pool, id, "someone else", "no")
+            .await
+            .expect("abandon")
+    );
+    assert!(
+        jobs::abandon(pool, id, "w", "too old")
+            .await
+            .expect("abandon")
+    );
+    let (state, attempts, error): (String, i32, Option<String>) =
+        sqlx::query_as("SELECT state, attempts, last_error FROM jobs WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("row");
+    assert_eq!(
+        (state.as_str(), attempts, error.as_deref()),
+        ("failed", 1, Some("too old"))
+    );
+    // The other kind is untouched.
+    let state: String = sqlx::query_scalar("SELECT state FROM jobs WHERE id = $1")
+        .bind(other)
+        .fetch_one(pool)
+        .await
+        .expect("row");
+    assert_eq!(state, "queued");
+}

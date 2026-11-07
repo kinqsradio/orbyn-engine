@@ -139,13 +139,50 @@ async fn serve(config: Config) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// How the worker sends email: over SMTP, which must be configured, unless `ORBYN_MAIL=log` asks
+/// for development mode, which logs that a message was not sent and sends nothing. SMTP needs
+/// `ORBYN_AUTH_SETUP` to open a queued message; in log mode, without it every message is logged as
+/// not sent. A worker with neither refuses to start: it would accept sign-ups nobody can complete.
+fn mailer(config: &Config) -> Result<orbyn_worker::Mailer, String> {
+    let secrets = match &config.auth_setup {
+        Some(setup) => Some(std::sync::Arc::new(
+            orbyn_core::accounts::AuthSecrets::from_encoded(setup).map_err(|e| e.to_string())?,
+        )),
+        None => None,
+    };
+    match (&config.smtp_url, &config.mail_from) {
+        (Some(url), Some(from)) => {
+            if secrets.is_none() {
+                return Err("ORBYN_SMTP_URL needs ORBYN_AUTH_SETUP: the worker opens queued messages with it".to_owned());
+            }
+            let sender = orbyn_worker::Smtp::new(url, from)?;
+            Ok(orbyn_worker::Mailer {
+                secrets,
+                sender: std::sync::Arc::new(sender),
+            })
+        }
+        _ if !config.mail_log_only => Err(
+            "the worker needs ORBYN_SMTP_URL and ORBYN_MAIL_FROM to send email (ORBYN_MAIL=log only for development, which sends nothing)"
+                .to_owned(),
+        ),
+        _ => {
+            tracing::warn!("ORBYN_MAIL=log: email is logged as not sent, and nothing is sent");
+            Ok(orbyn_worker::Mailer {
+                secrets,
+                sender: std::sync::Arc::new(orbyn_core::mail::LogOnly),
+            })
+        }
+    }
+}
+
 async fn worker(config: Config) -> Result<(), String> {
     let db = Database::connect_with_pool(&config.database_url, config.database_pool_size)
         .await
         .map_err(|e| e.to_string())?;
     let (tx, rx) = watch::channel(false);
     let id = format!("worker-{}", uuid::Uuid::new_v4());
-    let mut task = tokio::spawn(orbyn_worker::run(db, id, config.purge_after, rx));
+    let mailer = mailer(&config)?;
+    let mut task = tokio::spawn(orbyn_worker::run(db, id, config.purge_after, mailer, rx));
     tokio::select! {
         () = shutdown_signal() => {
             let _ = tx.send(true);
@@ -209,5 +246,64 @@ async fn shutdown_signal() {
     tokio::select! {
         () = ctrl_c => {},
         () = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(pairs: &[(&str, &str)]) -> Config {
+        let mut all = vec![("DATABASE_URL", "postgres://x")];
+        all.extend_from_slice(pairs);
+        Config::from_lookup(|name| {
+            all.iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| (*v).to_owned())
+        })
+        .expect("config")
+    }
+
+    #[tokio::test]
+    async fn the_worker_logs_unsent_mail_with_no_smtp_and_needs_the_setup_to_send_any() {
+        // No SMTP: refused, unless development mode is asked for by name.
+        let refused = mailer(&config(&[])).expect_err("refused");
+        assert!(refused.contains("ORBYN_SMTP_URL") && refused.contains("ORBYN_MAIL=log"));
+        assert!(mailer(&config(&[("ORBYN_MAIL", "log")])).is_ok());
+        let setup = orbyn_core::accounts::AuthSecrets::generate();
+        assert!(
+            mailer(&config(&[
+                ("ORBYN_AUTH_SETUP", setup.as_str()),
+                ("ORBYN_MAIL", "log")
+            ]))
+            .is_ok()
+        );
+        // SMTP without the setup that opens queued messages is refused, naming the setting.
+        let error = mailer(&config(&[
+            ("ORBYN_SMTP_URL", "smtps://mail.example.com"),
+            ("ORBYN_MAIL_FROM", "no-reply@example.com"),
+        ]))
+        .expect_err("refused");
+        assert!(
+            error.contains("ORBYN_AUTH_SETUP") && !error.contains("mail.example.com"),
+            "{error}"
+        );
+        // SMTP with it, and a bad setting is named without echoing it.
+        let ok = config(&[
+            ("ORBYN_AUTH_SETUP", setup.as_str()),
+            ("ORBYN_SMTP_URL", "smtps://mail.example.com"),
+            ("ORBYN_MAIL_FROM", "no-reply@example.com"),
+        ]);
+        assert!(mailer(&ok).is_ok());
+        let bad = config(&[
+            ("ORBYN_AUTH_SETUP", setup.as_str()),
+            ("ORBYN_SMTP_URL", "smtps://mail.example.com"),
+            ("ORBYN_MAIL_FROM", "not an address"),
+        ]);
+        assert!(
+            mailer(&bad)
+                .expect_err("refused")
+                .contains("ORBYN_MAIL_FROM")
+        );
     }
 }

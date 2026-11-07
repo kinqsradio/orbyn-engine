@@ -163,6 +163,34 @@ pub struct SessionCreated {
     pub expires_at: String,
 }
 
+/// The answer to `POST /v1/accounts/register/finish`: no account and no session yet, only the
+/// name of a sign-up that waits for the code sent to the address. It has the same shape whether
+/// or not the address is already taken.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SignUpPending {
+    pub signup_id: String,
+}
+
+/// `POST /v1/accounts/email/verify`: the six-digit code sent to the address. A right code creates
+/// the account with the signing-up device trusted and answers a [`SessionCreated`]. Five wrong
+/// tries close the sign-up; any failure is the one answer `invalid_email_code`. The sign-up lives
+/// 30 minutes after the last code was sent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct EmailVerify {
+    pub signup_id: String,
+    pub code: String,
+}
+
+/// `POST /v1/accounts/email/resend`: sends a new code for a pending sign-up, at most three an
+/// hour. The answer is 204 whether or not the sign-up exists.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct EmailResend {
+    pub signup_id: String,
+}
+
 /// The 401 body of a sign-in whose password was right but whose account has a second factor:
 /// no session was issued. Send `login_id` and a code to `POST /v1/sessions/login/second-factor`
 /// within five minutes.

@@ -32,6 +32,15 @@ pub struct Config {
     /// Connections this process's database pool may open (`ORBYN_DATABASE_POOL_SIZE`).
     /// The server and the worker are separate processes with a pool each.
     pub database_pool_size: u32,
+    /// Where the worker sends email: `smtps://` or `smtp://…?tls=required` (anything that could
+    /// send in the clear is refused when the worker starts), which may hold the account's
+    /// password. A secret. Without it the worker refuses to start, unless `mail_log_only` is set.
+    pub smtp_url: Option<String>,
+    /// `ORBYN_MAIL=log`: the worker sends nothing and logs each message as not sent. For
+    /// development only; sign-up works but nobody receives a code.
+    pub mail_log_only: bool,
+    /// The address email is sent from. Required with `smtp_url`.
+    pub mail_from: Option<String>,
 }
 
 impl std::fmt::Debug for Config {
@@ -46,6 +55,8 @@ impl std::fmt::Debug for Config {
             .field("max_uploads_in_flight", &self.max_uploads_in_flight)
             .field("max_uploads_per_address", &self.max_uploads_per_address)
             .field("database_pool_size", &self.database_pool_size)
+            .field("smtp_url", &self.smtp_url.as_ref().map(|_| "(hidden)"))
+            .field("mail_from", &self.mail_from)
             .finish()
     }
 }
@@ -64,6 +75,10 @@ pub enum ConfigError {
     InvalidAddressUploadCap,
     #[error("ORBYN_DATABASE_POOL_SIZE is not a whole number from 4 to 200")]
     InvalidPoolSize,
+    #[error("ORBYN_SMTP_URL needs ORBYN_MAIL_FROM, the address email is sent from")]
+    MissingMailFrom,
+    #[error("ORBYN_MAIL can only be `log`")]
+    InvalidMailMode,
 }
 
 impl Config {
@@ -133,6 +148,16 @@ impl Config {
                 .filter(|n| (crate::db::MIN_POOL_SIZE..=crate::db::MAX_POOL_SIZE).contains(n))
                 .ok_or(ConfigError::InvalidPoolSize)?,
         };
+        let smtp_url = optional("ORBYN_SMTP_URL");
+        let mail_from = optional("ORBYN_MAIL_FROM");
+        if smtp_url.is_some() && mail_from.is_none() {
+            return Err(ConfigError::MissingMailFrom);
+        }
+        let mail_log_only = match optional("ORBYN_MAIL").as_deref() {
+            None => false,
+            Some("log") => true,
+            Some(_) => return Err(ConfigError::InvalidMailMode),
+        };
         Ok(Self {
             database_url,
             bind,
@@ -143,6 +168,9 @@ impl Config {
             max_uploads_in_flight,
             max_uploads_per_address,
             database_pool_size,
+            smtp_url,
+            mail_log_only,
+            mail_from,
         })
     }
 }
@@ -210,6 +238,34 @@ mod tests {
         }
         let unset = Config::from_lookup(lookup(&[("DATABASE_URL", "postgres://x")]))?;
         assert_eq!(unset.max_uploads_per_address, None);
+        Ok(())
+    }
+
+    #[test]
+    fn smtp_is_optional_needs_a_sender_and_is_never_printed() -> Result<(), ConfigError> {
+        let with = |pairs: &[(&str, &str)]| {
+            let mut all = vec![("DATABASE_URL", "postgres://x")];
+            all.extend_from_slice(pairs);
+            Config::from_lookup(lookup(&all))
+        };
+        let none = with(&[])?;
+        assert_eq!((none.smtp_url, none.mail_from), (None, None));
+        assert!(!none.mail_log_only);
+        assert!(with(&[("ORBYN_MAIL", "log")])?.mail_log_only);
+        assert_eq!(
+            with(&[("ORBYN_MAIL", "off")]).err(),
+            Some(ConfigError::InvalidMailMode)
+        );
+        assert_eq!(
+            with(&[("ORBYN_SMTP_URL", "smtps://user:hunter2@mail.example.com")]).err(),
+            Some(ConfigError::MissingMailFrom)
+        );
+        let set = with(&[
+            ("ORBYN_SMTP_URL", "smtps://user:hunter2@mail.example.com"),
+            ("ORBYN_MAIL_FROM", "Orbyn <no-reply@example.com>"),
+        ])?;
+        assert!(set.smtp_url.is_some());
+        assert!(!format!("{set:?}").contains("hunter2"));
         Ok(())
     }
 
