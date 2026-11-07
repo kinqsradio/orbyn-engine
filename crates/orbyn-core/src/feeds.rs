@@ -310,7 +310,7 @@ fn build_client<R: Resolve + 'static>(
         .connect_timeout(Duration::from_secs(5))
         .no_proxy()
         .dns_resolver(resolver)
-        .user_agent("Orbyn-Feeds/0.1 (+https://github.com/kinqsradio/orbyn-engine)")
+        .user_agent("Orbyn-Feeds/0.1 (+https://github.com/orbyn-dev/orbyn-engine)")
         .build()
         .map_err(|_| FeedError::Internal)
 }

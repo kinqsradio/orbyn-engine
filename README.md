@@ -1,10 +1,23 @@
 # orbyn-engine
 
-The shared Rust engine behind Orbyn products. It has two halves: the device core that every app embeds, which keeps the whole planner on the device and syncs it, and the server, which holds accounts, encrypted records and keys and ships as one Docker image. Orbyn Planner is the first product to use it.
+The core every Orbyn app shares, planned to be open source once the licences land: one account, encrypted sync and the keychain under every Orbyn app. Orbyn Planner is the first app on it; Orbyn Engineering, Orbyn Notes and Orbyn Studio are planned to join. It has two halves: the device core that every app embeds, which keeps everything on the device and syncs it encrypted end to end, and the server, which holds accounts, encrypted records and keys and ships as one Docker image.
+
+**Private by design · Local first · One account · Agent ready.** Records are encrypted on the device before upload, every device works offline and keeps a full copy, one account will sign in to every Orbyn app, and agents will reach it only through grants the person controls (planned).
 
 Status: early. Nothing here is released.
 
-The plan, the feature map and the phases are in the [Orbyn platform plan](https://claude.ai/artifact/BBhxZSmXRg1DawhLVRbsNc).
+| Area | Status |
+| --- | --- |
+| Accounts, trusted devices, two-factor, email verification, account deletion | Built (the sign-up throttle redesign, [#42](https://github.com/orbyn-dev/orbyn-engine/issues/42), must land before sign-up is enabled in production) |
+| Zones, records, change tokens, live sync, the keychain | Built |
+| Signed protection setting (Standard or Advanced) | Built |
+| Key service: HSM boundary, envelopes, transparency log | Building (the cosigning witness is planned) |
+| Account recovery (Standard protection) | Planned |
+| Sharing lists and projects | Planned (designed in [docs/sharing.md](docs/sharing.md)) |
+| Connected-app grants for other Orbyn apps | Planned |
+| Advanced protection: recovery key, recovery contacts, web approval | Planned |
+
+The product, platform and hosting plans that this README follows are internal. Hostnames: `api.orbyn.dev` and `api-staging.orbyn.dev`.
 
 ## Layout
 
