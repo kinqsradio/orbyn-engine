@@ -25,6 +25,10 @@ pub mod secrets;
 mod sessions;
 pub mod totp;
 
+/// How long a deleted account's tombstone is kept, in days. A session lasts at most a year, so a
+/// device offline for longer would be signed out by expiry anyway.
+pub const TOMBSTONE_DAYS: i32 = 400;
+
 pub use delete_unused::{DELETE_UNUSED_TTL, REQUEST_JOB_KIND as DELETE_UNUSED_JOB_KIND};
 pub use limits::{Limit, Limits};
 pub use second_factor::{ManageProof, TotpEnrolment};

@@ -82,6 +82,8 @@ pub struct Limits {
     pub delete_unused_mail_per_account: Limit,
     /// Wrong delete-unused tokens from one IP prefix: 10 an hour. A right token is never counted.
     pub delete_unused_wrong_per_prefix: Limit,
+    /// Asks whether an account was deleted, from one IP prefix: 60 an hour.
+    pub account_status_per_prefix: Limit,
 }
 
 impl Default for Limits {
@@ -111,6 +113,7 @@ impl Default for Limits {
             delete_unused_per_address: Limit::new(10, Duration::from_secs(60 * MINUTE)),
             delete_unused_mail_per_account: Limit::new(3, Duration::from_secs(60 * MINUTE)),
             delete_unused_wrong_per_prefix: Limit::new(10, Duration::from_secs(60 * MINUTE)),
+            account_status_per_prefix: Limit::new(60, Duration::from_secs(60 * MINUTE)),
             account_delete_schedules_per_account: Limit::new(
                 3,
                 Duration::from_secs(24 * 60 * MINUTE),
@@ -421,6 +424,22 @@ pub async fn prune(pool: &PgPool) -> Result<u64, sqlx::Error> {
              SELECT id FROM devices WHERE state = 'pending' AND created_at < now() - interval '7 days' LIMIT 5000)",
     ];
     let mut removed = 0;
+    // Tombstones of accounts deleted more than 400 days ago: a session lasts at most a year.
+    for _ in 0..100 {
+        let n = sqlx::query(
+            "DELETE FROM account_tombstones WHERE subject IN (
+                 SELECT subject FROM account_tombstones
+                 WHERE deleted_at < (now() AT TIME ZONE 'utc')::date - $1 LIMIT 5000)",
+        )
+        .bind(super::TOMBSTONE_DAYS)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        removed += n;
+        if n < BATCH {
+            break;
+        }
+    }
     for statement in STATEMENTS {
         // Keep deleting until a batch comes back short, so pruning keeps up
         // however fast rows arrive; the cap stops one run from going on forever.

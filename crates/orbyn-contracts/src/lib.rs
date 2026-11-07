@@ -340,6 +340,23 @@ pub struct DeleteUnusedConfirm {
     pub token: String,
 }
 
+/// `POST /v1/accounts/status`: has this account been deleted? No session (the device's session
+/// went with the account). Answer 200 `AccountStatus` when a tombstone exists, and 404 `not_found`
+/// for everything else, so it never says that an account exists. 429 `too_many_attempts` past 60
+/// an hour from one network. A device asks once after a 401 and wipes only on a 200.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct AccountStatusRequest {
+    pub account_id: String,
+}
+
+/// The answer for a deleted account: the UTC day it was deleted, as an RFC 3339 date at 00:00 UTC.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct AccountStatus {
+    pub deleted_at: String,
+}
+
 /// A device of the account.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]

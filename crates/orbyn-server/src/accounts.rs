@@ -41,6 +41,7 @@ pub(crate) fn routes() -> Router<AppState> {
             "/v1/accounts/delete/cancel-by-mail",
             post(cancel_deletion_by_mail),
         )
+        .route("/v1/accounts/status", post(account_status))
         .route("/v1/accounts/delete-unused", post(delete_unused_request))
         .route(
             "/v1/accounts/delete-unused/confirm",
@@ -764,6 +765,26 @@ async fn cancel_deletion_by_mail(
         .cancel_deletion_by_mail(&client, &body.token)
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Whether an account was deleted. A tombstone is 200 `{deleted_at}`; anything else is the same
+/// 404, so a live account is not told apart from an id nobody used. Both answers are built the
+/// same way, after the same single lookup.
+async fn account_status(
+    State(state): State<AppState>,
+    Caller(client): Caller,
+    Body(body): Body<wire::AccountStatusRequest>,
+) -> Answer<Response> {
+    let id = Uuid::parse_str(&body.account_id).map_err(|_| AccountError::InvalidRequest)?;
+    let deleted = service(&state)?.deleted_on(&client, id).await?;
+    let (status, code, deleted_at) = match deleted {
+        Some(day) => (StatusCode::OK, "", Some(format!("{day}T00:00:00Z"))),
+        None => (StatusCode::NOT_FOUND, "not_found", None),
+    };
+    Ok(match deleted_at {
+        Some(deleted_at) => (status, Json(wire::AccountStatus { deleted_at })).into_response(),
+        None => error(status, code, "There is no such item."),
+    })
 }
 
 /// Always 202 `{}`: the service takes the same steps for every address and never reads the account.
