@@ -1,122 +1,212 @@
 # Sharing lists and projects
 
-This is the design for phase 4: sharing a list or a project with other people, the way a shared Reminders list works at Apple. It is not built yet.
+This is the design for phase 4: sharing a list or a project with other people, the way a shared Reminders list works at Apple. It is not built yet. It depends on the key service's transparency log ([key-service.md](key-service.md)), so it comes after that.
 
-## The caller and the failure
+## The caller and the goal
 
 Maya shares Groceries with Sam, who can edit it.
 
 - Sam's phone and laptop see the list and its changes at once.
-- When Maya removes Sam, Sam's devices keep what they already had, but see nothing written afterwards.
-- A server that lies cannot add itself to the list, read a change, or let a viewer write.
+- When Maya removes Sam, Sam's devices keep what they already had and see nothing written afterwards.
+- A server that lies, even one working with a participant, cannot:
+  - read a shared list;
+  - add itself or anyone else as a member;
+  - write as someone else;
+  - let a viewer write;
+  - make a member's devices escrow keys they should not.
+- What it can do is withhold or delay, and devices detect that where the design says so.
 
 ## What already exists
 
-- **Zones and keys.** Every list, project and calendar is a zone with an owner account. Its records are sealed with record keys, which are sealed with the zone key.
-- **Key envelopes.** A zone key reaches another device only through an envelope sealed to that device's X25519 key and signed by the sender's Ed25519 key. A device accepts envelopes only from devices it verifies through approval chains inside its own account.
-- **Participants table.** `zone_participants` exists in the store and is unused. Today another account's request answers `zone_not_found`.
-
-Sharing therefore needs three things that do not exist:
-- an identity for an account, not just a device, that another account can encrypt to and verify;
-- participants with roles that the server enforces and devices check;
-- removal that keeps a removed participant out of new data.
+- **Zones and keys.** Every list, project and calendar is a zone with an owner account. Records are sealed with record keys, which are sealed with the zone key.
+- **Key envelopes.** Device envelopes are sealed to a device's X25519 key and signed by the sending device. A device accepts envelopes only from devices it verifies through approval chains inside its own account.
+- **The transparency log.** The key service keeps a witness-cosigned log with per-account lookup proofs (see key-service.md). Sharing logs account keys in it.
+- **Participants table.** `zone_participants` exists in the store and is unused.
 
 ## Account keys
 
-Each account gets one **account key pair**:
-- Ed25519 for signing;
-- X25519 for receiving keys from other accounts.
+Each account has one **account key pair**: Ed25519 for signing and X25519 for receiving.
 
-**Creation and holding.**
+### Making and holding it
+
 - The account's first trusted device makes the pair after sign-up and verification.
-- It reaches the account's other devices through the keychain, like a zone key: an envelope sealed to each verified device, under the label `orbyn/account-key/v1`.
-- Only the account's trusted devices hold the private halves.
+- It reaches the account's other trusted devices through the keychain, in an envelope labelled `orbyn/account-key/v1`. The label binds the statement's sequence and hash, so a server cannot feed a new device an old key. The receiving device checks that the public key it derives equals the head it verified.
+- **The account key is never escrowed** to the key service. Account recovery therefore does not restore it (see *Recovery*).
 
-**Publishing.** The public halves are published as an **account key statement**, `orbyn/account-key-statement/v1`, over the account id, both public keys and a sequence. It is signed by a trusted device of the account and chained like the protection setting (seq, prev). `GET /v1/accounts/{id}/key` returns the newest statement and its chain.
+### Statements
 
-**How another account trusts it.** There are two levels, as in messaging apps:
-- **Server-vouched (the default).** Maya's device accepts the key the server returns for Sam's account, after checking the statement's signature chain within itself. It shows Sam's account key fingerprint in the share sheet.
-- **Verified.** Maya and Sam compare a 12-digit safety code computed from both account keys, in person or on a call, and mark it verified. If the key ever changes after that, Maya's devices warn before sharing anything new with Sam.
+The public halves are published as **account key statements**, `orbyn/account-key-statement/v1`. Each one is length-prefixed over:
+- the account id;
+- both public keys;
+- a sequence and prev (the hash of the previous statement).
 
-Under Standard protection, server-vouched is the honest default: the server can already read Standard data. For Advanced protection's end-to-end sharing (phase 7), a server-vouched key is used, but the share sheet says the person is unverified until the safety code is compared.
+Each statement is signed twice:
+- **by the account key itself**, the new key for the first statement and the previous key for a continuation, so a statement proves possession and continuity;
+- **by a trusted device of the account**, so the account's own approval chains vouch for it.
 
-**Rotation.** A device can rotate the account key: a new statement with the next sequence, and new envelopes to the account's devices. Other accounts see the new sequence on their next fetch. Their devices then re-wrap shared zone keys to the new key, and warn if that person was verified.
+### Logging
 
-## Participants and roles
+Every statement is appended to the transparency log under that account's map key. `GET /v1/accounts/{id}/key` returns the head, its chain and a fresh, cosigned lookup proof.
 
-- **Roles:** `owner` (one, the zone's account), `editor` and `viewer`.
-- **Inviting.** The owner invites by email.
-  - `POST /v1/zones/{zone}/participants {email, role}` from a trusted device of the owner.
-  - The answer is the same whether or not the email has an account. The invitation is stored against the email digest, and the email gets one message: "Maya shared Groceries with you on Orbyn". A person without an account can sign up with that email and then accept. An invitation never tells the owner whether an email has an account.
-  - Unaccepted invitations expire after 30 days. The owner sees them as "Invited" either way.
-- **Accepting.** The invitee's device accepts: `POST /v1/invitations/{id}/accept`, from a trusted device of the invitee.
-- **Server enforcement.**
-  - Viewers can read the zone and its changes but get `zone_read_only` on any upload.
-  - Editors can upload records.
-  - Only the owner can invite, change roles, remove participants, rotate the zone key or delete the zone.
-  - A participant can leave on their own.
-- **The participant set is signed.** Every change to it is a **participant statement**, `orbyn/zone-participants/v1`, signed by an owner's device, over:
-  - the zone, the sequence and prev;
-  - the full set of (account id, account key fingerprint, role).
+**Before Maya's device seals anything to Sam**, it requires all three:
+- a lookup proof no older than 24 hours;
+- a chain that verifies;
+- a head no older than the head it pinned for Sam (see *Contacts*).
 
-  The server stores the chain and serves it with the zone.
-- **Device checks.** A participant's device:
-  - verifies the chain from the owner's account key;
-  - accepts an envelope for the shared zone only from a member account;
-  - treats a record or tombstone as valid only if its author is in the set with a role that may write.
+**Sam's own devices** check the log for their account. A statement they did not make, or that no device of Sam's account made, is shown as a possible takeover, with the same checks as for recovery entries.
 
-  So a server that invents a participant, or upgrades a viewer, is caught by every device, not only by the server's own check.
+### Contacts
+
+- **Pinning.** For every account it has shared with, a device pins the highest sequence and statement hash it accepted. It refuses a lower sequence or a different hash at the same sequence.
+- **Continuations.** A new statement signed by the previous account key is accepted on its own.
+- **Resets.** A new statement that the previous key did not sign is accepted only as described under *Recovery*.
+
+### Verifying a person
+
+- **Default: logged, unverified.** The share sheet shows the person as unverified until both people compare safety codes. The key is still logged and cosigned, so substituting it is detectable by Sam's own devices, which is not the case for a key that is merely server-vouched.
+- **Verified.**
+  - Maya and Sam compare a **safety number**: 60 digits, or a QR code scanned in person, computed under `orbyn/safety-code/v1` over both account ids and both account keys in a canonical order.
+  - It is the full fingerprint, so it cannot be ground offline.
+  - Marking it verified pins that key. Any later reset, as opposed to a continuation, drops Sam back to unverified with a warning.
+
+## Roles and the participant set
+
+- **Roles in v1.**
+  - There is exactly one **owner**, the zone's account, plus **editors** and **viewers**.
+  - Only the owner seals keys to accounts, rotates the zone key, changes membership or roles, and deletes the zone.
+  - Editors write records; viewers read.
+  - There is no second owner and no ownership transfer in v1.
+- **The participant statement.** Membership is a chain, `orbyn/zone-participants/v1`, **signed by the owner's account key**. Each statement is length-prefixed over:
+  - the owner account and the zone;
+  - a sequence and prev;
+  - the full set of (account id, account key statement hash, role);
+  - the zone's protection level (`standard` or `end-to-end`).
+
+  The server stores it and serves it with the zone. It is capped at 1000 statements per zone, and uploads are limited to 30 an hour per zone, counted after the signature verifies. At the cap the owner can still remove people, by compacting the chain to a checkpoint statement the owner signs; it is never a lockout.
+- **Anchoring.** Every zone-key rotation (see below) binds the hash of the participant statement it was made for. A device accepts a statement only if:
+  - it is at least as new as the one bound by the newest key it holds;
+  - the head the server serves is not older than that.
+
+  So the head cannot be stripped or rolled back the way engine#32's endorsement could be. A device that joins bootstraps from the statement bound by the first key it is given.
+- **Server enforcement** is the first layer: viewers get `zone_read_only` on uploads, and non-owners get `zone_owner_only` on membership, rotation and key routes. Devices then check everything themselves, as below.
+
+## Records in shared zones
+
+The zone key alone cannot tell who wrote a record, because every member, viewers included, holds it. So in a shared zone, every record version and tombstone is also signed by its author's **account key**: `orbyn/shared-record/v1`, length-prefixed over:
+- the owner account and the zone;
+- the record id, its type and base version;
+- the zone key id;
+- the hash of the ciphertext and of the wrapped record key.
+
+A device accepts a version only if all of these hold:
+- its signature verifies against the author's pinned account key;
+- the author has a role that may write in the participant statement bound by the zone key the version is sealed under;
+- the version is newer than the device's copy and sealed under the current key, or under a key that was current for that statement.
+
+A demoted or removed member therefore cannot write, even with old keys and a cooperating server: their versions under the old key are older than the rotation, and under the new key they hold nothing.
 
 ## Keys for a shared zone
 
-- **Getting the key to Sam.** When Sam accepts, one of Maya's devices seals the zone's keys to Sam's account X25519 key: an envelope with recipient kind `account`, under the label `orbyn/shared-zone-key/v1`, binding the zone, the key id and Sam's account id. It is signed by Maya's account Ed25519 key.
-- **Sam's devices.** They open it with the account key they hold, then keep the zone key as they keep their own.
-- **Records.** They stay sealed exactly as today: record keys under the zone key. The author is now carried as the author account's key fingerprint with the device id, and signed deletes are signed by the author account's key.
-- **Storage.** `key_envelopes` gains recipient kind `account`, alongside `device` and `service`.
+- **Sealing.** Only the owner's devices seal zone keys to another account: the `account` envelope suite `orbyn/wrap-account/v1`, following the P-256 suite's pattern in key-service.md but with X25519. It has:
+  - its own HKDF info, AEAD context and signature context;
+  - a fully length-prefixed transcript binding the owner account, the zone, the key id, the recipient account and the hash of the recipient's account-key statement;
+  - a signature by the owner's account key.
 
-## Removal
+  Members' devices accept zone keys only in this form, from the owner. A viewer or a server cannot plant a "first key".
+- **Rotations** are signed by the owner's account key, and bind:
+  - the new and previous key ids;
+  - the participant statement hash;
+  - the zone version at which it took effect.
+- **Escrow.** Only the owner's devices write service envelopes for a shared zone, and only when the participant statement says `standard`. The server refuses a service envelope for a zone that the session's account does not own. A participant's recovery therefore never exposes someone else's zone.
 
-When Maya removes Sam:
+## Protection level of a shared zone
 
-1. One of Maya's devices writes a new participant statement without Sam.
-2. It rotates the zone key, a new current key signed as a rotation as today.
-3. It seals the new key only to the accounts still in the set.
-4. The server drops Sam from the zone at once. Sam's next fetch answers `zone_not_found`, and his live connection is closed for that zone.
+The owner sets it in the participant statement.
 
-Sam's devices keep their local copy of what they already had: the server cannot take back what was shared, and nothing pretends otherwise. They mark the list "You were removed" and stop syncing it.
+- **End-to-end** is allowed only while every participant's own verified protection setting is Advanced. Each participant's device checks its own verified level (engine#32) against the statement, and refuses to stay in an end-to-end zone while it is not Advanced, telling the person why.
+- **Standard** otherwise, said plainly in the share sheet.
+- **A downgrade** from end-to-end to Standard is a new owner-signed statement, shown to every member, never a server decision.
 
-**Rotation follows the owner.** If Maya is offline when Sam leaves on his own, the server drops him immediately. Maya's next device to sync sees the new participant set and rotates the key then. Until it does, Sam could read new records if he still received ciphertext. He doesn't: the server stops serving him at once. The rotation closes the case of a server that keeps serving him.
+## Removal, leaving and the window
 
-## Standard and Advanced
+- **Removal is one batch** from an owner device, accepted all or nothing:
+  - the new participant statement;
+  - the rotation bound to it;
+  - new account envelopes for the remaining members only.
 
-- **Standard (v1).** Shared zones are Standard: the key service may hold a service envelope for the zone, as for the owner's own zones. That copy stays the owner's: recovery restores the zone keys to the owner's recovered account, not to other participants.
-- **Advanced (phase 7).** A shared zone is end-to-end only when every participant's verified protection setting is Advanced: no service envelope is written, and the share sheet says so. Otherwise it stays Standard, and the share sheet says so too.
+  The server drops the removed account at once, and its next fetch answers `zone_not_found`.
+- **Leaving** is a statement signed by the member's own account key, `orbyn/zone-leave/v1`. The server drops the member at once.
+  - Members' devices stop accepting the leaver's writes as soon as they see the leave statement.
+  - The owner's next device online rotates the key.
+- **The window.** Between a leave (or a removal made while the owner's devices are offline) and the next rotation, a server that kept serving the leaver new ciphertext could let them read it. The window is bounded only by the owner being online. Members see "Waiting for Maya to secure this list" until the rotation arrives. Editors cannot rotate in v1, which keeps one key authority.
+- **What removed people keep.** Their devices keep the local copy of what they had; nothing pretends otherwise. They mark the list "You were removed" and stop syncing it.
 
-## Notifications
+## Recovery and key changes
 
-A change by another participant raises an in-app notification on the participant's devices: "Sam added Milk to Groceries". It is built on the device from the decrypted record. The server only says "this zone changed", as today.
+- **A participant recovers their account.** Sam recovers through Standard recovery. The account key is not escrowed, so Sam's recovered account makes a new key with a statement not signed by the old key: a **reset**.
+  - The reset is accepted only when the transparency log shows a recovery-finish entry for Sam's account linked to it.
+  - Owners' devices then **never re-wrap automatically**. They prompt: "Sam's account was recovered. Share Groceries with Sam again?"
+  - A verified Sam drops back to unverified.
+- **An owner recovers their account.** Maya recovers her own zones through the key service, as for any Standard zone, but her new account key is a reset. Members see "Maya's account was recovered", and Maya re-signs the participant statement with the new key. Members accept that only after the same linked log entry and a prompt.
+- **Every account-key change** is shown to the people the account shares with: a continuation as a quiet note, a reset as a prompt.
+
+## Invitations
+
+These follow engine#30's rules for addresses.
+
+- **One answer.** Inviting answers the same whether or not the email has an account.
+- **Storage.** One pending invitation per (zone, email digest), and digests expire with the invitation after 30 days.
+- **Caps.** One keyed counter per invitee address caps mails at 5 a day across all inviters, plus 20 invitations an hour per inviter. The answers are identical at the caps, and the mail is sent asynchronously on both paths.
+- **The mail.** It shows the inviter's verified email and the list name, escaped and truncated, with "Block invitations from this person". A blocked inviter's later invitations to that address are dropped silently.
+- **Accepting.** It needs a session whose account's verified email matches the invitation. Before sealing, the owner's device shows the accepting account's key fingerprint and its verification state.
+
+## Deleting
+
+- **Deleting a shared zone** is owner-only, with a tombstone signed by the owner's account key, `orbyn/zone-delete/v1`.
+- **Members' devices** remove it and keep nothing synced. The local copy goes to the trash for 30 days, as for any deleted list.
+- **Deleting the owner's account** deletes the owner's shared zones the same way, with members told: "Maya deleted her account; Groceries is gone".
+
+## What the server still sees
+
+The threat model gains:
+- the social graph: who shares with whom, and roles;
+- which account wrote each version, from the signatures;
+- invitation timing, under keyed, expiring email digests;
+- the owner's device ids in cross-account notices.
+
+Contents stay sealed.
 
 ## Limits
 
 - 50 participants per zone.
-- 100 shared zones per account, as owner or participant.
-- 20 invitations per account an hour.
+- 100 shared zones per account.
+- Participant statements: 1000 per zone, then checkpoint compaction, at 30 an hour.
+- Account key statements: 30 a day.
+- Invitations: as above.
 
 ## Order of work
 
-1. Account keys: making them, the keychain envelopes, the statement chain and its routes, and the client verification.
-2. Participants: the routes, the server roles, the signed participant chain, and client verification of the chain and of record authors.
-3. Shared-zone envelopes (recipient kind `account`), accepting an invitation, and fetch and upload across accounts.
-4. Removal with rotation, and leaving.
-5. Planner:
-   - the share sheet (invite, role, fingerprint and safety code);
+1. The key service's transparency log, from key-service.md step 3.
+2. Account keys:
+   - making the pair and its keychain envelope, bound to the statement;
+   - double-signed statements, logged with lookup proofs;
+   - contact pinning, continuation and reset rules.
+3. The participant chain signed by the owner's account key, server roles, the anchoring through rotations, and the protection level in the statement.
+4. Signed shared records and tombstones, and device-side author checks.
+5. The `orbyn/wrap-account/v1` envelopes, accepting invitations, the owner-only escrow rule, and fetch and upload across accounts.
+6. Removal as one batch, leave statements, zone deletion, and the recovery prompts.
+7. Planner:
+   - the share sheet (role, verification state, safety number and QR);
    - invitations;
-   - the removed state;
-   - notifications for shared changes.
+   - the waiting and removed states;
+   - key-change prompts;
+   - shared-change notifications.
 
 Each step ships in both repos behind the same contracts.
 
 ## Rejected alternatives
 
-- **Sealing the zone key to each of the participant's devices directly.** The owner's devices would need to verify another account's device approval chains, and every new device of Sam's would need the owner to be online. The account key moves that verification into Sam's own account, where approval chains already work.
-- **Using the key service to hand out shared zone keys.** It would make every shared zone readable by the key service even when every participant is Advanced, and tie sharing to the key service being up.
+- **Sealing zone keys to each participant device.** The owner would have to verify another account's device approval chains, and every new device of Sam's would need the owner online. The account key moves that into Sam's own account.
+- **The key service handing out shared zone keys.** It would make shared zones readable by the key service even when end-to-end, and tie sharing to the key service being up.
+- **A server-vouched account key.** The record server could substitute keys undetectably. Logging with cosigned lookup proofs makes substitution visible to the account's own devices.
+- **Escrowing the account key.** Recovery would then silently restore every share to whoever recovered the account. A reset that owners must confirm is safer.
