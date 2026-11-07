@@ -220,7 +220,20 @@ pub trait StateStore {
 }
 
 /// The state in a file, replaced atomically: written to a temporary file, `fsync`ed, renamed over
-/// the old one, and the directory `fsync`ed.
+/// the old one, and the directory `fsync`ed where the system allows it.
+///
+/// **What is guaranteed, per system.**
+/// - **Unix (Linux, macOS):** the data is flushed before the rename, the rename atomically replaces
+///   the old file, and the directory is flushed, so once `save` returns the new state survives a
+///   crash. A directory that cannot be flushed is an error.
+/// - **Windows:** the data is flushed (`FlushFileBuffers`) before the rename, and `rename` is
+///   `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`, which replaces the old file in one step, so a
+///   reader and a crash see the old state or the new, never a torn one. A directory cannot be
+///   opened as a file to flush in the way Unix does (it needs `FILE_FLAG_BACKUP_SEMANTICS`, and
+///   even then a flush may be refused), so the directory flush is **attempted and not required**:
+///   NTFS journals the rename, but a crash in the instant after `save` returns could in principle
+///   leave the previous state, which is the one outcome a witness must avoid. A Windows witness
+///   is for development and CI; production runs on Unix.
 #[derive(Debug, Clone)]
 pub struct FileStore {
     path: std::path::PathBuf,
@@ -248,7 +261,7 @@ impl StateStore for FileStore {
         let mut file = std::fs::File::create(&tmp).map_err(io)?;
         file.write_all(&state.encode()).map_err(io)?;
         file.sync_all().map_err(io)?;
-        std::fs::rename(&tmp, &self.path).map_err(io)?;
+        replace(&tmp, &self.path).map_err(io)?;
         // The rename itself must survive a crash too.
         if let Some(dir) = self.path.parent() {
             let dir = if dir.as_os_str().is_empty() {
@@ -256,9 +269,7 @@ impl StateStore for FileStore {
             } else {
                 dir
             };
-            std::fs::File::open(dir)
-                .and_then(|d| d.sync_all())
-                .map_err(io)?;
+            sync_directory(dir)?;
         }
         Ok(())
     }
@@ -333,5 +344,59 @@ fn format_mismatch(body: &[u8]) -> StoreError {
         Some(n) if n < current => StoreError::OlderFormat,
         Some(n) if n > current => StoreError::NewerFormat,
         _ => StoreError::Corrupt,
+    }
+}
+
+/// Moves `from` over `to`. On Windows the target may be held open for a moment by another handle
+/// (a scanner, a reader), so a refusal is tried again a few times.
+fn replace(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        let mut last = None;
+        for _ in 0..5 {
+            match std::fs::rename(from, to) {
+                Ok(()) => return Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    last = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| std::io::Error::from(std::io::ErrorKind::PermissionDenied)))
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(from, to)
+    }
+}
+
+/// Flushes a directory so a rename in it survives a crash: required on Unix, attempted on Windows
+/// (see [`FileStore`]), skipped elsewhere.
+fn sync_directory(dir: &std::path::Path) -> Result<(), StoreError> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)
+            .and_then(|d| d.sync_all())
+            .map_err(|_| StoreError::Io)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_BACKUP_SEMANTICS opens a directory; a flush it refuses is not an error here.
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        if let Ok(handle) = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(dir)
+        {
+            let _ = handle.sync_all();
+        }
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = dir;
+        Ok(())
     }
 }

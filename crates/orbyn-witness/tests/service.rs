@@ -972,6 +972,11 @@ fn the_binary_says_what_the_designs_say_for_help_and_for_each_start_up_error() {
         stderr_of(&output),
         format!("{}\n", messages::cannot_listen(&address))
     );
+    // The address is taken before anything is written: nothing was left behind.
+    assert!(
+        !dir.join("listen").exists(),
+        "a witness that could not listen made its state directory"
+    );
     drop(taken);
 
     // The words of the final designs, word for word, for what v42 changed.

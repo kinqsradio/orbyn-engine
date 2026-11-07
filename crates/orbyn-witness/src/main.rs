@@ -233,6 +233,11 @@ async fn run(args: RunArgs) -> Result<(), String> {
         .init();
     let key = read_key(&args.key_file)?;
     let config = Config::new(parse_log_keys(&args.log_keys)?);
+    // The address is taken before anything is written: a witness that cannot listen leaves no state
+    // behind it.
+    let listener = tokio::net::TcpListener::bind(args.bind)
+        .await
+        .map_err(|_| messages::cannot_listen(&args.bind))?;
     let state_dir = args.state_dir.clone();
     let start = |e| start_error(e, &state_dir);
     std::fs::create_dir_all(&args.state_dir)
@@ -274,9 +279,6 @@ async fn run(args: RunArgs) -> Result<(), String> {
         }
     });
 
-    let listener = tokio::net::TcpListener::bind(args.bind)
-        .await
-        .map_err(|_| messages::cannot_listen(&args.bind))?;
     tracing::info!("{}", messages::listening(&args.bind));
     axum::serve(
         listener,
