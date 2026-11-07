@@ -35,9 +35,10 @@ fn an_envelope_that_does_not_match_is_refused_and_leaves_no_session_object() {
 fn a_failing_derive_still_destroys_the_session_object() {
     let hsm = std::sync::Arc::new(MemoryHsm::new());
     let live = hsm.clone();
-    suite::a_failing_derive_still_destroys_the_session_object(suite::Shared(hsm), move || {
-        live.live_session_objects()
-    });
+    suite::a_failing_derive_still_destroys_the_session_object(
+        orbyn_keyservice::testing::Shared(hsm),
+        move || live.live_session_objects(),
+    );
 }
 
 #[test]

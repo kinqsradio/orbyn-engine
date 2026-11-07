@@ -45,6 +45,8 @@ impl MemoryHsm {
     }
 }
 
+impl crate::sealed::Sealed for MemoryHsm {}
+
 impl Hsm for MemoryHsm {
     fn kek_exists(&self) -> Result<bool, HsmError> {
         Ok(self.state().kek.is_some())

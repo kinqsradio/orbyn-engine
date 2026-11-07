@@ -17,11 +17,12 @@ const PIN: &str = "1234";
 
 /// The SoftHSM module's path, or `None` when this machine has none, so the tests skip: a developer
 /// without SoftHSM can still run `--include-ignored`. CI sets `ORBYN_SOFTHSM_REQUIRED`, which turns
-/// a missing module into a failure, so the tests can never skip there unnoticed.
+/// a missing module into a failure, so the tests can never skip there unnoticed. An empty value
+/// counts as unset, so `ORBYN_SOFTHSM_REQUIRED=` clears it.
 fn softhsm_module() -> Option<String> {
     match std::env::var("ORBYN_SOFTHSM_MODULE") {
         Ok(path) => Some(path),
-        Err(_) if std::env::var("ORBYN_SOFTHSM_REQUIRED").is_ok() => {
+        Err(_) if std::env::var("ORBYN_SOFTHSM_REQUIRED").is_ok_and(|v| !v.is_empty()) => {
             panic!("ORBYN_SOFTHSM_REQUIRED is set but ORBYN_SOFTHSM_MODULE is not")
         }
         Err(_) => {
@@ -235,9 +236,10 @@ fn a_failing_derive_still_destroys_the_session_object() {
     let Some(hsm) = new_hsm() else { return };
     let hsm = Arc::new(hsm);
     let live = hsm.clone();
-    suite::a_failing_derive_still_destroys_the_session_object(suite::Shared(hsm), move || {
-        live.live_session_objects()
-    });
+    suite::a_failing_derive_still_destroys_the_session_object(
+        orbyn_keyservice::testing::Shared(hsm),
+        move || live.live_session_objects(),
+    );
 }
 
 #[test]
