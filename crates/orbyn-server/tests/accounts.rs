@@ -5400,3 +5400,73 @@ async fn the_second_factor_step_waits_for_the_account_lock_before_its_state_row(
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 }
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn adding_a_device_waits_while_a_deletion_is_scheduled() {
+    let _turn = TURN.lock().await;
+    let server = server_with(roomy()).await;
+    let p = pair(&server).await;
+
+    // An approval under way: the pending device answers and the approver reveals.
+    let (status, body, run) = server.start_approval(&p).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let device_nonce = rand32();
+    let (status, body) = server
+        .step(
+            token(&p.b_session),
+            &run,
+            "nonce",
+            json!({"nonce": b64(&device_nonce)}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (status, body) = server
+        .step(
+            token(&p.a_session),
+            &run,
+            "reveal",
+            json!({"nonce": b64(&run.nonce)}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    // A deletion is scheduled.
+    let (status, body) = server
+        .delete_account(&p.a_session, delete_body(&p.a_session, &p.a, None, None))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+
+    // Starting another approval and confirming the one under way both wait.
+    let (status, refused, _) = server.start_approval(&p).await;
+    assert_eq!(
+        (status, &refused["code"]),
+        (StatusCode::CONFLICT, &json!("deletion_scheduled"))
+    );
+    let signature = p.a.sign(auth::DEVICE_APPROVAL_CONTEXT, &run.message());
+    let confirm = || async {
+        server
+            .step(
+                token(&p.a_session),
+                &run,
+                "confirm",
+                json!({"signature": b64(&signature)}),
+            )
+            .await
+    };
+    let (status, refused) = confirm().await;
+    assert_eq!(
+        (status, &refused["code"]),
+        (StatusCode::CONFLICT, &json!("deletion_scheduled"))
+    );
+
+    // Cancelled, the approval under way finishes.
+    let (status, _) = server
+        .cancel_deletion(&p.a_session, cancel_body(&p.a_session, &p.a))
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, body) = confirm().await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (status, body, _) = server.start_approval(&p).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}

@@ -377,7 +377,9 @@ impl Accounts {
             return Err(AccountError::InvalidRequest);
         }
         let mut tx = self.pool.begin().await?;
-        Self::lock_account_shared(&mut tx, session.account_id).await?;
+        // Adding a device waits while a deletion is scheduled, under the shared account lock like
+        // the other frozen steps.
+        Self::refuse_during_deletion_shared(&mut tx, session.account_id).await?;
         self.require_trusted(&mut tx, session).await?;
         if device_id == session.device_id {
             return Err(AccountError::InvalidRequest);
@@ -515,6 +517,9 @@ impl Accounts {
             return Err(AccountError::InvalidRequest);
         }
         let mut tx = self.pool.begin().await?;
+        // The account first (the deletion takes it before the devices), shared, and refuse while a
+        // deletion is scheduled: an approval already under way cannot finish in the grace period.
+        Self::refuse_during_deletion_shared(&mut tx, session.account_id).await?;
         self.require_trusted(&mut tx, session).await?;
         let view = self
             .open_approval(&mut tx, session, approval_id, true)
