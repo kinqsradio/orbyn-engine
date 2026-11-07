@@ -24,6 +24,8 @@ pub(crate) fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/accounts/register/start", post(register_start))
         .route("/v1/accounts/register/finish", post(register_finish))
+        .route("/v1/accounts/email/verify", post(email_verify))
+        .route("/v1/accounts/email/resend", post(email_resend))
         .route("/v1/sessions/login/start", post(login_start))
         .route("/v1/sessions/login/finish", post(login_finish))
         .route(
@@ -100,7 +102,7 @@ impl IntoResponse for Failure {
             AccountError::InvalidRequest => (StatusCode::BAD_REQUEST, "invalid_request"),
             AccountError::InvalidEmail => (StatusCode::BAD_REQUEST, "invalid_email"),
             AccountError::InvalidDeviceName => (StatusCode::BAD_REQUEST, "invalid_device_name"),
-            AccountError::EmailUnavailable => (StatusCode::CONFLICT, "email_unavailable"),
+            AccountError::InvalidEmailCode => (StatusCode::BAD_REQUEST, "invalid_email_code"),
             AccountError::LoginFailed => (StatusCode::UNAUTHORIZED, "login_failed"),
             AccountError::TooManyAttempts => (StatusCode::TOO_MANY_REQUESTS, "too_many_attempts"),
             // Answered above with its login id; never reached.
@@ -351,8 +353,8 @@ async fn register_finish(
     State(state): State<AppState>,
     Caller(client): Caller,
     Body(body): Body<wire::RegisterFinish>,
-) -> Answer<(StatusCode, Json<wire::SessionCreated>)> {
-    let session = service(&state)?
+) -> Answer<(StatusCode, Json<wire::SignUpPending>)> {
+    let signup_id = service(&state)?
         .register_finish(
             &client,
             &body.email,
@@ -361,7 +363,35 @@ async fn register_finish(
             &fixed(&body.device_signature)?,
         )
         .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(wire::SignUpPending {
+            signup_id: signup_id.to_string(),
+        }),
+    ))
+}
+
+async fn email_verify(
+    State(state): State<AppState>,
+    Caller(client): Caller,
+    Body(body): Body<wire::EmailVerify>,
+) -> Answer<(StatusCode, Json<wire::SessionCreated>)> {
+    // An id that is not even a UUID is a sign-up nobody made: the same refusal as any other.
+    let signup_id = Uuid::parse_str(&body.signup_id).map_err(|_| AccountError::InvalidEmailCode)?;
+    let session = service(&state)?
+        .email_verify(&client, signup_id, &body.code)
+        .await?;
     Ok((StatusCode::CREATED, Json(wire_session(session))))
+}
+
+async fn email_resend(
+    State(state): State<AppState>,
+    Body(body): Body<wire::EmailResend>,
+) -> Answer<StatusCode> {
+    if let Ok(signup_id) = Uuid::parse_str(&body.signup_id) {
+        service(&state)?.email_resend(signup_id).await?;
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn login_start(

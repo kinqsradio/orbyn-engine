@@ -1,7 +1,14 @@
 //! Runs queued jobs until asked to stop. Each job kind has one handler; an
 //! unknown kind fails, so a typo never silently drops work.
 
+mod smtp;
+
+pub use smtp::Smtp;
+
+use orbyn_core::accounts::AuthSecrets;
+use orbyn_core::mail::{self, Delivery, Sender};
 use orbyn_core::{Database, jobs};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 
@@ -21,6 +28,42 @@ const PURGE_STEPS: usize = 50;
 pub enum Outcome {
     Done,
     Retry(String),
+    /// Stop for good: the job cannot succeed or is no longer wanted.
+    GiveUp(String),
+}
+
+/// What the worker needs to send email: the setup that opens a queued message (without it a
+/// message is logged as not sent) and the sender, SMTP or [`mail::LogOnly`].
+#[derive(Clone)]
+pub struct Mailer {
+    pub secrets: Option<Arc<AuthSecrets>>,
+    pub sender: Arc<dyn Sender>,
+}
+
+impl std::fmt::Debug for Mailer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Mailer(..)")
+    }
+}
+
+impl Mailer {
+    /// A mailer that sends nothing and logs each message as not sent.
+    pub fn log_only() -> Self {
+        Self {
+            secrets: None,
+            sender: Arc::new(mail::LogOnly),
+        }
+    }
+}
+
+/// Delivers one email job. Failures are retried by the queue's backoff until the message is 24
+/// hours old.
+pub async fn deliver_email(job: &jobs::Job, mailer: &Mailer) -> Outcome {
+    match mail::deliver(job, mailer.secrets.as_deref(), mailer.sender.as_ref()).await {
+        Delivery::Sent => Outcome::Done,
+        Delivery::Retry(reason) => Outcome::Retry(reason.to_owned()),
+        Delivery::GiveUp(reason) => Outcome::GiveUp(reason.to_owned()),
+    }
 }
 
 /// Runs one job. Kinds arrive with later phases (push, reminders, rotation).
@@ -72,6 +115,7 @@ pub async fn run(
     db: Database,
     worker_id: String,
     retention: Duration,
+    mailer: Mailer,
     mut stop: watch::Receiver<bool>,
 ) {
     tracing::info!(worker = %worker_id, "worker started");
@@ -111,7 +155,14 @@ pub async fn run(
         match jobs::claim(db.pool(), &worker_id, LEASE).await {
             Ok(Some(job)) => {
                 let pool = db.pool();
-                let outcome = supervise(handle(&job), LEASE / 3, || {
+                let work = async {
+                    if job.kind == mail::JOB_KIND {
+                        deliver_email(&job, &mailer).await
+                    } else {
+                        handle(&job).await
+                    }
+                };
+                let outcome = supervise(work, LEASE / 3, || {
                     jobs::renew(pool, job.id, &worker_id, LEASE)
                 })
                 .await;
@@ -121,6 +172,10 @@ pub async fn run(
                 };
                 let result = match outcome {
                     Outcome::Done => jobs::complete(db.pool(), job.id, &worker_id).await,
+                    Outcome::GiveUp(reason) => {
+                        tracing::warn!(job = %job.id, kind = %job.kind, "job given up: {reason}");
+                        jobs::abandon(db.pool(), job.id, &worker_id, &reason).await
+                    }
                     Outcome::Retry(reason) => {
                         tracing::warn!(job = %job.id, kind = %job.kind, attempts = job.attempts, "job failed");
                         jobs::fail(
@@ -161,6 +216,61 @@ mod tests {
             attempts: 1,
             idempotency_key: None,
         }
+    }
+
+    #[tokio::test]
+    async fn an_email_job_is_done_retried_or_given_up_by_what_the_sender_says() {
+        use orbyn_core::mail::{Capture, Kind, Mail, SendError, SendFuture};
+
+        struct Says(Result<(), SendError>);
+        impl Sender for Says {
+            fn send<'a>(&'a self, _: &'a Mail) -> SendFuture<'a> {
+                let answer = self.0.clone();
+                Box::pin(async move { answer })
+            }
+        }
+        let secrets = Arc::new(AuthSecrets::from_encoded(&AuthSecrets::generate()).expect("setup"));
+        let mail = Mail {
+            kind: Kind::VerifyEmail,
+            account: Some(uuid::Uuid::new_v4()),
+            to: "sam@example.com".into(),
+            code: Some("123456".into()),
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let mut j = job(mail::JOB_KIND);
+        j.payload = mail::payload(&secrets, j.id, &mail, now).expect("payload");
+        let mailer = |sender: Arc<dyn Sender>| Mailer {
+            secrets: Some(secrets.clone()),
+            sender,
+        };
+
+        let capture = Capture::default();
+        assert_eq!(
+            deliver_email(&j, &mailer(Arc::new(capture.clone()))).await,
+            Outcome::Done
+        );
+        assert_eq!(capture.sent(), vec![mail.clone()]);
+        let busy = Says(Err(SendError {
+            reason: "the mail server did not take the message",
+            permanent: false,
+        }));
+        assert!(matches!(
+            deliver_email(&j, &mailer(Arc::new(busy))).await,
+            Outcome::Retry(_)
+        ));
+        let refused = Says(Err(SendError {
+            reason: "refused",
+            permanent: true,
+        }));
+        assert_eq!(
+            deliver_email(&j, &mailer(Arc::new(refused))).await,
+            Outcome::GiveUp("refused".into())
+        );
+        // With no SMTP, the log-only mailer finishes the job and sends nothing.
+        assert_eq!(deliver_email(&j, &Mailer::log_only()).await, Outcome::Done);
     }
 
     #[tokio::test]

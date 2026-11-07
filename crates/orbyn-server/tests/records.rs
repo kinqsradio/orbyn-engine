@@ -29,6 +29,27 @@ use uuid::Uuid;
 /// One server setup for the run: a password record only works with its setup.
 static SETUP: OnceLock<String> = OnceLock::new();
 
+/// Every message the tests' sign-ups sent, shared by the tests of this binary: whichever test
+/// delivers the queue, the rest find their code here.
+static MAILBOX: OnceLock<orbyn_core::mail::Capture> = OnceLock::new();
+
+/// The verification code sent to `email`: delivers the queue into the shared mailbox until it shows.
+async fn code_sent_to(pool: &orbyn_core::sqlx::PgPool, email: &str) -> String {
+    let mailbox = MAILBOX.get_or_init(orbyn_core::mail::Capture::default);
+    let secrets = AuthSecrets::from_encoded(SETUP.get().expect("setup")).expect("setup");
+    let to = auth::normalize_email(email).expect("email");
+    for _ in 0..200 {
+        orbyn_core::mail::deliver_queued(pool, &secrets, mailbox)
+            .await
+            .expect("deliver");
+        if let Some(code) = mailbox.code_for(&to) {
+            return code;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("no verification code was sent to {to}");
+}
+
 struct Up;
 impl Readiness for Up {
     fn database_ready(&self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
@@ -163,7 +184,7 @@ impl Server {
             auth::DEVICE_REGISTER_CONTEXT,
             &auth::register_message(&normalized, &finish.upload, &keys.public()),
         );
-        let (status, session) = self
+        let (status, pending) = self
             .call(
                 Method::POST,
                 "/v1/accounts/register/finish",
@@ -174,6 +195,16 @@ impl Server {
                     "device": device_json("Laptop", &keys.public()),
                     "device_signature": b64(&signature),
                 })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{pending}");
+        let code = code_sent_to(self.db.pool(), &email).await;
+        let (status, session) = self
+            .call(
+                Method::POST,
+                "/v1/accounts/email/verify",
+                None,
+                Some(json!({"signup_id": pending["signup_id"], "code": code})),
             )
             .await;
         assert_eq!(status, StatusCode::CREATED, "{session}");

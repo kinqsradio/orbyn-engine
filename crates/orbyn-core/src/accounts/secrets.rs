@@ -43,6 +43,7 @@ const STATE_KEY_INFO: &[u8] = b"orbyn/auth-state-key/v1";
 const DIGEST_KEY_INFO: &[u8] = b"orbyn/auth-digest-key/v1";
 const TOTP_KEY_INFO: &[u8] = b"orbyn/totp-seal/v1";
 const TOTP_SECRET_CONTEXT: &str = "orbyn/totp-secret/v1";
+const MAIL_CONTEXT: &str = "orbyn/mail-job/v1";
 
 impl AuthSecrets {
     /// A new value for `ORBYN_AUTH_SETUP`, base64url without padding.
@@ -94,12 +95,30 @@ impl AuthSecrets {
             .map(|sealed| sealed.to_bytes())
     }
 
+    /// An outgoing email's address and code sealed for the job queue, so neither rests in the
+    /// `jobs` table in the clear. `aad` binds what the payload says about itself (its kind and
+    /// account), so a sealed body moved to another job does not open.
+    pub(crate) fn seal_mail(&self, aad: &[u8], plaintext: &[u8]) -> Option<Vec<u8>> {
+        self.state_key
+            .seal(MAIL_CONTEXT, aad, plaintext)
+            .ok()
+            .map(|sealed| sealed.to_bytes())
+    }
+
     /// The secret [`AuthSecrets::seal_totp`] sealed, or `None` for another account, another setup
     /// or changed bytes.
     pub(crate) fn open_totp(&self, account: Uuid, sealed: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
         let sealed = Sealed::from_bytes(sealed).ok()?;
         self.totp_key
             .open(TOTP_SECRET_CONTEXT, account.as_bytes(), &sealed)
+            .ok()
+            .map(Zeroizing::new)
+    }
+
+    pub(crate) fn open_mail(&self, aad: &[u8], sealed: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+        let sealed = Sealed::from_bytes(sealed).ok()?;
+        self.state_key
+            .open(MAIL_CONTEXT, aad, &sealed)
             .ok()
             .map(Zeroizing::new)
     }
