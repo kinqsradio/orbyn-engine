@@ -172,6 +172,9 @@ fn with_newline(mut text: String) -> String {
 }
 
 async fn serve(config: Config) -> Result<(), String> {
+    if config.mail_log_codes {
+        warn_log_codes();
+    }
     let db = Database::connect_lazy_with_pool(&config.database_url, config.database_pool_size)
         .map_err(|e| e.to_string())?;
     let mut state = orbyn_server::AppState::new(Arc::new(db.clone()));
@@ -235,6 +238,11 @@ async fn serve(config: Config) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// The loud start-up warning of `ORBYN_MAIL=log-codes`, written by the server and the worker alike.
+fn warn_log_codes() {
+    tracing::warn!("{}", orbyn_core::mail::LOG_CODES_WARNING);
+}
+
 /// How the worker sends email: over SMTP, which must be configured, unless `ORBYN_MAIL=log` asks
 /// for development mode, which logs that a message was not sent and sends nothing. SMTP needs
 /// `ORBYN_AUTH_SETUP` to open a queued message; in log mode, without it every message is logged as
@@ -246,6 +254,17 @@ fn mailer(config: &Config) -> Result<orbyn_worker::Mailer, String> {
         )),
         None => None,
     };
+    // Staging only: the configuration has already refused this anywhere else. It wins over SMTP,
+    // since it was asked for by name.
+    if config.mail_log_codes {
+        warn_log_codes();
+        return Ok(orbyn_worker::Mailer {
+            secrets,
+            account_url: config.account_url.clone(),
+            push: std::sync::Arc::new(orbyn_core::push::NoPush),
+            sender: std::sync::Arc::new(orbyn_core::mail::LogCodes),
+        });
+    }
     match (&config.smtp_url, &config.mail_from) {
         (Some(url), Some(from)) => {
             if secrets.is_none() {
@@ -445,5 +464,136 @@ mod tests {
             "error: the worker has ORBYN_SMTP_URL but no ORBYN_AUTH_SETUP\n  The worker needs ORBYN_AUTH_SETUP to open queued messages. Set it to\n  the same value the server uses."
         );
         assert!(error.lines().skip(1).all(|l| l.len() <= 72));
+    }
+
+    // ---- ORBYN_MAIL=log-codes ----
+
+    #[derive(Clone, Default)]
+    struct Logs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("lock").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
+        type Writer = Logs;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn capture() -> (Logs, tracing::subscriber::DefaultGuard) {
+        let logs = Logs::default();
+        let guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .without_time()
+                .finish(),
+        );
+        (logs, guard)
+    }
+
+    /// The settings of a staging worker, with a real setup to open messages.
+    fn staging(setup: &str) -> [(&str, &str); 3] {
+        [
+            ("ORBYN_MAIL", "log-codes"),
+            ("ORBYN_ENV", "staging"),
+            ("ORBYN_AUTH_SETUP", setup),
+        ]
+    }
+
+    #[tokio::test]
+    async fn the_worker_in_log_codes_mode_warns_at_start_and_writes_each_code_to_the_log() {
+        let (logs, _guard) = capture();
+        let setup = orbyn_core::accounts::AuthSecrets::generate();
+        let mailer = mailer(&config(&staging(setup.as_str()))).expect("the worker starts");
+        let started = String::from_utf8_lossy(&logs.0.lock().expect("lock")).into_owned();
+        assert_eq!(started.matches("WARN").count(), 1, "{started}");
+        assert!(started.contains("ORBYN_MAIL=log-codes: codes are written to this log with the address they belong to, and no email is sent. This is for staging only."), "{started}");
+        let mail = orbyn_core::mail::Mail {
+            kind: orbyn_core::mail::Kind::VerifyEmail,
+            account: None,
+            to: "sam@example.com".to_owned(),
+            code: Some("482913".to_owned()),
+        };
+        mailer.sender.send(&mail).await.expect("sent");
+        let all = String::from_utf8_lossy(&logs.0.lock().expect("lock")).into_owned();
+        assert!(
+            all.contains(
+                "WARN orbyn_core::mail: staging only, not emailed: code 482913 for sam@example.com"
+            ),
+            "{all}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_server_and_the_worker_both_refuse_log_codes_outside_staging() {
+        // The check is in the configuration both read, so neither process gets as far as a mailer.
+        for (name, pairs) in [
+            ("no ORBYN_ENV", vec![("ORBYN_MAIL", "log-codes")]),
+            (
+                "open sign-up",
+                vec![
+                    ("ORBYN_MAIL", "log-codes"),
+                    ("ORBYN_ENV", "staging"),
+                    ("ORBYN_SIGNUP", "open"),
+                ],
+            ),
+            (
+                "production host",
+                vec![
+                    ("ORBYN_MAIL", "log-codes"),
+                    ("ORBYN_ENV", "staging"),
+                    ("ORBYN_AUTH_SETUP", "a-setup"),
+                    ("ORBYN_ACCOUNT_URL", "https://account.orbyn.dev"),
+                ],
+            ),
+            (
+                "no ORBYN_AUTH_SETUP",
+                vec![("ORBYN_MAIL", "log-codes"), ("ORBYN_ENV", "staging")],
+            ),
+        ] {
+            let mut all = vec![("DATABASE_URL", "postgres://x")];
+            all.extend(pairs);
+            let error = Config::from_lookup(|n| {
+                all.iter()
+                    .find(|(k, _)| *k == n)
+                    .map(|(_, v)| (*v).to_owned())
+            })
+            .expect_err(name);
+            assert!(
+                error.is_operator_message(),
+                "{name}: printed to stderr as it is"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn plain_log_mode_warns_as_before_and_logs_no_code() {
+        let (logs, _guard) = capture();
+        let mailer = mailer(&config(&[("ORBYN_MAIL", "log")])).expect("log mode");
+        let mail = orbyn_core::mail::Mail {
+            kind: orbyn_core::mail::Kind::VerifyEmail,
+            account: None,
+            to: "sam@example.com".to_owned(),
+            code: Some("482913".to_owned()),
+        };
+        mailer.sender.send(&mail).await.expect("sent");
+        let all = String::from_utf8_lossy(&logs.0.lock().expect("lock")).into_owned();
+        assert!(
+            all.contains("ORBYN_MAIL=log: email is logged as not sent, and nothing is sent"),
+            "{all}"
+        );
+        assert!(
+            !all.contains("482913") && !all.contains("sam@example.com"),
+            "{all}"
+        );
     }
 }

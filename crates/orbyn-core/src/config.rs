@@ -50,6 +50,10 @@ pub struct Config {
     /// `ORBYN_MAIL=log`: the worker sends nothing and logs each message as not sent. For
     /// development only; sign-up works but nobody receives a code.
     pub mail_log_only: bool,
+    /// `ORBYN_MAIL=log-codes`: for **staging only**, the worker writes each verification code and the
+    /// address it belongs to in the log, and sends nothing. It starts only with `ORBYN_ENV=staging`
+    /// and invite-only sign-up, and never with a production address (see [`production_host`]).
+    pub mail_log_codes: bool,
     /// The address email is sent from. Required with `smtp_url`.
     pub mail_from: Option<String>,
     /// Where the account site is served (`ORBYN_ACCOUNT_URL`, `https://` or a localhost address):
@@ -69,7 +73,15 @@ impl ConfigError {
     /// Whether the message is written for the operator (it starts `error: ` and has its own
     /// hint lines), to be printed to stderr as it is.
     pub fn is_operator_message(&self) -> bool {
-        matches!(self, Self::MissingMailFrom | Self::CaFileWithoutSmtp)
+        matches!(
+            self,
+            Self::MissingMailFrom
+                | Self::CaFileWithoutSmtp
+                | Self::LogCodesNotStaging
+                | Self::LogCodesNeedsInvite
+                | Self::LogCodesProductionHost(_)
+                | Self::LogCodesNeedsAuthSetup
+        )
     }
 }
 
@@ -89,6 +101,7 @@ impl std::fmt::Debug for Config {
             .field("mail_from", &self.mail_from)
             .field("account_url", &self.account_url)
             .field("smtp_ca_file", &self.smtp_ca_file)
+            .field("mail_log_codes", &self.mail_log_codes)
             .field("signup", &self.signup)
             .finish()
     }
@@ -116,12 +129,70 @@ pub enum ConfigError {
         "error: ORBYN_SMTP_CA_FILE is set, but ORBYN_SMTP_URL isn't\n  The CA file only applies to mail sent through ORBYN_SMTP_URL. Set\n  ORBYN_SMTP_URL, or unset ORBYN_SMTP_CA_FILE."
     )]
     CaFileWithoutSmtp,
-    #[error("ORBYN_MAIL can only be `log`")]
+    #[error("ORBYN_MAIL can only be `log` or `log-codes`")]
     InvalidMailMode,
     #[error("ORBYN_ACCOUNT_URL must be an https:// address (http:// only for localhost)")]
     InvalidAccountUrl,
     #[error("ORBYN_SIGNUP can only be `invite` or `open`")]
     InvalidSignup,
+    // The three refusals of `ORBYN_MAIL=log-codes`, as designed (Account Designs v55, frame
+    // `em-ops-log-codes-refused`).
+    #[error(
+        "error: ORBYN_MAIL=log-codes is for staging only\n  Set ORBYN_ENV=staging to use it, or set ORBYN_SMTP_URL to send real email."
+    )]
+    LogCodesNotStaging,
+    #[error(
+        "error: ORBYN_MAIL=log-codes needs invite-only sign-up\n  Set ORBYN_SIGNUP=invite, so only people with an invite can create accounts while codes are in the log."
+    )]
+    LogCodesNeedsInvite,
+    /// The production host that was found, as the check read it.
+    #[error(
+        "error: ORBYN_MAIL=log-codes can't be used with a production address ({0})\n  Remove api.orbyn.dev, account.orbyn.dev, engineer.orbyn.dev and orbyn.dev from the account URL and the allowed origins.\n  Production never writes codes to the log."
+    )]
+    LogCodesProductionHost(String),
+    /// Without the setup the worker cannot open a queued message, so no code would be logged.
+    #[error(
+        "error: ORBYN_MAIL=log-codes needs ORBYN_AUTH_SETUP\n  Without it the worker can\u{2019}t open messages, so no codes would be logged. Set ORBYN_AUTH_SETUP, or set ORBYN_SMTP_URL to send real email."
+    )]
+    LogCodesNeedsAuthSetup,
+}
+
+/// The hosts of the production deployment. A match is on the host name itself, case-insensitively
+/// and ignoring a trailing dot, the port, a path and any user part, not on the text: so
+/// `https://Account.Orbyn.Dev.:443/x` and `https://x@account.orbyn.dev` are `account.orbyn.dev`,
+/// while the staging hosts (`api-staging.orbyn.dev`, `account-staging.orbyn.dev`) are not.
+pub const PRODUCTION_HOSTS: [&str; 5] = [
+    "api.orbyn.dev",
+    "account.orbyn.dev",
+    "engineer.orbyn.dev",
+    "orbyn.dev",
+    "www.orbyn.dev",
+];
+
+/// The host an address names, lower case, without a trailing dot, or `None` when it names none.
+fn host_of(address: &str) -> Option<String> {
+    let rest = address.trim();
+    let rest = rest.split_once("://").map_or(rest, |(_, after)| after);
+    // The authority ends at the first of `/`, `?` or `#`; a user part ends at its last `@`.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, after)| after);
+    let host = if let Some(inner) = host_port.strip_prefix('[') {
+        inner.split(']').next().unwrap_or("")
+    } else {
+        host_port.split(':').next().unwrap_or("")
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    (!host.is_empty()).then_some(host)
+}
+
+/// The first production host any of `addresses` names, if one does.
+pub fn production_host<'a>(addresses: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    addresses
+        .into_iter()
+        .filter_map(host_of)
+        .find(|host| PRODUCTION_HOSTS.contains(&host.as_str()))
 }
 
 impl Config {
@@ -142,7 +213,7 @@ impl Config {
             .unwrap_or_else(|| "127.0.0.1:8080".into())
             .parse()
             .map_err(|_| ConfigError::InvalidBind)?;
-        let allowed_origins = get("ORBYN_ALLOWED_ORIGINS")
+        let allowed_origins: Vec<String> = get("ORBYN_ALLOWED_ORIGINS")
             .unwrap_or_else(|| "http://localhost:5173".into())
             .split(',')
             .map(|s| s.trim().to_owned())
@@ -200,9 +271,10 @@ impl Config {
         if smtp_ca_file.is_some() && smtp_url.is_none() {
             return Err(ConfigError::CaFileWithoutSmtp);
         }
-        let mail_log_only = match optional("ORBYN_MAIL").as_deref() {
-            None => false,
-            Some("log") => true,
+        let (mail_log_only, mail_log_codes) = match optional("ORBYN_MAIL").as_deref() {
+            None => (false, false),
+            Some("log") => (true, false),
+            Some("log-codes") => (false, true),
             Some(_) => return Err(ConfigError::InvalidMailMode),
         };
         let account_url = optional("ORBYN_ACCOUNT_URL");
@@ -219,6 +291,27 @@ impl Config {
             Some("open") => SignupMode::Open,
             Some(_) => return Err(ConfigError::InvalidSignup),
         };
+        if mail_log_codes {
+            // Staging only, in this order: the environment, then the sign-up mode, then the hosts.
+            if optional("ORBYN_ENV").as_deref() != Some("staging") {
+                return Err(ConfigError::LogCodesNotStaging);
+            }
+            if signup != SignupMode::Invite {
+                return Err(ConfigError::LogCodesNeedsInvite);
+            }
+            let named = account_url
+                .iter()
+                .map(String::as_str)
+                .chain(allowed_origins.iter().map(String::as_str));
+            if let Some(host) = production_host(named) {
+                return Err(ConfigError::LogCodesProductionHost(host));
+            }
+            // Last: the worker opens each queued message with the setup, so without it there is
+            // no code to write, and the mode would run and say nothing.
+            if optional("ORBYN_AUTH_SETUP").is_none() {
+                return Err(ConfigError::LogCodesNeedsAuthSetup);
+            }
+        }
         Ok(Self {
             database_url,
             bind,
@@ -231,6 +324,7 @@ impl Config {
             database_pool_size,
             smtp_url,
             mail_log_only,
+            mail_log_codes,
             mail_from,
             account_url,
             smtp_ca_file,
@@ -456,5 +550,284 @@ mod tests {
             assert!(message.to_string().lines().skip(1).all(|l| l.len() <= 72));
         }
         assert!(!ConfigError::InvalidMailMode.is_operator_message());
+    }
+
+    // ---- ORBYN_MAIL=log-codes: staging only ----
+
+    fn log_codes(extra: &[(&str, &str)]) -> Result<Config, ConfigError> {
+        let mut pairs = vec![
+            ("DATABASE_URL", "postgres://x"),
+            ("ORBYN_MAIL", "log-codes"),
+            ("ORBYN_ENV", "staging"),
+            ("ORBYN_AUTH_SETUP", "a-setup"),
+        ];
+        pairs.extend_from_slice(extra);
+        // A later pair for the same name replaces an earlier one.
+        let mut map: HashMap<String, String> = HashMap::new();
+        for (k, v) in pairs {
+            map.insert(k.to_owned(), v.to_owned());
+        }
+        Config::from_lookup(move |name| map.get(name).cloned())
+    }
+
+    fn without(name: &str) -> impl Fn(&str) -> Option<String> {
+        let name = name.to_owned();
+        move |asked| {
+            if asked == name {
+                return None;
+            }
+            match asked {
+                "DATABASE_URL" => Some("postgres://x".to_owned()),
+                "ORBYN_MAIL" => Some("log-codes".to_owned()),
+                "ORBYN_ENV" => Some("staging".to_owned()),
+                "ORBYN_AUTH_SETUP" => Some("a-setup".to_owned()),
+                _ => None,
+            }
+        }
+    }
+
+    #[test]
+    fn log_codes_starts_only_on_staging_with_invite_only_sign_up_and_no_production_address() {
+        let allowed = log_codes(&[]).expect("the allowed combination starts");
+        assert!(allowed.mail_log_codes && !allowed.mail_log_only);
+        // Sign-up is invite-only by default, and said out loud it is the same.
+        assert_eq!(allowed.signup, SignupMode::Invite);
+        assert!(
+            log_codes(&[("ORBYN_SIGNUP", "invite")])
+                .expect("explicit")
+                .mail_log_codes
+        );
+        // Staging's own hosts are not production hosts.
+        let staging = log_codes(&[
+            ("ORBYN_ACCOUNT_URL", "https://account-staging.orbyn.dev"),
+            (
+                "ORBYN_ALLOWED_ORIGINS",
+                "https://api-staging.orbyn.dev, https://engineer-staging.orbyn.dev, http://localhost:5173",
+            ),
+        ])
+        .expect("staging hosts");
+        assert!(staging.mail_log_codes);
+        // A host that merely contains a production name is another host.
+        for host in [
+            "https://account.orbyn.dev.example.com",
+            "https://notorbyn.dev",
+            "https://account-orbyn.dev",
+            "https://orbyn.dev.example.com/account.orbyn.dev",
+        ] {
+            assert!(log_codes(&[("ORBYN_ACCOUNT_URL", host)]).is_ok(), "{host}");
+        }
+    }
+
+    #[test]
+    fn log_codes_is_refused_without_staging_in_every_spelling_of_not_staging() {
+        // No ORBYN_ENV at all.
+        assert_eq!(
+            Config::from_lookup(without("ORBYN_ENV")).err(),
+            Some(ConfigError::LogCodesNotStaging)
+        );
+        for env in [
+            "",
+            " ",
+            "production",
+            "prod",
+            "Staging",
+            "STAGING",
+            "staging2",
+            "development",
+        ] {
+            assert_eq!(
+                log_codes(&[("ORBYN_ENV", env)]).err(),
+                Some(ConfigError::LogCodesNotStaging),
+                "{env:?}"
+            );
+        }
+        assert!(ConfigError::LogCodesNotStaging.is_operator_message());
+    }
+
+    #[test]
+    fn log_codes_is_refused_without_the_setup_that_opens_messages() {
+        assert_eq!(
+            Config::from_lookup(without("ORBYN_AUTH_SETUP")).err(),
+            Some(ConfigError::LogCodesNeedsAuthSetup)
+        );
+        // Blank is not set.
+        assert_eq!(
+            log_codes(&[("ORBYN_AUTH_SETUP", "  ")]).err(),
+            Some(ConfigError::LogCodesNeedsAuthSetup)
+        );
+        assert!(ConfigError::LogCodesNeedsAuthSetup.is_operator_message());
+        assert_eq!(
+            ConfigError::LogCodesNeedsAuthSetup.to_string(),
+            "error: ORBYN_MAIL=log-codes needs ORBYN_AUTH_SETUP\n  Without it the worker can\u{2019}t open messages, so no codes would be logged. Set ORBYN_AUTH_SETUP, or set ORBYN_SMTP_URL to send real email."
+        );
+        // It is the last of the four: the others are named first when they are wrong too.
+        let nothing_set = |extra: &[(&str, &str)]| {
+            let mut pairs = vec![
+                ("DATABASE_URL", "postgres://x"),
+                ("ORBYN_MAIL", "log-codes"),
+            ];
+            pairs.extend_from_slice(extra);
+            Config::from_lookup(lookup(&pairs)).err()
+        };
+        assert_eq!(nothing_set(&[]), Some(ConfigError::LogCodesNotStaging));
+        assert_eq!(
+            nothing_set(&[("ORBYN_ENV", "staging"), ("ORBYN_SIGNUP", "open")]),
+            Some(ConfigError::LogCodesNeedsInvite)
+        );
+        assert_eq!(
+            nothing_set(&[
+                ("ORBYN_ENV", "staging"),
+                ("ORBYN_ACCOUNT_URL", "https://account.orbyn.dev")
+            ]),
+            Some(ConfigError::LogCodesProductionHost(
+                "account.orbyn.dev".into()
+            ))
+        );
+        assert_eq!(
+            nothing_set(&[("ORBYN_ENV", "staging")]),
+            Some(ConfigError::LogCodesNeedsAuthSetup)
+        );
+    }
+
+    #[test]
+    fn log_codes_is_refused_when_sign_up_is_open() {
+        assert_eq!(
+            log_codes(&[("ORBYN_SIGNUP", "open")]).err(),
+            Some(ConfigError::LogCodesNeedsInvite)
+        );
+        assert!(ConfigError::LogCodesNeedsInvite.is_operator_message());
+    }
+
+    #[test]
+    fn log_codes_is_refused_for_each_production_host_in_the_account_url_and_in_the_origins() {
+        let spellings = [
+            ("api.orbyn.dev", "https://api.orbyn.dev"),
+            ("account.orbyn.dev", "https://account.orbyn.dev"),
+            ("engineer.orbyn.dev", "https://engineer.orbyn.dev"),
+            ("orbyn.dev", "https://orbyn.dev"),
+            ("www.orbyn.dev", "https://www.orbyn.dev"),
+            // The same hosts, spelled to get past a text match.
+            ("account.orbyn.dev", "https://ACCOUNT.Orbyn.Dev"),
+            ("account.orbyn.dev", "https://account.orbyn.dev:443"),
+            ("account.orbyn.dev", "https://account.orbyn.dev./"),
+            (
+                "account.orbyn.dev",
+                "https://account.orbyn.dev/sign-in?next=/x#y",
+            ),
+            ("account.orbyn.dev", "https://someone@account.orbyn.dev"),
+            (
+                "account.orbyn.dev",
+                "https://staging:secret@account.orbyn.dev:8443/x",
+            ),
+            ("account.orbyn.dev", "http://account.orbyn.dev"),
+            ("orbyn.dev", "https://orbyn.dev."),
+            ("account.orbyn.dev", "account.orbyn.dev"),
+        ];
+        for (host, address) in spellings {
+            // An account URL must be https (or localhost) to be one at all; a plain-http or
+            // scheme-less production address is refused as an account URL before the host is
+            // looked at, which is a refusal too, so only the origins are held to the host check.
+            let account = log_codes(&[("ORBYN_ACCOUNT_URL", address)]).err();
+            if address.starts_with("https://") {
+                assert_eq!(
+                    account,
+                    Some(ConfigError::LogCodesProductionHost(host.to_owned())),
+                    "account url {address}"
+                );
+            } else {
+                assert!(account.is_some(), "account url {address} is refused");
+            }
+            // In the allowed origins, alone and among others.
+            let origins =
+                format!("http://localhost:5173, {address}, https://api-staging.orbyn.dev");
+            assert_eq!(
+                log_codes(&[("ORBYN_ALLOWED_ORIGINS", &origins)]).err(),
+                Some(ConfigError::LogCodesProductionHost(host.to_owned())),
+                "origin {address}"
+            );
+        }
+        assert!(ConfigError::LogCodesProductionHost("x".into()).is_operator_message());
+    }
+
+    #[test]
+    fn the_three_refusals_are_the_designed_text_and_come_in_the_designed_order() {
+        assert_eq!(
+            ConfigError::LogCodesNotStaging.to_string(),
+            "error: ORBYN_MAIL=log-codes is for staging only\n  Set ORBYN_ENV=staging to use it, or set ORBYN_SMTP_URL to send real email."
+        );
+        assert_eq!(
+            ConfigError::LogCodesNeedsInvite.to_string(),
+            "error: ORBYN_MAIL=log-codes needs invite-only sign-up\n  Set ORBYN_SIGNUP=invite, so only people with an invite can create accounts while codes are in the log."
+        );
+        for host in ["account.orbyn.dev", "orbyn.dev"] {
+            assert_eq!(
+                ConfigError::LogCodesProductionHost(host.to_owned()).to_string(),
+                format!(
+                    "error: ORBYN_MAIL=log-codes can't be used with a production address ({host})\n  Remove api.orbyn.dev, account.orbyn.dev, engineer.orbyn.dev and orbyn.dev from the account URL and the allowed origins.\n  Production never writes codes to the log."
+                )
+            );
+        }
+        // Everything wrong at once: the environment is named first, then the sign-up, then the host.
+        assert_eq!(
+            log_codes(&[
+                ("ORBYN_ENV", "production"),
+                ("ORBYN_SIGNUP", "open"),
+                ("ORBYN_ACCOUNT_URL", "https://account.orbyn.dev"),
+            ])
+            .err(),
+            Some(ConfigError::LogCodesNotStaging)
+        );
+        assert_eq!(
+            log_codes(&[
+                ("ORBYN_SIGNUP", "open"),
+                ("ORBYN_ACCOUNT_URL", "https://account.orbyn.dev")
+            ])
+            .err(),
+            Some(ConfigError::LogCodesNeedsInvite)
+        );
+    }
+
+    #[test]
+    fn plain_log_mode_is_unchanged_and_asks_nothing_of_the_environment() {
+        // It never writes an address or a code, so it needs no staging, no invites, and any host.
+        let config = Config::from_lookup(lookup(&[
+            ("DATABASE_URL", "postgres://x"),
+            ("ORBYN_MAIL", "log"),
+            ("ORBYN_SIGNUP", "open"),
+            ("ORBYN_ACCOUNT_URL", "https://account.orbyn.dev"),
+        ]))
+        .expect("log mode");
+        assert!(config.mail_log_only && !config.mail_log_codes);
+        // And no other value is a mail mode.
+        for bad in ["log-code", "logcodes", "LOG-CODES", "codes", "smtp"] {
+            assert_eq!(
+                Config::from_lookup(lookup(&[
+                    ("DATABASE_URL", "postgres://x"),
+                    ("ORBYN_MAIL", bad)
+                ]))
+                .err(),
+                Some(ConfigError::InvalidMailMode),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_production_host_is_judged_by_its_host_name_not_its_text() {
+        assert_eq!(
+            production_host(["https://api.orbyn.dev/v1"]),
+            Some("api.orbyn.dev".into())
+        );
+        assert_eq!(
+            production_host(["http://localhost:5173", "https://Engineer.Orbyn.Dev:8443"]),
+            Some("engineer.orbyn.dev".into())
+        );
+        assert_eq!(
+            production_host(["http://[::1]:8080", "http://127.0.0.1"]),
+            None
+        );
+        assert_eq!(production_host(["https://account-staging.orbyn.dev"]), None);
+        assert_eq!(production_host([""]), None);
+        assert_eq!(production_host(Vec::<&str>::new()), None);
     }
 }
