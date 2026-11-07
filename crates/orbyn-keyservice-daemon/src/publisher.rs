@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use orbyn_keyservice::Hsm;
-use orbyn_keyservice_server::{Store, StoreError};
+use orbyn_keyservice_server::{CosignMaterial, Store, StoreError};
 use orbyn_translog::UnsignedHead;
 use orbyn_witness::client::{ClientError, Cosigner, RequestSource, WitnessClient};
 use orbyn_witness::{CosignEntry, CosignRequest, MAX_ENTRIES, MAX_SKEW_MS, wire};
@@ -144,11 +144,43 @@ impl PublisherSettings {
 /// holds, the head, its stored log signature, the consistency proof and each entry's map path.
 pub struct StoreSource {
     store: Store,
+    /// The material of the last two heads asked about, by head hash. Replaying a head's entries
+    /// costs a database read per map level for each, and every witness asks for the same head: the
+    /// head is measured before it is signed, then each witness is sent it. The material of a head
+    /// never changes (the maps are content-addressed), so a copy is always right.
+    cache: std::sync::Mutex<Vec<(orbyn_translog::Hash, Arc<CosignMaterial>)>>,
 }
 
 impl StoreSource {
     pub fn new(store: Store) -> Self {
-        Self { store }
+        Self {
+            store,
+            cache: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// What a witness needs to check `head`, from the cache or the store.
+    pub async fn material(&self, head: &UnsignedHead) -> Result<Arc<CosignMaterial>, StoreError> {
+        let key = head.hash();
+        if let Some((_, found)) = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|(hash, _)| *hash == key)
+        {
+            return Ok(found.clone());
+        }
+        let material = Arc::new(self.store.cosign_material(head).await?);
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.push((key, material.clone()));
+        if cache.len() > 2 {
+            cache.remove(0);
+        }
+        Ok(material)
     }
 }
 
@@ -172,14 +204,10 @@ impl RequestSource for StoreSource {
                     tracing::warn!(event = "source_unknown_head");
                     ClientError::Source
                 })?;
-            let material = self
-                .store
-                .cosign_material(&stored.head)
-                .await
-                .map_err(|error| {
-                    tracing::warn!(event = "source_store_error", error = %error);
-                    ClientError::Source
-                })?;
+            let material = self.material(&stored.head).await.map_err(|error| {
+                tracing::warn!(event = "source_store_error", error = %error);
+                ClientError::Source
+            })?;
             let log_signature: [u8; 64] = stored
                 .log_signature
                 .as_slice()
@@ -188,14 +216,14 @@ impl RequestSource for StoreSource {
             Ok(CosignRequest {
                 head: stored.head,
                 log_signature,
-                consistency_proof: material.consistency_proof,
+                consistency_proof: material.consistency_proof.clone(),
                 entries: material
                     .entries
-                    .into_iter()
+                    .iter()
                     .map(|e| CosignEntry {
-                        entry: e.entry,
+                        entry: e.entry.clone(),
                         chain_len: e.chain_len,
-                        path: e.path,
+                        path: e.path.clone(),
                     })
                     .collect(),
                 intermediate: false,
@@ -291,18 +319,18 @@ impl<H: Hsm + Send + Sync + 'static> Publisher<H> {
                 .store
                 .build_head(now, self.log_key_version, Some(cap))
                 .await?;
-            let material = self.state.store.cosign_material(&head).await?;
+            let material = self.source.material(&head).await?;
             let request = CosignRequest {
                 head: head.clone(),
                 log_signature: [0; 64],
-                consistency_proof: material.consistency_proof,
+                consistency_proof: material.consistency_proof.clone(),
                 entries: material
                     .entries
-                    .into_iter()
+                    .iter()
                     .map(|e| CosignEntry {
-                        entry: e.entry,
+                        entry: e.entry.clone(),
                         chain_len: e.chain_len,
-                        path: e.path,
+                        path: e.path.clone(),
                     })
                     .collect(),
                 intermediate: false,

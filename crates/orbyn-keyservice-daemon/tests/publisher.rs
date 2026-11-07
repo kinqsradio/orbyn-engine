@@ -410,7 +410,7 @@ async fn nothing_publishes_a_head_older_than_the_witness_window() {
     let signature = c.state.keys.sign_head(&head).expect("sign");
     let stale_id = store.commit_head(&head, &signature).await.expect("commit");
     // The witnesses are up, and it grows older than their window.
-    c.advance(FRESH_FOR_MS + MIN);
+    c.advance(orbyn_witness::MAX_SKEW_MS + MIN);
     // The witnesses themselves refuse it as the end of a request: that is their clock rule.
     let clients: Vec<_> = c
         .witnesses
