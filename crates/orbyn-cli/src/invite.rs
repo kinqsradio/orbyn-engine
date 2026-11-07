@@ -391,13 +391,6 @@ mod tests {
         parts.iter().map(|p| (*p).to_owned()).collect()
     }
 
-    async fn count(pool: &sqlx::PgPool) -> i64 {
-        sqlx::query_scalar("SELECT count(*) FROM invites")
-            .fetch_one(pool)
-            .await
-            .expect("count")
-    }
-
     #[tokio::test]
     #[ignore = "needs DATABASE_URL"]
     async fn create_list_and_revoke_work_end_to_end_and_the_code_is_only_in_the_create_output() {
@@ -487,55 +480,74 @@ mod tests {
     #[ignore = "needs DATABASE_URL"]
     async fn the_limits_refuse_in_the_designed_words_and_make_nothing() {
         let pool = pool().await;
-        let before = count(&pool).await;
+        // Other tests make invites too, so what is counted is this test's own label.
+        let marker = format!("limits-{}", uuid::Uuid::new_v4().simple());
+        let mine = || async {
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM invites WHERE label = $1")
+                .bind(&marker)
+                .fetch_one(&pool)
+                .await
+                .expect("count")
+        };
         assert_eq!(
-            run(&pool, &args(&["create", "--count", "101"])).await,
+            run(
+                &pool,
+                &args(&["create", "--count", "101", "--label", &marker])
+            )
+            .await,
             Err(count_too_big())
         );
         assert_eq!(
-            run(&pool, &args(&["create", "--expires-days", "91"])).await,
+            run(
+                &pool,
+                &args(&["create", "--expires-days", "91", "--label", &marker])
+            )
+            .await,
             Err(days_too_long())
         );
-        assert_eq!(
-            run(&pool, &args(&["create", "--label", "ana@example.com"])).await,
-            Err(label_has_at())
-        );
+        let named = ["create", "--label", "ana@example.com"];
+        assert_eq!(run(&pool, &args(&named)).await, Err(label_has_at()));
         assert_eq!(
             run(&pool, &args(&["create", "--label=x@y"])).await,
             Err(label_has_at())
         );
-        assert_eq!(count(&pool).await, before, "nothing was made");
+        assert_eq!(mine().await, 0, "nothing was made");
+        let label = format!("--label={marker}");
         // The edges are allowed: 90 days, and 100 at a time; the default is 14 days and one invite.
-        let tag = format!("edge-{}", uuid::Uuid::new_v4().simple());
         let out = run(
             &pool,
-            &args(&[
-                "create",
-                "--count=100",
-                "--expires-days=90",
-                &format!("--label={tag}"),
-            ]),
+            &args(&["create", "--count=100", "--expires-days=90", &label]),
         )
         .await
         .expect("100 invites");
         assert_eq!(out.lines().count(), 101);
-        assert_eq!(count(&pool).await, before + 100);
-        let plain = run(&pool, &args(&["create"])).await.expect("one");
-        assert!(plain.starts_with("Created 1 invite. Each code is shown once. Save it now.\n"));
+        assert_eq!(mine().await, 100);
         let days: i32 = sqlx::query_scalar(
-            "SELECT round(extract(epoch FROM expires_at - created_at) / 86400)::int FROM invites ORDER BY created_at DESC LIMIT 1",
+            "SELECT round(extract(epoch FROM expires_at - created_at) / 86400)::int FROM invites WHERE label = $1 LIMIT 1",
         )
+        .bind(&marker)
         .fetch_one(&pool)
         .await
         .expect("days");
-        assert_eq!(days, 14);
+        assert_eq!(days, 90);
+        let plain = run(&pool, &args(&["create", "--label", &marker]))
+            .await
+            .expect("one");
+        assert!(plain.starts_with("Created 1 invite. Each code is shown once. Save it now.\n"));
+        let default_days: i32 = sqlx::query_scalar(
+            "SELECT round(extract(epoch FROM expires_at - created_at) / 86400)::int FROM invites WHERE label = $1 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(&marker)
+        .fetch_one(&pool)
+        .await
+        .expect("days");
+        assert_eq!(default_days, 14);
     }
 
     #[tokio::test]
     #[ignore = "needs DATABASE_URL"]
     async fn a_usage_problem_the_design_has_no_text_for_prints_the_help() {
         let pool = pool().await;
-        let before = count(&pool).await;
         for bad in [
             &[][..],
             &["frobnicate"],
@@ -551,7 +563,6 @@ mod tests {
             let text = result.expect_err("a usage problem is an error");
             assert!(text == HELP || text == CREATE_HELP, "{bad:?}: {text}");
         }
-        assert_eq!(count(&pool).await, before);
         // Help, asked for, is not an error.
         assert_eq!(run(&pool, &args(&["--help"])).await, Ok(HELP.to_owned()));
         assert_eq!(

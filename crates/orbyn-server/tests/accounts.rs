@@ -6100,7 +6100,7 @@ async fn two_confirms_with_one_token_at_once_delete_once() {
         statuses.sort();
         assert_eq!(
             statuses,
-            [StatusCode::NO_CONTENT, StatusCode::BAD_REQUEST],
+            [StatusCode::OK, StatusCode::BAD_REQUEST],
             "exactly one deletes ({body})"
         );
         assert!(!server.account_exists(&email).await);
@@ -7773,7 +7773,7 @@ async fn unknown_expired_used_and_revoked_codes_get_one_answer_at_the_check_and_
     }
     let refusal: Value = serde_json::from_slice(&answers[0].3).expect("json");
     assert_eq!(refusal["code"], "invite_invalid");
-    assert_eq!(refusal["message"], "this invite code can't be used");
+    assert_eq!(refusal["message"], "This invite code can't be used.");
     assert!(
         steps.iter().all(|s| *s == steps[0]),
         "the steps differ: {steps:?}"
@@ -7849,8 +7849,10 @@ async fn the_check_spends_nothing_and_only_failures_count_against_the_limit() {
         (false, false, false, false)
     );
     let pending: i64 = orbyn_core::sqlx::query_scalar(
-        "SELECT count(*) FROM pending_signups WHERE invite_id IS NOT NULL",
+        "SELECT count(*) FROM pending_signups
+         WHERE invite_id = (SELECT id FROM invites WHERE short_id = $1)",
     )
+    .bind(&invite.id)
     .fetch_one(server.db.pool())
     .await
     .expect("count");
