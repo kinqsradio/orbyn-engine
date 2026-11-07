@@ -280,7 +280,7 @@ A cancel is a statement signed by a device (`orbyn/recovery-cancel/v1`: account,
    - its own deployment, store, test HSM trait and SoftHSM implementation;
    - `orbyn keyservice init`, identity pinning and service-key certification;
    - the transparency log and the off-machine audit.
-4. **Service envelopes**: the recipient kind, `GET /v1/keychain/service-key`, client wrapping and verification, and backfill for Standard accounts.
+4. **Service envelopes**: the recipient kind, `GET /v1/keychain/service-key`, client wrapping and verification, and backfill for Standard accounts. The contract, the migration and the order against 3c's PRs 5 and 6 are in [key-service-4.md](key-service-4.md).
 5. **Recovery**: the states, routes, worker emails, the finish claim and transaction, rotation after recovery, and the client trust rules.
 6. **Planner**:
    - Standard protection in settings, saying plainly what Orbyn can read and what an account without a second factor means;
