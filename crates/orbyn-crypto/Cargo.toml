@@ -1,5 +1,6 @@
 [package]
 name = "orbyn-crypto"
+license = "MIT OR Apache-2.0"
 description = "Keys, sealing, key wrapping, signatures and recovery keys for Orbyn devices."
 version.workspace = true
 edition.workspace = true

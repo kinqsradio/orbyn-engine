@@ -94,6 +94,9 @@ jobs:
           components: rustfmt
       - if: env.RUST == 'true'
         run: cargo fmt --all --check
+      # No app-side (MIT OR Apache-2.0) crate may depend on a server-side (AGPL-3.0-only) one.
+      - if: env.RUST == 'true'
+        run: python3 scripts/check_licence_split.py
 
   # The Rust lane: lint, the whole workspace with the Postgres tests against a service container, the web build of the
   # device crates, and the committed wire types. The one lane a pull request always runs (unless it only touches docs).

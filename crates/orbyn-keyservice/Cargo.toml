@@ -1,5 +1,6 @@
 [package]
 name = "orbyn-keyservice"
+license = "AGPL-3.0-only"
 description = "The key service library: an HSM trait, service-key certification and opening service envelopes."
 version.workspace = true
 edition.workspace = true

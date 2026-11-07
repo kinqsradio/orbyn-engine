@@ -1,5 +1,6 @@
 [package]
 name = "orbyn-client"
+license = "MIT OR Apache-2.0"
 description = "The device sync engine: encrypts planner records and syncs them through the record store. No IO; a host drives it."
 version.workspace = true
 edition.workspace = true

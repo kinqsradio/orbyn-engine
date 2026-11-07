@@ -1,5 +1,6 @@
 [package]
 name = "orbyn-sync"
+license = "MIT OR Apache-2.0"
 description = "Hybrid logical clocks and field-by-field merge for Orbyn records."
 version.workspace = true
 edition.workspace = true

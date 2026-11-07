@@ -1,5 +1,6 @@
 [package]
 name = "orbyn-planner"
+license = "MIT OR Apache-2.0"
 description = "Planner rules: tasks, events, lists and repeat rules. Runs on every device."
 version.workspace = true
 edition.workspace = true
