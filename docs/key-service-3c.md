@@ -1,0 +1,138 @@
+# Key service, step 3c: the binary, the log and the witness
+
+A design note for review before any code. It plans what [key-service.md](key-service.md) calls "its own deployment, store, … the transparency log", on top of what has landed: 3a (`wrap_key_p256`, engine#40) and 3b (the `orbyn-keyservice` library: the `Hsm` trait, SoftHSM, certification, opening an envelope, `orbyn keyservice init`, engine#43). Nothing here changes a rule in key-service.md; where it must say something that file does not, it says so and asks.
+
+## What 3c is, and is not
+
+- **In:** a key service you can run (its own binary, database, mutual-TLS internal API and small public API), an append-only transparency log with the service-key map and an empty identity map, signed heads with a log key kept apart from the identities, and a minimal witness that cosigns them, with a test witness for CI.
+- **Not in:** the recovery state machine and the cancel route (step 5), client wiring and the engine's recipient kind (step 4), the identity map's content and its VRF (the sharing work), and the off-machine audit sink (a small PR after 3c, below).
+
+## 1. The binary and its deployment
+
+**Crates.**
+
+| Crate | Owns | Runs on |
+| --- | --- | --- |
+| `orbyn-translog` (new) | The pure log: RFC 9162 Merkle tree, the prefix-tree map, every proof and its verifier, and (in the PRs that first need them) the canonical entry and head encodings. No IO. | Key service and devices (native and WebAssembly) |
+| `orbyn-keyservice` (3b) | The HSM boundary, certification, opening one envelope. Gains a log key and the `LogHead` message (below). | Key service |
+| `orbyn-keyservice-server` (new) | The `orbyn-keyservice` binary (`serve`, `migrate`, `init`), its Postgres store and migrations, the head builder, the internal and public APIs. | Key service |
+| `orbyn-keyservice-client` (new, small) | The mutual-TLS client `orbyn-server` uses. Wired in step 4, built and tested here. | Server |
+| `orbyn-witness` (new) | The cosigning library and a `orbyn-witness` binary; a `TestWitness` behind `test-support`. | A witness host; CI |
+
+`orbyn keyservice init` stays in `orbyn-cli` and calls the same function the new binary's `init` calls, so the 3b interface does not move.
+
+**Its own Postgres.** The key service has its own database (in production its own instance, with credentials the record server and its operators do not hold). It has its own migrator and migrations directory (`crates/orbyn-keyservice-server/migrations/`), its own `_sqlx_migrations`, and **two database URLs and two roles**: `ORBYN_KEYSERVICE_MIGRATE_DATABASE_URL`, an owner role used only by `orbyn-keyservice migrate` (it owns the tables and creates the triggers), and `ORBYN_KEYSERVICE_DATABASE_URL`, a runtime role used by `serve` with only the grants it needs: `SELECT` and `INSERT` on the append-only tables, `UPDATE` only on the one column below, and no `TRUNCATE`, `DELETE` or DDL. It never reads the engine's database and the engine never reads its. CI uses a second database on the same Postgres service container, with both roles made by the test setup; the difference from production is isolation, not code.
+
+**Tables** (all in the key service's database):
+
+| Table | Holds |
+| --- | --- |
+| `service_keys` | `account_id` (primary key), `wrapped` (the private key under the KEK), `public` (33 bytes), `identity_version`, `statement`, `signature`, `created_at`. One row per account; rotating an account's key (key-service.md, *Rotating an account's service key*) adds a row and a log entry, step 5. |
+| `log_entries` | `seq` (bigserial), `kind`, `map` (`service` or `identity`), `map_key` (32 bytes), `prev_entry_hash` (the account's chain link), `payload` (canonical bytes), `leaf_hash`, `created_at`, `included_in_head` (null until a cosigned head covers it). Append-only: `TRUNCATE` is revoked and a `BEFORE TRUNCATE` trigger refuses it too; a `BEFORE UPDATE` trigger allows only `included_in_head` going from null to a value, and `DELETE` is refused. **These rules guard against bugs in the service, not against its operator**, who could drop the triggers; the real guarantee is the witness's check of every head (section 2), which no database rule can replace. |
+| `log_nodes` | `(level, index)` → `hash` for the complete subtrees of the Merkle tree, written on append (O(log n) rows). |
+| `map_nodes` | `(map, prefix, depth)` → `hash` for each non-default node of a path-compressed sparse Merkle tree, per map. |
+| `heads` | `size`, `log_root`, `service_map_root`, `identity_map_root`, `time_ms`, `prev_head_hash`, `log_key_version`, `log_signature`, `cosignatures` (each witness's signature with its own signed time), `created_at`. Append-only, with the same triggers. |
+| `rate_events` | `(action, subject, at)` for the public API's limits. A plain count over an index: the volumes are per address and per hour, so the engine's advisory-lock limiter is not needed. |
+
+**Configuration** (environment, like the engine): `ORBYN_KEYSERVICE_DATABASE_URL`, `ORBYN_KEYSERVICE_MIGRATE_DATABASE_URL` (migrate only), `ORBYN_HSM_MODULE`, `ORBYN_HSM_SLOT`, `ORBYN_HSM_PIN` (3b), `ORBYN_KS_INTERNAL_BIND`, `ORBYN_KS_PUBLIC_BIND`, `ORBYN_KS_TLS_CERT`, `ORBYN_KS_TLS_KEY`, `ORBYN_KS_CLIENT_CA` (the CA that signs `orbyn-server`'s certificate), `ORBYN_KS_WITNESSES` (URLs), `ORBYN_KS_WITNESS_KEYS` (pinned public keys), `ORBYN_KS_WITNESS_THRESHOLD` (above half of the pinned witnesses; see below), `ORBYN_KS_LOG_KEY_VERSION`, `ORBYN_KS_ALLOWED_ORIGINS` (the planner's origins, for CORS).
+
+**The internal API (mutual TLS), for `orbyn-server` only.** rustls on its own listener: the client certificate must chain to `ORBYN_KS_CLIENT_CA` and carry the SAN `orbyn-server`; anything else is refused at the handshake. No tokens on top of it. Certificates and keys reload on `SIGHUP`, so rotation needs no restart. In 3c:
+
+- `POST /internal/v1/service-keys {account_id}` makes the account's service key and certifies it (`KeyService::new_account_key`), stores the row, appends the certification entry, and answers the public key, statement and signature. **Idempotent per account**: a second call returns the stored key and changes nothing.
+- `GET /internal/v1/service-keys/{account_id}`: the stored public key, statement and signature, or 404.
+- `GET /healthz`: the database and the HSM answer.
+
+Recovery start, finish and escrow open arrive with step 5; the internal API grows then, behind the same listener.
+
+**The public API (no client authentication), on its own hostname:**
+
+- `GET /v1/log/head`: the newest cosigned head. `Cache-Control: max-age=60`, so the edge absorbs it.
+- `GET /v1/log/consistency?from=&to=`: the consistency proof between two sizes.
+- `GET /v1/log/entries?map_key=&after=`: an account's chain, with each entry's inclusion proof against a head.
+- `GET /v1/log/lookup/{map_key}?map=service|identity`: the lookup proof: the map root's membership or non-membership proof for the key, the chain it commits to, and the head with its cosignatures.
+- `GET /v1/keys`: the log and identity key versions in use, for operators checking what clients must pin. Clients do not trust this; they pin.
+
+Rate limits as in key-service.md (lookups 60 per address an hour). CORS for `ORBYN_KS_ALLOWED_ORIGINS` only. A contract test fetches a head and a lookup proof across origins, so a blocked path fails CI.
+
+**The cancel route is not in 3c.** A cancel names a recovery, and recovery does not exist yet; the route, its signature check and its log entry land with step 5. This is the one place this note departs from the list in key-service.md; see the questions at the end.
+
+**Deployment.** `docker/keyservice.Dockerfile` builds only the key service crates (no engine code in the image and none of the key service in the engine's); the HSM module is mounted, never baked in. The compose file gains a `keyservice` profile with SoftHSM, a second Postgres and a witness, for development. The Docker CI job builds the image and checks its health.
+
+## 2. The transparency log
+
+**The tree.** RFC 9162 (certificate transparency v2): leaf hash `SHA-256(0x00 ‖ entry)`, node hash `SHA-256(0x01 ‖ left ‖ right)`, inclusion and consistency proofs as the RFC defines them. The test vectors are the RFC's. `orbyn-translog` holds the hashing and verification; the key service's `log_nodes` only stores what it computed.
+
+**An entry** is a canonical, length-prefixed byte string: a version, the kind, the map and map key, the hash of the account's previous entry in this map (zero for the first, so each account has a hash chain), the time, and the kind's fields. Kinds in 3c: `1` service-key certification (the statement and its signature), `2` identity or KEK rotation. Reserved, not built: `3` to `5` recovery start, cancel and finish (step 5), and the identity map's statements (sharing).
+
+**The two maps.** Both are verifiable maps over the same log, keyed by 32 bytes, each value the hash of the account's latest entry in that map and the chain length:
+
+- the **service-key map**, keyed by `SHA-256(orbyn/log-account/v1 ‖ service public key)` (key-service.md);
+- the **identity map**, keyed by `VRF(normalised email)` (sharing.md).
+
+Each is a **path-compressed sparse Merkle tree** (SHA-256, only branching nodes and leaves stored), with membership and non-membership proofs. In 3c both exist and are tested with the model of a plain map; **the identity map stays empty**: its root is the empty-tree root, and the VRF (RFC 9381, ECVRF-EDWARDS25519-SHA512-TAI) and the identity statements arrive with sharing. Building the second map now is cheap because the tree is generic over its key, and it keeps the head format final.
+
+**Heads and epochs.** An entry is appended to the log at once but is not visible to lookups until a head covers it. A **head builder** runs on a timer and on demand (a recovery start must reach a cosigned head, step 5). **A cosigned head is made every 10 minutes, even when nothing was appended**: in one transaction it takes the pending entries (possibly none), updates the maps, computes the three roots, builds the head `orbyn/log-head/v1` (size, log root, service map root, identity map root, time in milliseconds, hash of the previous head, log key version), has the HSM sign it with the **log key**, sends it with the entries and map paths to the witnesses, and stores the head with the cosignatures only when the threshold is met. A failed cosign leaves the entries pending and the previous head in place; heads are never half-published. An idle head repeats the size and every root, so it is a new cosignature over the same content, and the **witness's signed time**, not the head's `time_ms`, is what freshness means (below).
+
+**The log key** is a second Ed25519 key in the HSM, separate from the identities (key-service.md), with its own version, pinned by clients with the identity and witness keys. The `Hsm` trait gets `generate_log_key(version)`. The closed message type from 3b is **renamed `HsmMessage`** in this PR (a log key is not an identity), and gains `LogHead`, built only by the head builder; the key used follows the variant (service-key statement or recovery approval: identity; head: log key). So the signing oracle stays closed: no caller can have the log key sign anything but a head. **The log key signs any head the key service builds, including a dishonest one, so it is not the control: the witness is** (next section). Sealing the `Hsm` trait itself is engine#46.
+
+**The witness.** A cosigning service; the shape is the C2SP `tlog-witness` idea (a witness signs a checkpoint after checking it extends the one it signed last) with our own head, because our head carries two map roots, **and the witness verifies the map updates itself**, so it is a check on what the roots say, not only on the log's size.
+
+- **State:** the last size, log root, service map root, identity map root and head hash. Nothing else.
+- `POST /v1/cosign` with `{head, log_signature, consistency_proof, entries, map_paths}`: the new head; the proof that the log extends; **the entries since the witness's last size**; and, for each entry, the map path (the sibling hashes along its key) as the maps stood before it. The witness checks:
+  1. the log signature, against its pinned log key;
+  2. the log extends: the consistency proof links its last root to the head's log root, and the entries' leaf hashes, appended to its own accumulator state, give that root (so the entries are exactly the new leaves);
+  3. **the map roots are exactly what applying those entries gives**: for each entry, in order, the map path proves the key's old value under the witness's current map root, and the witness computes the new root from the new value; after all entries, `service_map_root` and `identity_map_root` of the head equal the roots it computed, **and nothing else changed**. The value is a function of the entry (its hash and the account's chain length), and the witness checks the entry's `prev` link against the old value, so an entry cannot rewrite an account's earlier chain;
+  4. the time rules below.
+  The cost is O(k log n) hashes for k new entries, and it needs no database: the paths come with the request.
+- **What it signs:** `orbyn/log-cosign/v1 ‖ head hash ‖ the witness's own time`, with its Ed25519 key. It returns the signature and the time.
+- **Freshness without new content.** A head with the **same size and the same roots** as the last one is re-cosigned, with a new witness time. That is how an idle log stays fresh. **Freshness is defined from the witness's signed time**, never the head's `time_ms`, which the key service writes: a device or the key service judges "how old is the newest cosignature" by that time. The head's `time_ms` must be no earlier than the last head's and within 5 minutes of the witness's clock. **A witness clock off by more than 5 minutes therefore stops heads (a liveness risk):** witnesses and the key service run NTP, a refusal names its reason (`clock_skew`, `fork`, `rollback`, `bad_proof`, `map_mismatch`), and the key service alerts its operator after 3 refused intervals (30 minutes), well before any device's 2-hour bound.
+- **Refusing a fork.** "A second, different head of the same size" means **a different log root or different map roots** at a size the witness already signed; a different time alone is not different. It is refused with the head it holds, so the refusal is evidence.
+- **Threshold.** The key service takes `ORBYN_KS_WITNESS_THRESHOLD` cosignatures and clients pin the witness keys and the same threshold. **The threshold must be above half of the pinned witnesses** (2 of 3, 3 of 5, 1 of 1): the key service **refuses to start**, and a client **refuses a head**, under a lower one, because two disjoint minorities could then each sign a different head. It ships with one witness and a threshold of 1, the code and the head format carrying a list. **A self-hoster's own witness gives no fork resistance**: the operator controls both ends, so the pinned witness only guards against the operator's own mistakes; real resistance needs a witness someone else runs (key-service.md says the same). With no witness configured the key service runs but cannot publish a head, and recovery stays refused.
+- **State on disk.** `orbyn-witness` writes its state and **`fsync`s it before answering**: a cosignature that was returned but lost on a crash would let the operator present an older head afterwards. It **refuses to start without a state file** unless given an explicit bootstrap flag and a pinned first head (a size, roots and hash taken from somewhere the operator chose), so an emptied directory cannot be passed off as a new witness. The state is backed up with the witness's key; a restored older state is the one thing that would let a witness sign a head it had refused, so a restore is a recorded, deliberate step.
+- **Clients and the witness.** A device fetches the newest cosignature **directly from a witness** as well as from the key service. Different roots at the same size, from any source, mean a **fork**. A key-service head that lags the witness's newest cosignature by **more than 3 intervals (30 minutes)** counts as **withholding**; lagging by less is normal (the witness signs before the key service stores, and heads are edge-cached for a minute).
+- **The witness as a public endpoint.** `GET /v1/cosignature` returns its newest cosigned head. It is cached at the edge for up to a minute (content changes every 10 minutes) and limited per address (60 an hour). The witness sees the addresses of devices that fetch from it; this is added to the metadata in sharing.md. A small witness (a Raspberry Pi) sits behind a caching proxy.
+- **Cosign size.** A cosign request carries at most 1000 entries. A witness that is behind catches up in chunks: the key service log-signs an intermediate head for each chunk, and the witness cosigns each in turn. With three witnesses and a threshold of two, a lagging witness catches up on its own while the other two keep heads flowing.
+- **Witness state, exactly.** The last size, log root, both map roots, the last head's hash, and the log's **right edge** (the O(log n) frontier from orbyn-translog's accumulator), so the witness can extend the log root from the entries without asking for anything else.
+- **A test witness for CI.** `TestWitness` is in-process, with an injectable clock and the same checks as the real one, including the map check (it recomputes the roots, so a key service that changes a map without an entry, or an entry without its map change, is caught). A second set of tests runs the real `orbyn-witness` binary on localhost. Tests: a good head is cosigned; an idle head is re-cosigned with a new witness time; a fork (a different root at a signed size), a rollback, a stale or future `time_ms`, a bad log signature, a bad consistency proof, a map root that does not match the entries, an extra or missing entry, and an entry that rewrites an earlier chain are each refused; a threshold at or below half is refused at start; with three witnesses and a threshold of two, one down still gives a head and two down does not; the witness's state survives a restart and a missing state refuses to start.
+
+## Freshness and monitoring
+
+- **Cadence.** A cosigned head every 10 minutes (above).
+- **Three outcomes, kept apart.**
+  - **Possible withholding:** a successful response carrying a head whose witness-signed time is more than **2 hours** old, or a key-service head lagging the witness by more than 30 minutes. The device warns of a possible takeover, as for an unknown recovery.
+  - **Availability:** failed fetches (network errors, 5xx, a 429 from the witness or the key service, offline) are not a takeover signal. They are left to the 24-hour dead man's switch, and a failed fetch never blocks sync.
+  - **Fork:** different roots at the same size, from any source. The device warns at once.
+- **The 24-hour alarm is separate.** The dead man's switch (the local notification a successful check reschedules for 24 hours ahead) is about the device not being able to check at all, and stays as written. **24 hours > 2 hours holds**: a device warns at 2 hours of stale heads and the switch fires at 24 hours of no successful check.
+- **Recovery's 72 hours** are measured from the witness's signed time in the first cosigned head that includes the start (key-service.md), not from the head's `time_ms`.
+
+## 3. Pull requests, in order
+
+Each is one review's worth, with its own tests, and builds on the one before.
+
+| # | PR | Size and what the reviewer checks |
+| --- | --- | --- |
+| 1 | **`orbyn-translog`: the Merkle tree.** Tree, root, inclusion and consistency proofs and their verifiers, an accumulator, reference vectors, exhaustive tests against the recursive definition, wasm32 check. No IO. (engine#47) | Medium. The verifiers. |
+| 2 | **`orbyn-translog`: the map.** The path-compressed sparse Merkle tree, membership and non-membership proofs, verifiers, **the path-and-update function the witness replays**, tests against a plain map, a fixed vector. Entry and head encodings land with the first PR that uses them. | Medium. Proof soundness (a proof for a missing key must not verify as present). |
+| 3 | **The key service's store.** `orbyn-keyservice-server` as a library: migrator, the tables above, `LogStore` and `MapStore` on Postgres, append, head building without signing, the append-only grants and trigger. Tests on `ORBYN_KEYSERVICE_DATABASE_URL`; CI gets the second database. | Medium. The migrations and the append-only guarantees. |
+| 4 | **Head signing and the witness.** The log key and `HsmMessage::LogHead` (the rename of `IdentityMessage`) in `orbyn-keyservice` (SoftHSM and memory); the head signer; `orbyn-witness` (library, binary, `TestWitness`) **including the map-update check**; the cosign client and the threshold rule; every witness test above. This needs the map's path and update functions from PR 2. | Large; may split into the witness library and the signer. Security: the signing oracle stays closed, and the witness's refusals. |
+| 5 | **The binary and the internal API.** `orbyn-keyservice serve/migrate/init`, rustls mutual TLS and reload, the service-key endpoints and their log entries, `orbyn-keyservice-client`. Tests: a wrong CA and a wrong SAN refused, create is idempotent, a certification appears in the next head. | Medium. TLS settings and what the endpoints can and cannot do. |
+| 6 | **The public API.** Head, consistency, entries, lookup proofs and keys; CORS, cache headers, rate limits; the cross-origin contract test. A client-side verifier test in `orbyn-translog` against the served bytes. **Gated on PR 4**: lookup proofs are served only once the witness's map check has landed, so a proof is never served against roots nobody checked. | Small to medium. |
+| 7 | **Deployment.** The Dockerfile, the compose profile, the CI image and health check, the runbook (the key ceremony, the pinned keys to publish, rotating a certificate), and the partial-`init` and trusted-KEK steps from 3b. Docs and packaging only. | Small. |
+| later | **The audit sink** (a trait with file and object-store implementations, written for each HSM open, certification and rotation; no keys, codes or emails), **the cancel route** (step 5) and **the identity map's content** (sharing). | Each its own PR. |
+
+PR 1 (the tree, engine#47) comes first and holds **only the tree and its proofs**: the canonical entry and head encodings move into the PR that first needs them (PR 3 for entries, PR 4 for the head), once this note has settled what a head carries. PR 2 needs PR 1; 3 needs 1 and 2; 4 needs 3; 5 needs 4; 6 needs 5; 7 needs all.
+
+## Decisions
+
+Settled by the owner on engine#45 (1 to 6) and by review (the rest):
+
+1. The cancel route moves to step 5.
+2. Our own head format on the C2SP witness shape.
+3. `orbyn-translog` is its own crate.
+4. Limits count `rate_events` in the key service.
+5. CI uses a second database on the same Postgres service.
+6. The log key lives in the HSM; `IdentityMessage` becomes `HsmMessage` in PR 4.
+7. The witness verifies the map updates itself, not only that the log extends (section 2).
+8. An idle log is re-cosigned every 10 minutes; freshness is the witness's signed time; devices warn after 2 hours.
+9. The threshold is above half of the pinned witnesses, enforced at start and by clients.
+10. Separate migrate and runtime database roles; the database rules guard against bugs, the witness is the control.

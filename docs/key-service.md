@@ -63,7 +63,7 @@ The key service runs as its own container with:
   - Web: the public API sends CORS headers for the planner's origins only.
   - A planner contract test sends a cancel and fetches a proof from that host, so a blocked path fails CI rather than showing up only as "stale".
 
-It does not trust its own rows for time. A recovery's 72 hours are measured from the time in the first witness-cosigned log head that includes the start (see *Transparency log*). Neither a back-dated row nor a host clock set forward can shorten the wait: the witness signs its own time, and an entry without such a head has no start time at all.
+It does not trust its own rows for time. A recovery's 72 hours are measured from the witness's signed time in the first cosigned log head that includes the start (see *Transparency log*). Neither a back-dated row nor a host clock set forward can shorten the wait: the witness signs its own time, and an entry without such a head has no start time at all.
 
 ## Protection level is signed by the person's devices
 
@@ -225,7 +225,7 @@ A cancel is a statement signed by a device (`orbyn/recovery-cancel/v1`: account,
 - **No witness, no recovery.** Recovery is refused while no witness is configured.
   - Production needs a witness run by someone other than Orbyn. Who runs it is an open decision.
   - A self-hoster may run their own, but then the witness is the same operator, so resistance to forks rests only on gossip between devices, which that operator's record server can withhold.
-- **Freshness.** A device refuses a head older than 24 hours, or one that is not consistent with the last head it saw. A missing or failing lookup proof counts the same as a stale head.
+- **Freshness.** A cosigned head is made every 10 minutes, even when the log is idle, and freshness is the age of the newest cosignature by the **witness's signed time**, not the head's own time. A device warns of a possible takeover when a response carries a head more than **2 hours** old, or a key-service head lags a witness's newest cosignature by more than 30 minutes; failed fetches are availability only, left to the 24-hour switch. It refuses a head that is not consistent with the last head it saw, and different roots at one size from any source are a fork. See key-service-3c.md for the exact rules. A missing or failing lookup proof counts the same as a stale head. The 24-hour dead man's switch below is separate: it covers a device that cannot check at all. See [key-service-3c.md](key-service-3c.md) for the witness's checks.
 - **Gossip between devices.** Each device writes the last head it verified into a record in a private system zone, so the account's other devices read it encrypted. A device that sees another device's head inconsistent with its own has found a fork and warns.
 - **Checks devices make.** On every sync, and at least daily, a trusted device fetches the newest head, checks it is fresh, consistent and cosigned, then checks its account's lookup proof. It verifies that every recovery and certification in its chain is one it knew of through the normal flow.
 - **What a finding means.** An unknown recovery or key, a fork, or a stale head is shown to the person as a possible takeover.

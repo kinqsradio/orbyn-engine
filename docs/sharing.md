@@ -75,7 +75,7 @@ Identities are logged by **email**, the identity people share with, as key-trans
 - **The answer** is the VRF output and proof, the head statement with its chain, and a cosigned lookup proof. Clients verify the VRF proof per RFC 9381, against a VRF public key pinned and versioned in client configuration like the identity keys.
 - **Before sealing.** Before Maya's device seals anything to Sam, it requires:
   - the email Maya typed, looked up by her own device with the capability for Sam's accepted invitation;
-  - a lookup proof no older than 24 hours;
+  - a lookup proof from a cosigned head no more than 2 hours old by the witness's signed time (the monitoring bound in key-service.md; the 24-hour margins below are a separate rule about how long a statement has been in the log);
   - a chain that verifies;
   - a head no older than the one she pinned for that email.
 - **Monitoring.** Sam's own devices look up Sam's own email on every log check. Any statement for Sam's email that no device of Sam's account made, including one from another account claiming sam@, is shown as a possible takeover.
@@ -209,6 +209,7 @@ The threat model gains:
 - which account wrote each version, from the signatures;
 - invitation timing, under keyed, expiring email digests;
 - the owner's device ids in cross-account notices;
+- witness fetches: a witness sees the addresses of devices that fetch its cosignatures;
 - identity lookups: the key service sees which emails a device looks up, and when, and both servers learn whether an email has an entry when an accepted invitation's lookup is made.
 
 Contents stay sealed.
