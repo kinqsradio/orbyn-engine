@@ -2,7 +2,7 @@
 
 One Docker host (the Windows test server, under Git Bash) runs the engine and the planner's web app, and a Cloudflare tunnel brings in `api-staging.orbyn.dev` and `account-staging.orbyn.dev`. No port is open: everything is published on `127.0.0.1` only.
 
-**Needs before the beta works end to end:** invite-only sign-up (`ORBYN_SIGNUP`, `orbyn invite`) merged into the engine; the planner's web image (orbyn-planner `chore/web-image`) merged and checked out next to this repository; and a way to get email codes (see [Email codes](#email-codes), which is not settled).
+**Needs before the beta works end to end:** invite-only sign-up (`ORBYN_SIGNUP`, `orbyn invite`) and the staging mail mode (`ORBYN_MAIL=log-codes`), both merged into the engine; and the planner's web image (orbyn-planner `chore/web-image`, merged), checked out next to this repository. Not yet on main: the key service's head publisher, so the smoke step that checks heads and cosignatures waits for it. Real email before any tester is invited is a gate (see [Email codes](#email-codes)).
 
 ## What runs
 
@@ -126,3 +126,7 @@ id=$(openssl rand -hex 16)
 5. **SIGHUP.** `dc --profile smoke run --rm ks-setup renew-cert`, then `dc --profile smoke kill -s HUP keyservice`. `dc --profile smoke logs keyservice` shows "reloaded the certificates", and step 1 still works.
 
 Stop it with `dc --profile smoke down`; add `-v` only to throw the smoke data away.
+
+## If a database was made before the invite gate merged
+
+An earlier branch of the invite migration (`0016`) was edited before it merged. A database that ran that branch refuses to migrate with `VersionMismatch(16)`. Recreate it: nothing on staging is worth keeping before the first beta. From the first beta on, an applied migration is never edited, and a CI check enforces that.
