@@ -242,7 +242,7 @@ async fn the_counters_equal_the_rows_when_uploads_and_purges_race() {
         }));
     }
     for writer in 0..3 {
-        let (store, me) = (store.clone(), me.clone());
+        let store = store.clone();
         tasks.push(tokio::spawn(async move {
             for round in 0..15 {
                 let ids: Vec<String> = (0..10)
