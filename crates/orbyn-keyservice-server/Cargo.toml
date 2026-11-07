@@ -1,0 +1,19 @@
+[package]
+name = "orbyn-keyservice-server"
+description = "The key service's store: its own migrations, the transparency log and map on Postgres, and head building."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+orbyn-translog.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

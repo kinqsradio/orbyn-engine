@@ -116,6 +116,9 @@ jobs:
           --health-interval 5s --health-timeout 3s --health-retries 10
     env:
       DATABASE_URL: postgres://orbyn@localhost:5432/orbyn
+      # The key service's own database, on the same Postgres: its tests make a database and two
+      # roles (an owner and a runtime role) per test from this connection.
+      ORBYN_KEYSERVICE_DATABASE_URL: postgres://orbyn@localhost:5432/orbyn_keyservice
       RUN: ${{ needs.changes.outputs.rust }}
     steps:
       - name: Cheap checks passed
@@ -142,6 +145,9 @@ jobs:
       - if: env.RUN == 'true'
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # Formatting ran in "Cheap checks".
+      - name: Second database for the key service
+        if: env.RUN == 'true'
+        run: psql "$DATABASE_URL" -c 'CREATE DATABASE orbyn_keyservice'
       # SoftHSM runs the key service's PKCS#11 tests on this lane only. The tests are ignored without
       # ORBYN_SOFTHSM_MODULE, so the other lanes, which have no SoftHSM, skip them; here
       # ORBYN_SOFTHSM_REQUIRED makes a missing module a failure instead of a silent skip (an empty
