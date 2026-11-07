@@ -5,13 +5,10 @@
 //! of its own.
 
 use std::process::{Command, Output};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Mutex;
 
-use cryptoki::context::{CInitializeArgs, CInitializeFlags, Pkcs11};
-use cryptoki::session::UserType;
-use cryptoki::types::AuthPin;
 use orbyn_keyservice::KeyService;
-use orbyn_keyservice::pkcs11::Pkcs11Hsm;
+use orbyn_keyservice::pkcs11::{Pkcs11Config, Pkcs11Hsm};
 use orbyn_keyservice_client::hex;
 use orbyn_keyservice_daemon::messages;
 
@@ -34,25 +31,20 @@ fn softhsm_module() -> Option<String> {
 struct Token {
     module: String,
     slot: u64,
-    context: Arc<Pkcs11>,
-    slot_handle: cryptoki::slot::Slot,
 }
 
 /// A new, empty, initialised token with a user PIN, in a slot of its own.
+///
+/// The token is made by `softhsm2-util`, **not by a PKCS#11 module loaded into this process**:
+/// SoftHSM gives an initialised token a new slot id, derived from its serial number, and a loaded
+/// module keeps reporting the id of the free slot it was initialised in (0) until it is loaded
+/// again. The binary under test is a separate process, loads the module afresh and sees the new
+/// id, so the id has to be the one a fresh process reports, which `softhsm2-util` prints.
 fn new_token() -> Option<Token> {
+    // Two tokens made at once would both take the one free slot.
     static MAKING: Mutex<()> = Mutex::new(());
-    static CONTEXT: OnceLock<Arc<Pkcs11>> = OnceLock::new();
     let module = softhsm_module()?;
     let _making = MAKING.lock().unwrap_or_else(|e| e.into_inner());
-    let context = CONTEXT
-        .get_or_init(|| {
-            let context = Pkcs11::new(&module).expect("load SoftHSM");
-            context
-                .initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))
-                .expect("initialise SoftHSM");
-            Arc::new(context)
-        })
-        .clone();
     let label = format!(
         "c{:x}",
         std::time::SystemTime::now()
@@ -60,40 +52,26 @@ fn new_token() -> Option<Token> {
             .expect("clock")
             .as_nanos()
     );
-    // SoftHSM keeps one uninitialised slot, always the last.
-    let free = *context
-        .get_all_slots()
-        .expect("slots")
-        .last()
-        .expect("a free slot");
-    context
-        .init_token(free, &AuthPin::from(SO_PIN.to_owned()), &label)
-        .expect("init token");
-    let slot_handle = context
-        .get_slots_with_token()
-        .expect("slots")
-        .into_iter()
-        .find(|s| {
-            context
-                .get_token_info(*s)
-                .map(|i| i.label().trim() == label)
-                .unwrap_or(false)
+    let out = Command::new("softhsm2-util")
+        .args(["--init-token", "--free", "--label", &label])
+        .args(["--so-pin", SO_PIN, "--pin", PIN])
+        .output()
+        .expect("softhsm2-util is installed (apt install softhsm2)");
+    let said =
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "softhsm2-util: {said}");
+    // "The token has been initialized and is reassigned to slot 48992642"
+    let slot = said
+        .rsplit_once("slot ")
+        .and_then(|(_, rest)| {
+            rest.trim()
+                .split(|c: char| !c.is_ascii_digit())
+                .next()?
+                .parse()
+                .ok()
         })
-        .expect("the new token");
-    let session = context.open_rw_session(slot_handle).expect("session");
-    session
-        .login(UserType::So, Some(&AuthPin::from(SO_PIN.to_owned())))
-        .expect("SO login");
-    session
-        .init_pin(&AuthPin::from(PIN.to_owned()))
-        .expect("user pin");
-    drop(session);
-    Some(Token {
-        module,
-        slot: slot_handle.id(),
-        context,
-        slot_handle,
-    })
+        .unwrap_or_else(|| panic!("no slot id in what softhsm2-util said: {said}"));
+    Some(Token { module, slot })
 }
 
 impl Token {
@@ -112,15 +90,52 @@ impl Token {
             .output()
             .expect("runs")
     }
+}
 
-    /// The HSM as a library would see it, to read back what the binary made.
-    fn hsm(&self) -> KeyService<Pkcs11Hsm> {
-        KeyService::new(Pkcs11Hsm::with_context(
-            self.context.clone(),
-            self.slot_handle,
-            PIN,
-        ))
+/// Reads a public key out of the token **in a fresh process**, which is what the binary is too:
+/// this test binary is run again as a child, with an environment flag that makes
+/// [`read_key_child`] open the HSM by the real slot id and print the key it holds. `which` is
+/// `identity` or `log`. The key is the HSM's own, not anything the binary printed.
+fn read_back(token: &Token, which: &str) -> String {
+    let out = Command::new(std::env::current_exe().expect("this test binary"))
+        .args(["--ignored", "--exact", "read_key_child", "--nocapture"])
+        .env("ORBYN_SOFTHSM_CLI_CHILD", which)
+        .env(
+            "SOFTHSM2_CONF",
+            std::env::var("SOFTHSM2_CONF").unwrap_or_default(),
+        )
+        .env("ORBYN_HSM_MODULE", &token.module)
+        .env("ORBYN_HSM_SLOT", token.slot.to_string())
+        .env("ORBYN_HSM_PIN", PIN)
+        .output()
+        .expect("the child runs");
+    let stdout = text(&out.stdout);
+    assert!(
+        out.status.success(),
+        "child: {stdout} {}",
+        text(&out.stderr)
+    );
+    stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("KEY=").map(str::to_owned))
+        .unwrap_or_else(|| panic!("the child printed no key: {stdout}"))
+}
+
+/// Not a test of its own: the child that [`read_back`] runs. Without the flag it does nothing.
+#[test]
+#[ignore = "run by read_back"]
+fn read_key_child() {
+    let Ok(which) = std::env::var("ORBYN_SOFTHSM_CLI_CHILD") else {
+        return;
+    };
+    let config = Pkcs11Config::from_env().expect("settings");
+    let keys = KeyService::new(Pkcs11Hsm::open(&config).expect("opens the HSM"));
+    let key = match which.as_str() {
+        "identity" => keys.identity_public(1),
+        _ => keys.log_key_public(1),
     }
+    .expect("the key is in the token");
+    println!("KEY={}", hex(&key));
 }
 
 fn text(bytes: &[u8]) -> String {
@@ -134,59 +149,77 @@ fn assert_fails_with(out: &Output, message: &str) {
     assert!(!text(&out.stderr).contains(PIN) && !text(&out.stdout).contains(PIN));
 }
 
+/// The 64 hex digits on the line after the first, or after the first line of `stdout`.
+fn key_line(stdout: &str) -> String {
+    let key = stdout.lines().nth(1).expect("a second line").to_owned();
+    assert!(
+        key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()),
+        "{key}"
+    );
+    key
+}
+
 #[test]
 #[ignore = "needs SoftHSM"]
 fn init_makes_the_identity_key_and_prints_its_public_key_then_refuses_to_run_twice() {
     let Some(token) = new_token() else { return };
     let out = token.run("init", PIN, token.slot);
-    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert_eq!(text(&out.stderr), "");
-    // The designed line and the key, which is the one the HSM holds.
-    let public = token.hsm().identity_public(1).expect("identity 1 exists");
-    assert_eq!(
-        text(&out.stdout),
-        format!("{}\n", messages::init_created(&hex(&public)))
-    );
-    assert!(
-        text(&out.stdout)
-            .starts_with("Created the service identity key (version 1). Public key:\n")
-    );
-    // A second run changes nothing and says so.
+    // The designed line, then the key: 64 hex digits.
+    let stdout = text(&out.stdout);
+    let key = key_line(&stdout);
+    assert_eq!(stdout, format!("{}\n", messages::init_created(&key)));
+    // The key it printed is the key the HSM holds, read by a fresh process.
+    assert_eq!(read_back(&token, "identity"), key);
+    assert!(stdout.starts_with("Created the service identity key (version 1). Public key:\n"));
+    // A second run changes nothing and says so (the key is in the token: it is found).
     let again = token.run("init", PIN, token.slot);
     assert_fails_with(&again, &messages::already_initialised());
-    assert_eq!(token.hsm().identity_public(1).expect("still there"), public);
+    assert!(!text(&again.stdout).contains(&key));
 }
 
 #[test]
 #[ignore = "needs SoftHSM"]
-fn init_log_key_makes_log_key_1_prints_its_public_key_once_and_works_after_init() {
+fn init_log_key_makes_log_key_1_prints_its_public_key_once_and_is_separate_from_init() {
     let Some(token) = new_token() else { return };
-    // It works where `init` has already run, and on a token where it has not.
-    assert_eq!(token.run("init", PIN, token.slot).status.code(), Some(0));
+    // On a token where `init` has run:
+    let init = token.run("init", PIN, token.slot);
+    assert_eq!(init.status.code(), Some(0), "{}", text(&init.stderr));
+    let identity = key_line(&text(&init.stdout));
+    assert_eq!(read_back(&token, "identity"), identity);
     let out = token.run("init-log-key", PIN, token.slot);
-    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert_eq!(text(&out.stderr), "");
-    let public = token.hsm().log_key_public(1).expect("log key 1 exists");
+    let stdout = text(&out.stdout);
+    let log_key = key_line(&stdout);
+    assert_eq!(stdout, format!("{}\n", messages::log_key_created(&log_key)));
+    assert!(stdout.ends_with("This is the only time the public key is printed. Save it.\n"));
+    assert_ne!(log_key, identity, "the log key is a key of its own");
+    assert_eq!(read_back(&token, "log"), log_key);
     assert_eq!(
-        text(&out.stdout),
-        format!("{}\n", messages::log_key_created(&hex(&public)))
-    );
-    assert!(
-        text(&out.stdout).ends_with("This is the only time the public key is printed. Save it.\n")
+        read_back(&token, "identity"),
+        identity,
+        "and the identity is untouched"
     );
     // The second run changes nothing, and does not print the key again.
     let again = token.run("init-log-key", PIN, token.slot);
     assert_fails_with(&again, &messages::log_key_exists());
-    assert!(!text(&again.stdout).contains(&hex(&public)));
-    // Neither command made the other's key.
+    assert!(!text(&again.stdout).contains(&log_key));
+    // On a token where it ran alone, it did not make the identity: `init` still has work to do.
     let other = new_token().expect("module is set");
+    let alone = other.run("init-log-key", PIN, other.slot);
+    assert_eq!(alone.status.code(), Some(0), "{}", text(&alone.stderr));
+    let init_after = other.run("init", PIN, other.slot);
     assert_eq!(
-        other.run("init-log-key", PIN, other.slot).status.code(),
-        Some(0)
+        init_after.status.code(),
+        Some(0),
+        "{}",
+        text(&init_after.stderr)
     );
-    assert!(
-        other.hsm().identity_public(1).is_err(),
-        "init-log-key does not make identity 1"
+    assert_ne!(
+        key_line(&text(&init_after.stdout)),
+        key_line(&text(&alone.stdout))
     );
 }
 
@@ -203,7 +236,7 @@ fn the_hsms_own_refusals_name_the_setting_at_fault() {
         // A slot the HSM does not have.
         assert_fails_with(&token.run(command, PIN, 987_654), &messages::hsm_slot());
     }
-    // Nothing was made by any of that.
-    assert!(token.hsm().identity_public(1).is_err());
-    assert!(token.hsm().log_key_public(1).is_err());
+    // Nothing was made by any of that: with the right settings, init makes its key.
+    let out = token.run("init", PIN, token.slot);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
 }
