@@ -189,7 +189,7 @@ fn read_entries(path: &Path) -> Result<Vec<Entry>, String> {
 /// signature over them.
 fn parse_pin_head(text: &str) -> Result<PinnedHead, String> {
     let bad = || messages::bad_value("--pin-head");
-    let bytes = (text.len() % 2 == 0 && text.is_ascii())
+    let bytes = (text.len().is_multiple_of(2) && text.is_ascii())
         .then(|| {
             (0..text.len() / 2)
                 .map(|i| u8::from_str_radix(&text[i * 2..i * 2 + 2], 16).ok())
