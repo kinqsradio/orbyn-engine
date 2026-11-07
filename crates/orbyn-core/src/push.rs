@@ -113,6 +113,9 @@ pub enum PushDelivery {
     GiveUp(String),
 }
 
+/// A device's push row: its id, provider, sealed token and token digest.
+type TokenRow = (Uuid, String, Vec<u8>, Vec<u8>);
+
 /// How long one send may take before it counts as "try again later".
 pub const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 /// The most devices one job wakes. Past it a device is simply not woken: it syncs when it is next
@@ -183,7 +186,7 @@ pub async fn handle_zone_changed_with(
     };
     // Trusted devices with a token that subscribed to the zone, other than the author, that this
     // job has not reached yet.
-    let rows: Result<Vec<(Uuid, String, Vec<u8>, Vec<u8>)>, _> = sqlx::query_as(
+    let rows: Result<Vec<TokenRow>, _> = sqlx::query_as(
         "SELECT p.device_id, p.provider, p.sealed_token, p.token_digest
          FROM push_tokens p
          JOIN devices d ON d.id = p.device_id AND d.state = 'trusted'
