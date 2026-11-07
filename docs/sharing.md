@@ -8,7 +8,7 @@ Maya shares Groceries with Sam, who can edit it.
 
 - Sam's phone and laptop see the list and its changes at once.
 - When Maya removes Sam, Sam's devices keep what they already had and see nothing written afterwards.
-- A server that lies, even one working with a participant, cannot:
+- A server that lies, even one working with a participant, cannot do the following, except during the stated owner-offline window after someone leaves (see *Removal, leaving and the window*):
   - read a shared list;
   - add itself or anyone else as a member;
   - write as someone else;
@@ -32,38 +32,55 @@ Each account has one **account key pair**: Ed25519 for signing and X25519 for re
 - The account's first trusted device makes the pair after sign-up and verification.
 - It reaches the account's other trusted devices through the keychain, in an envelope labelled `orbyn/account-key/v1`. The label binds the statement's sequence and hash, so a server cannot feed a new device an old key. The receiving device checks that the public key it derives equals the head it verified.
 - **The account key is never escrowed** to the key service. Account recovery therefore does not restore it (see *Recovery*).
+- **Removing a device rotates it.** When a device is removed, a remaining trusted device makes a new account key pair. It publishes it as a continuation signed by the old key, and seals the private half only to the remaining devices. A removed or stolen device therefore holds only keys that are being retired.
 
 ### Statements
 
-The public halves are published as **account key statements**, `orbyn/account-key-statement/v1`. Each one is length-prefixed over:
+The public halves are published as **identity statements**, `orbyn/identity-statement/v1`. Each one is length-prefixed over:
+- the normalised email;
 - the account id;
 - both public keys;
-- a sequence and prev (the hash of the previous statement).
+- a sequence and prev (the hash of the previous statement);
+- for a reset, the hash of the recovery-finish log entry it follows.
 
 Each statement is signed twice:
-- **by the account key itself**, the new key for the first statement and the previous key for a continuation, so a statement proves possession and continuity;
+- **by the account key**: the new key for the first statement and for a reset, the previous key for a continuation;
 - **by a trusted device of the account**, so the account's own approval chains vouch for it.
 
 ### Logging
 
-Every statement is appended to the transparency log under that account's map key. `GET /v1/accounts/{id}/key` returns the head, its chain and a fresh, cosigned lookup proof.
+Identities are logged by **email**, the identity people share with, as key-transparency systems for messaging do.
 
-**Before Maya's device seals anything to Sam**, it requires all three:
-- a lookup proof no older than 24 hours;
-- a chain that verifies;
-- a head no older than the head it pinned for Sam (see *Contacts*).
-
-**Sam's own devices** check the log for their account. A statement they did not make, or that no device of Sam's account made, is shown as a possible takeover, with the same checks as for recovery entries.
+- **The identity map.** The key service keeps a second verifiable map in the same witness-cosigned log, separate from the service-key map in key-service.md.
+  - Its map key is `VRF(normalised email)`: ECVRF-EDWARDS25519-SHA512-TAI (RFC 9381) under a VRF key held by the key service.
+  - The VRF lets anyone who knows an email find and verify its entry and its proof, but does not let the key service's readers walk the list of emails.
+  - The VRF key is stored wrapped under the HSM key-encryption key. It is not an HSM operation, because HSMs do not offer VRFs. A leak of it exposes only which emails have entries, not keys or contents.
+- **Accounts without a service key.** The identity map is independent of the service key and of the protection level. Advanced accounts use it the same way.
+- **Self-hosting.** Self-hosts without a key service have no log, so they cannot share.
+- **Submitting.** A device submits a statement with `POST /v1/identity/statements`. The key service checks both signatures and the chain before appending. For a reset, it also checks that the referenced recovery-finish entry exists for that account.
+- **Lookup.** `GET /v1/identity/{email}` is answered by the key service's public API, not the record server. It returns the VRF output and proof, the head statement with its chain, and a cosigned lookup proof.
+- **Before sealing.** Before Maya's device seals anything to Sam, it requires:
+  - the email Maya typed, looked up by her own device;
+  - a lookup proof no older than 24 hours;
+  - a chain that verifies;
+  - a head no older than the one she pinned for that email.
+- **Monitoring.** Sam's own devices look up Sam's own email on every log check. Any statement for Sam's email that no device of Sam's account made, including one from another account claiming sam@, is shown as a possible takeover.
 
 ### Contacts
 
-- **Pinning.** For every account it has shared with, a device pins the highest sequence and statement hash it accepted. It refuses a lower sequence or a different hash at the same sequence.
-- **Continuations.** A new statement signed by the previous account key is accepted on its own.
-- **Resets.** A new statement that the previous key did not sign is accepted only as described under *Recovery*.
+- **Pinning.** For every email it has shared with, a device pins the account id, the highest sequence and the statement hash it accepted. It refuses a lower sequence, a different hash at the same sequence, or a different account id for the email (except a reset, below).
+- **Continuations take time to count.** A continuation (signed by the previous key) is used for sealing only once:
+  - a cosigned head has included it for **24 hours**;
+  - no other statement exists at the same sequence.
+
+  This gives Sam's devices a day to see a continuation they did not make and publish a competing one.
+- **Two statements at one sequence** freeze sealing to that email on every contact's devices, and prompt: "Sam's identity changed in two ways. Compare safety numbers with Sam." Sealing resumes only for the statement the person confirms by safety number.
+- **Resets** are accepted only as described under *Recovery*.
 
 ### Verifying a person
 
-- **Default: logged, unverified.** The share sheet shows the person as unverified until both people compare safety codes. The key is still logged and cosigned, so substituting it is detectable by Sam's own devices, which is not the case for a key that is merely server-vouched.
+- **Default: logged, unverified.** The share sheet shows the person as unverified until both people compare safety numbers. The identity is logged and cosigned under the email Maya typed, so a substitute, including another account claiming Sam's email, is visible to Sam's own devices. An unverified share therefore trusts the log to be watched by Sam's devices, not the record server's word.
+- **End-to-end zones require verification.** A zone whose statement says `end-to-end` can be shared only with verified people.
 - **Verified.**
   - Maya and Sam compare a **safety number**: 60 digits, or a QR code scanned in person, computed under `orbyn/safety-code/v1` over both account ids and both account keys in a canonical order.
   - It is the full fingerprint, so it cannot be ground offline.
@@ -101,9 +118,9 @@ The zone key alone cannot tell who wrote a record, because every member, viewers
 A device accepts a version only if all of these hold:
 - its signature verifies against the author's pinned account key;
 - the author has a role that may write in the participant statement bound by the zone key the version is sealed under;
-- the version is newer than the device's copy and sealed under the current key, or under a key that was current for that statement.
+- it is sealed under the zone's current key. Once a device has accepted a rotation away from a key, it refuses **any newly arriving version sealed under that key**, whatever its version number, because version numbers are assigned by the server and are not signed.
 
-A demoted or removed member therefore cannot write, even with old keys and a cooperating server: their versions under the old key are older than the rotation, and under the new key they hold nothing.
+A demoted or removed member therefore cannot write, even with old keys and a cooperating server: a new version under the old key is refused, and they hold nothing under the new key. A member who wrote offline under the old key seals the write again under the new key before uploading it.
 
 ## Keys for a shared zone
 
@@ -138,7 +155,7 @@ The owner sets it in the participant statement.
 - **Leaving** is a statement signed by the member's own account key, `orbyn/zone-leave/v1`. The server drops the member at once.
   - Members' devices stop accepting the leaver's writes as soon as they see the leave statement.
   - The owner's next device online rotates the key.
-- **The window.** Between a leave (or a removal made while the owner's devices are offline) and the next rotation, a server that kept serving the leaver new ciphertext could let them read it. The window is bounded only by the owner being online. Members see "Waiting for Maya to secure this list" until the rotation arrives. Editors cannot rotate in v1, which keeps one key authority.
+- **The window.** After a leave, until the owner's next device online rotates the key, a server that kept serving the leaver could let them read anything sealed under the old key. So members **hold their own uploads** for that zone, showing "Waiting for Maya to secure this list", until the rotation arrives. Nothing new is sealed under a key the leaver holds. The window is bounded only by the owner being online. Editors cannot rotate in v1, which keeps one key authority.
 - **What removed people keep.** Their devices keep the local copy of what they had; nothing pretends otherwise. They mark the list "You were removed" and stop syncing it.
 
 ## Recovery and key changes
@@ -162,7 +179,7 @@ These follow engine#30's rules for addresses.
 
 ## Deleting
 
-- **Deleting a shared zone** is owner-only, with a tombstone signed by the owner's account key, `orbyn/zone-delete/v1`.
+- **Deleting a shared zone** is owner-only, with a tombstone signed by the owner's account key, `orbyn/shared-zone-delete/v1` (distinct from the device context `orbyn/zone-delete/v1`).
 - **Members' devices** remove it and keep nothing synced. The local copy goes to the trash for 30 days, as for any deleted list.
 - **Deleting the owner's account** deletes the owner's shared zones the same way, with members told: "Maya deleted her account; Groceries is gone".
 
@@ -172,7 +189,8 @@ The threat model gains:
 - the social graph: who shares with whom, and roles;
 - which account wrote each version, from the signatures;
 - invitation timing, under keyed, expiring email digests;
-- the owner's device ids in cross-account notices.
+- the owner's device ids in cross-account notices;
+- identity lookups: the key service sees which emails a device looks up, and when.
 
 Contents stay sealed.
 
@@ -207,6 +225,6 @@ Each step ships in both repos behind the same contracts.
 ## Rejected alternatives
 
 - **Sealing zone keys to each participant device.** The owner would have to verify another account's device approval chains, and every new device of Sam's would need the owner online. The account key moves that into Sam's own account.
-- **The key service handing out shared zone keys.** It would make shared zones readable by the key service even when end-to-end, and tie sharing to the key service being up.
-- **A server-vouched account key.** The record server could substitute keys undetectably. Logging with cosigned lookup proofs makes substitution visible to the account's own devices.
+- **The key service handing out shared zone keys.** It would make shared zones readable by the key service even when end-to-end. Sharing does depend on the key service's log for lookups, but never gives it keys.
+- **A server-vouched account key, or a log keyed by account id.** The record server could substitute keys, or the account an email belongs to, undetectably. A log keyed by the email the inviter types, which the email's own devices watch, makes either visible.
 - **Escrowing the account key.** Recovery would then silently restore every share to whoever recovered the account. A reset that owners must confirm is safer.
