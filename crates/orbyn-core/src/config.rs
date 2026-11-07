@@ -41,10 +41,11 @@ pub struct Config {
     pub mail_log_only: bool,
     /// The address email is sent from. Required with `smtp_url`.
     pub mail_from: Option<String>,
-    /// Where the planner is served (`ORBYN_APP_URL`, `https://` or a localhost address): the
-    /// deletion email's cancel link points to `<url>/cancel-deletion#<token>`. Without it the email
-    /// carries the token alone.
-    pub app_url: Option<String>,
+    /// Where the account site is served (`ORBYN_ACCOUNT_URL`, `https://` or a localhost address):
+    /// the deletion email's cancel link points to `<url>/cancel-deletion#<token>`. Until the account
+    /// site exists it is the planner, which serves that page. Without it the email carries the
+    /// token alone.
+    pub account_url: Option<String>,
     /// `ORBYN_SMTP_CA_FILE`: a PEM bundle of extra CA certificates the worker trusts for SMTP, in
     /// addition to the web roots and never instead of them. For a private relay or a test mail
     /// server. TLS is still required. Needs `smtp_url`.
@@ -65,7 +66,7 @@ impl std::fmt::Debug for Config {
             .field("database_pool_size", &self.database_pool_size)
             .field("smtp_url", &self.smtp_url.as_ref().map(|_| "(hidden)"))
             .field("mail_from", &self.mail_from)
-            .field("app_url", &self.app_url)
+            .field("account_url", &self.account_url)
             .field("smtp_ca_file", &self.smtp_ca_file)
             .finish()
     }
@@ -91,8 +92,8 @@ pub enum ConfigError {
     CaFileWithoutSmtp,
     #[error("ORBYN_MAIL can only be `log`")]
     InvalidMailMode,
-    #[error("ORBYN_APP_URL must be an https:// address (http:// only for localhost)")]
-    InvalidAppUrl,
+    #[error("ORBYN_ACCOUNT_URL must be an https:// address (http:// only for localhost)")]
+    InvalidAccountUrl,
 }
 
 impl Config {
@@ -176,13 +177,13 @@ impl Config {
             Some("log") => true,
             Some(_) => return Err(ConfigError::InvalidMailMode),
         };
-        let app_url = optional("ORBYN_APP_URL");
-        if let Some(url) = &app_url {
+        let account_url = optional("ORBYN_ACCOUNT_URL");
+        if let Some(url) = &account_url {
             let local = ["http://localhost", "http://127.0.0.1", "http://[::1]"]
                 .iter()
                 .any(|p| url.starts_with(p));
             if !(url.starts_with("https://") || local) || url.contains(char::is_whitespace) {
-                return Err(ConfigError::InvalidAppUrl);
+                return Err(ConfigError::InvalidAccountUrl);
             }
         }
         Ok(Self {
@@ -198,7 +199,7 @@ impl Config {
             smtp_url,
             mail_log_only,
             mail_from,
-            app_url,
+            account_url,
             smtp_ca_file,
         })
     }
@@ -311,25 +312,29 @@ mod tests {
     }
 
     #[test]
-    fn the_app_url_is_https_or_localhost() -> Result<(), ConfigError> {
+    fn the_account_url_is_https_or_localhost() -> Result<(), ConfigError> {
         let with = |value: &str| {
             Config::from_lookup(lookup(&[
                 ("DATABASE_URL", "postgres://x"),
-                ("ORBYN_APP_URL", value),
+                ("ORBYN_ACCOUNT_URL", value),
             ]))
         };
         assert_eq!(
-            with("https://app.example.com")?.app_url.as_deref(),
-            Some("https://app.example.com")
+            with("https://account.example.com")?.account_url.as_deref(),
+            Some("https://account.example.com")
         );
         assert!(with("http://localhost:5173").is_ok());
         for bad in [
-            "http://app.example.com",
-            "app.example.com",
+            "http://account.example.com",
+            "account.example.com",
             "javascript:x",
             "https://a b",
         ] {
-            assert_eq!(with(bad).err(), Some(ConfigError::InvalidAppUrl), "{bad}");
+            assert_eq!(
+                with(bad).err(),
+                Some(ConfigError::InvalidAccountUrl),
+                "{bad}"
+            );
         }
         Ok(())
     }

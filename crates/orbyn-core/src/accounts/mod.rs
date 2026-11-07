@@ -389,8 +389,8 @@ pub struct Accounts {
     /// Where the steps of the email verification paths are recorded, for a test that checks a
     /// real sign-up and a decoy take the same ones. `None` in production.
     trace: Option<Arc<std::sync::Mutex<Vec<&'static str>>>>,
-    /// Where the planner is served, for the cancel link in the deletion email.
-    app_url: Option<String>,
+    /// Where the account site is served, for the cancel link in the deletion email.
+    account_url: Option<String>,
 }
 
 /// The time a TOTP code or a device's signature is judged against, in Unix seconds. The system
@@ -412,7 +412,7 @@ impl Accounts {
             limits: Limits::default(),
             clock: Clock(Arc::new(|| u64::try_from(unix_now_secs()).unwrap_or(0))),
             trace: None,
-            app_url: None,
+            account_url: None,
         }
     }
 
@@ -424,14 +424,15 @@ impl Accounts {
             limits: Limits::default(),
             clock: Clock(Arc::new(|| u64::try_from(unix_now_secs()).unwrap_or(0))),
             trace: None,
-            app_url: None,
+            account_url: None,
         }
     }
 
-    /// The address the planner is served at (`https://app.example.com`); the deletion email's cancel
-    /// link points to `<url>/cancel-deletion#<token>`. Without it the email carries the token alone.
-    pub fn with_app_url(mut self, url: impl Into<String>) -> Self {
-        self.app_url = Some(url.into().trim_end_matches('/').to_owned());
+    /// The address the account site is served at (`https://account.example.com`); the deletion
+    /// email's cancel link points to `<url>/cancel-deletion#<token>`. Without it the email carries
+    /// the token alone.
+    pub fn with_account_url(mut self, url: impl Into<String>) -> Self {
+        self.account_url = Some(url.into().trim_end_matches('/').to_owned());
         self
     }
 
