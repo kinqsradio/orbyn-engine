@@ -6,7 +6,8 @@ name: CI
 # Pull requests run one lane: Rust on Linux with Postgres. macOS and Windows run on main, nightly, on manual runs,
 # and on a pull request that touches Cargo manifests, the toolchain pin, `crates/orbyn-cli/` (the only platform code)
 # or the workflows. The Docker image and the security audit run on main, nightly, manual runs, and a pull request
-# that can change them. Main and nightly run every lane.
+# that can change them. Main and nightly run every lane, so an advisory published against a dependency the pull
+# request did not change is caught there, not on the pull request.
 on:
   push:
     branches: [main]
@@ -60,7 +61,7 @@ jobs:
           # The image builds every crate except the WebAssembly one, with the migrations.
           docker='^(docker/|compose\.yaml$|\.dockerignore$|migrations/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|\.cargo/|\.github/workflows/)'
           audit='^(Cargo\.(toml|lock)$|crates/[^/]+/Cargo\.toml$|\.cargo/audit\.toml$|\.github/workflows/)'
-          # scripts/ holds the title checker, which the cheap checks run.
+          # scripts/ holds the title checker, which the title workflow runs.
           known="$rust|$docker|^scripts/"
           code=$(printf '%s\n' "$files" | grep -Ev "$docs" | grep -v '^$' || true)
           unknown=$(printf '%s\n' "$code" | grep -Ev "$known" | grep -v '^$' || true)
@@ -74,8 +75,9 @@ jobs:
           echo "rust=$r platform=$p docker=$d audit=$a"
           printf '%s\n' "$files"
 
-  # The pull request's title and AI usage section, and (for a Rust change) formatting: seconds, before anything heavy.
-  # The heavy jobs wait for it and fail at once when it failed, so a typo never costs a full run.
+  # Formatting, in seconds, before anything heavy. The heavy jobs wait for it and fail at once when it failed.
+  # The title and the AI usage section are checked by their own workflows, which also run when the pull request is
+  # edited, so fixing a title never needs a push or a full run.
   lint:
     name: Cheap checks
     needs: changes
@@ -86,30 +88,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Pull request title
-        if: github.event_name == 'pull_request' && github.event.pull_request.user.login != 'dependabot[bot]'
-        env:
-          TITLE: ${{ github.event.pull_request.title }}
-        run: python3 scripts/check_title.py --kind pull-request --title "$TITLE"
-      # The same check as the "PR AI usage" workflow, which owns it: keep the two in step.
-      - name: AI usage section
-        if: github.event_name == 'pull_request' && github.event.pull_request.user.login != 'dependabot[bot]'
-        env:
-          BODY: ${{ github.event.pull_request.body }}
-        run: |
-          python3 - <<'PY'
-          import os, re, sys
-          body = re.sub(r"<!--.*?-->", "", os.environ.get("BODY") or "", flags=re.S)
-          match = re.search(r"^## AI usage\s*$(.*?)(?=^## |\Z)", body, flags=re.M | re.S)
-          if not match:
-              sys.exit("Add the AI usage section from the pull request template.")
-          section = match.group(1)
-          if re.search(r"^- \[[xX]\] Written by hand", section, flags=re.M):
-              sys.exit(0)
-          missing = [f for f in ["Harness and version", "Models", "Effort", "Human role", "Sources"] if not (m := re.search(rf"^- {re.escape(f)}:[ \t]*(.*)$", section, flags=re.M)) or not m.group(1).strip()]
-          if missing:
-              sys.exit("Tick 'Written by hand', or fill in: " + ", ".join(missing) + ".")
-          PY
       - if: env.RUST == 'true'
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
