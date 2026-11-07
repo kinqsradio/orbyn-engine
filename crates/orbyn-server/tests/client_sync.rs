@@ -776,3 +776,160 @@ async fn devices_trusted_before_the_two_way_comparison_are_approved_again() {
     // A device a trusts now is not approved again.
     assert!(a.engine.start_approval(b_entry, now_secs()).is_err());
 }
+
+/// `device` signs `level` as the next link, the server stores it, and the device verifies what the
+/// server answered against its own trusted devices.
+async fn set_protection(
+    server: &Server,
+    device: &mut Device,
+    level: wire::ProtectionLevel,
+) -> wire::ProtectionLink {
+    let body = device
+        .engine
+        .sign_protection(level, now_secs())
+        .expect("sign");
+    let link: wire::ProtectionLink = server
+        .ok(
+            Method::POST,
+            "/v1/keychain/protection",
+            &device.token,
+            Some(value(&body)),
+            StatusCode::CREATED,
+        )
+        .await;
+    let devices = device.devices(server).await;
+    device
+        .engine
+        .verify_protection(
+            &wire::ProtectionChain {
+                links: vec![link.clone()],
+                more: false,
+            },
+            &devices,
+        )
+        .expect("verify own link");
+    link
+}
+
+async fn protection_from(server: &Server, device: &Device, from: u64) -> wire::ProtectionChain {
+    server
+        .ok(
+            Method::GET,
+            &format!("/v1/keychain/protection?from={from}"),
+            &device.token,
+            None,
+            StatusCode::OK,
+        )
+        .await
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn the_protection_chain_goes_through_the_server_and_a_new_device_refuses_a_replayed_standard()
+{
+    let server = Server::start().await;
+    let email = format!("protect-{}@example.com", Uuid::new_v4());
+    let a_keys = DeviceKeys::generate().expect("keys");
+    let a_session = server.sign_up(&email, &a_keys).await;
+    let device = |keys: &DeviceKeys, session: &wire::SessionCreated| Device {
+        engine: Engine::new(copy(keys), &session.account_id, &session.device_id).expect("engine"),
+        token: session.token.clone(),
+        id: session.device_id.clone(),
+        now: 1_800_000_000_000,
+    };
+    let mut a = device(&a_keys, &a_session);
+    assert_eq!(
+        a.engine.protection_level(),
+        orbyn_client::ProtectionState::Unknown,
+        "nothing verified yet"
+    );
+
+    // The first device signs Standard right after sign-up, then the person switches to Advanced.
+    let standard = set_protection(&server, &mut a, wire::ProtectionLevel::Standard).await;
+    assert_eq!(standard.seq, 1);
+    let advanced = set_protection(&server, &mut a, wire::ProtectionLevel::Advanced).await;
+    assert_eq!(advanced.seq, 2);
+    assert_eq!(
+        a.engine.protection_level(),
+        orbyn_client::ProtectionState::Verified(wire::ProtectionLevel::Advanced)
+    );
+
+    // A new device approved by a starts from a's setting.
+    let b_keys = DeviceKeys::generate().expect("keys");
+    let b_session = server.sign_in(&email, &b_keys).await;
+    let mut b = device(&b_keys, &b_session);
+    approve(&server, &mut a, &mut b).await;
+    let devices = b.devices(&server).await;
+    // The server, or anyone replaying, shows b the genuine old Standard: refused.
+    assert_eq!(
+        b.engine.verify_protection(
+            &wire::ProtectionChain {
+                links: vec![standard.clone()],
+                more: false
+            },
+            &devices
+        ),
+        Err(orbyn_client::ClientError::ProtectionRollback)
+    );
+    assert_eq!(
+        b.engine.protection_level(),
+        orbyn_client::ProtectionState::Unknown,
+        "no level, so no escrow"
+    );
+    // The chain as the server holds it, from the sequence a vouched for, verifies.
+    assert_eq!(b.engine.protection_from(), 2, "the sequence a vouched for");
+    let chain = protection_from(&server, &b, b.engine.protection_from()).await;
+    let status = b
+        .engine
+        .verify_protection(&chain, &devices)
+        .expect("verify");
+    assert_eq!(
+        (status.seq, status.state),
+        (
+            2,
+            orbyn_client::ProtectionState::Verified(wire::ProtectionLevel::Advanced)
+        )
+    );
+    // b can now sign the next one, and a, fetching it, follows.
+    let request = b
+        .engine
+        .sign_protection(wire::ProtectionLevel::Standard, now_secs())
+        .expect("sign");
+    let back: wire::ProtectionLink = server
+        .ok(
+            Method::POST,
+            "/v1/keychain/protection",
+            &b.token,
+            Some(value(&request)),
+            StatusCode::CREATED,
+        )
+        .await;
+    assert_eq!(back.seq, 3);
+    let devices = a.devices(&server).await;
+    let chain = protection_from(&server, &a, a.engine.protection_from()).await;
+    let status = a
+        .engine
+        .verify_protection(&chain, &devices)
+        .expect("a follows b");
+    assert_eq!(
+        (status.seq, status.state),
+        (
+            3,
+            orbyn_client::ProtectionState::Verified(wire::ProtectionLevel::Standard)
+        )
+    );
+
+    // The same request sent again (a replay, or a retry whose answer was lost) is a conflict that
+    // shows the head, which is that very setting.
+    let (status, conflict) = server
+        .call(
+            Method::POST,
+            "/v1/keychain/protection",
+            Some(&b.token),
+            Some(value(&request)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+    assert_eq!(conflict["code"], "protection_conflict");
+    assert_eq!(conflict["head"], value(&back));
+}

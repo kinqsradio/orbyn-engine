@@ -169,6 +169,21 @@ impl IntoResponse for Refusal {
             StoreError::TooManyEnvelopes => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "too_many_envelopes")
             }
+            StoreError::InvalidProtection => (StatusCode::BAD_REQUEST, "invalid_protection"),
+            StoreError::InvalidProtectionSignature => {
+                (StatusCode::BAD_REQUEST, "invalid_signature")
+            }
+            StoreError::TooManyProtectionChanges => {
+                (StatusCode::TOO_MANY_REQUESTS, "too_many_changes")
+            }
+            StoreError::ProtectionConflict(head) => {
+                let body = wire::ProtectionConflict {
+                    code: "protection_conflict".to_owned(),
+                    message: "The setting does not follow the current one.".to_owned(),
+                    head: head.clone().map(|h| crate::keychain::wire_protection(*h)),
+                };
+                return (StatusCode::CONFLICT, Json(body)).into_response();
+            }
             StoreError::TooManyUploads { retry_after } => {
                 let mut response = error(
                     StatusCode::TOO_MANY_REQUESTS,

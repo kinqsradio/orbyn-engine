@@ -260,7 +260,7 @@ impl Trust {
         else {
             return false;
         };
-        let message = auth::approval_message(&auth::Pairing {
+        let pairing = auth::Pairing {
             account_id: &self.account,
             approval_id: &approval_id,
             created_at,
@@ -268,13 +268,25 @@ impl Trust {
             approver,
             device_id: &id,
             device: &public,
-        });
-        orbyn_crypto::verify(
-            approver,
-            auth::DEVICE_APPROVAL_CONTEXT,
-            &message,
-            &signature,
-        )
+        };
+        // An approval that covers its endorsement says so by the endorsement's hash; one without
+        // is an older approval, signed under the v1 message. A server that drops the hash only
+        // makes the signature fail to verify.
+        match device.approval_endorsement_hash.as_deref().map(key32) {
+            Some(Some(hash)) => orbyn_crypto::verify(
+                approver,
+                auth::DEVICE_APPROVAL_V2_CONTEXT,
+                &auth::approval_message_v2(&pairing, &hash),
+                &signature,
+            ),
+            Some(None) => return false,
+            None => orbyn_crypto::verify(
+                approver,
+                auth::DEVICE_APPROVAL_CONTEXT,
+                &auth::approval_message(&pairing),
+                &signature,
+            ),
+        }
         .is_ok()
     }
 

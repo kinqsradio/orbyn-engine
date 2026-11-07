@@ -26,11 +26,13 @@
 pub mod crypt;
 mod pairing;
 mod planner;
+mod protection;
 mod trust;
 
 pub use crypt::KeyId;
 pub use pairing::{ApproverPairing, DevicePairing, ENDORSEMENT_CONTEXT, MAX_ENDORSED};
 pub use planner::{ITEM_TYPE, item_fields, item_from_fields};
+pub use protection::{ProtectionFloor, ProtectionHead, ProtectionState, ProtectionStatus};
 pub use trust::{Peer, PinnedKeys, uuid_bytes};
 
 use base64::Engine as _;
@@ -91,6 +93,14 @@ pub enum ClientError {
     Random,
     #[error("the zone expired again before it was fetched from the start; try again later")]
     ExpiredAgain,
+    /// The newest protection setting is older than one this device verified or its approver
+    /// vouched for.
+    #[error("the protection settings are older than ones this device already knows")]
+    ProtectionRollback,
+    /// A protection setting differs from one this device verified or its approver vouched for at
+    /// the same sequence, or does not follow the verified head.
+    #[error("the protection settings fork from the ones this device verified")]
+    ProtectionFork,
 }
 
 impl From<CryptoError> for ClientError {
@@ -339,6 +349,18 @@ pub struct Snapshot {
     /// The highest removal sequence this device has counted.
     #[serde(default)]
     pub removal_sequence: u64,
+    /// The newest protection setting this device verified.
+    #[serde(default)]
+    pub protection: Option<ProtectionHead>,
+    /// An approver's newest setting this device has not seen yet.
+    #[serde(default)]
+    pub protection_floor: Option<ProtectionFloor>,
+    /// Whether something this device trusts vouches for the chain it follows.
+    #[serde(default)]
+    pub protection_anchored: bool,
+    /// Whether the last walk of the chain reached the server's head with nothing stopped.
+    #[serde(default)]
+    pub protection_complete: bool,
     pub zones: BTreeMap<String, ZoneSnapshot>,
 }
 
@@ -366,6 +388,7 @@ pub struct ZoneSnapshot {
 pub struct Engine {
     keys: DeviceKeys,
     trust: Trust,
+    protection: protection::Protection,
     clock: Clock,
     zones: BTreeMap<String, ZoneState>,
     /// Records whose newest stamp was more than an hour ahead of the clock when
@@ -397,6 +420,7 @@ impl Engine {
         Ok(Self {
             clock: Clock::new(stamp_device(&me)),
             trust: Trust::new(account, device_id.to_owned(), me),
+            protection: protection::Protection::default(),
             keys,
             zones: BTreeMap::new(),
             skipped_future_stamps: 0,
@@ -411,6 +435,12 @@ impl Engine {
         engine
             .trust
             .set_removal_sequence(snapshot.removal_sequence.min(auth::MAX_REMOVAL_SEQUENCE));
+        engine.protection = protection::Protection::import(
+            snapshot.protection.as_ref(),
+            snapshot.protection_floor.as_ref(),
+            snapshot.protection_anchored,
+            snapshot.protection_complete,
+        )?;
         for (name, z) in snapshot.zones {
             let mut keys = BTreeMap::new();
             for (id, key) in &z.keys {
@@ -480,12 +510,17 @@ impl Engine {
             })
             .collect();
         let (pinned, revoked) = self.trust.export();
+        let protection = self.protection.export();
         Snapshot {
             account_id: format_uuid(&self.trust.account),
             device_id: self.trust.device_id.clone(),
             pinned,
             revoked,
             removal_sequence: self.trust.removal_sequence(),
+            protection: protection.head,
+            protection_floor: protection.floor,
+            protection_anchored: protection.anchored,
+            protection_complete: protection.complete,
             zones,
         }
     }

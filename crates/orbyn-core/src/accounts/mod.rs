@@ -279,6 +279,9 @@ pub struct Device {
     /// signed into it, both part of the signed message.
     pub approval_id: Option<Uuid>,
     pub approval_created_at: Option<i64>,
+    /// The SHA-256 of the endorsement that approval carried, covered by the approver's v2
+    /// signature; `None` for an approval made before that existed, or without an endorsement.
+    pub approval_endorsement_hash: Option<[u8; 32]>,
 }
 
 /// An approval just opened.

@@ -28,6 +28,12 @@ approval_id?: string,
  */
 approval_created_at?: number, 
 /**
+ * The SHA-256 of the endorsement that approval carried, base64url, when the approver's
+ * signature is the `orbyn/device-approval/v2` one that covers it; absent for an older
+ * approval, whose signature is the v1 one.
+ */
+approval_endorsement_hash?: string, 
+/**
  * True for the device making the request.
  */
 current: boolean, };

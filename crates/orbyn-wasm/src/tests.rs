@@ -87,6 +87,9 @@ fn approve_json(
     let mut entry = device(new_id, new_keys, "trusted");
     entry["approved_by"] = json!(approver_id);
     entry["approval_signature"] = confirm["signature"].clone();
+    entry["approval_endorsement_hash"] = json!(URL_SAFE_NO_PAD.encode(auth::endorsement_hash(
+        &unb64(confirm["endorsement"].as_str().expect("endorsement"))?
+    )));
     entry["approval_id"] = json!(get(&view, "id"));
     entry["approval_created_at"] = view["created_at"].clone();
     Ok(entry)
@@ -386,6 +389,71 @@ fn restoring_does_not_move_the_clock_to_the_restore_time() -> Result<()> {
     assert_eq!(
         v["millis"], 6_000,
         "stamped at the edit, not at the restore"
+    );
+    Ok(())
+}
+
+#[test]
+fn protection_settings_are_signed_and_verified_through_json() -> Result<()> {
+    let keys = DeviceKeys::create()?;
+    let mut engine = SyncEngine::create(&keys, ACCOUNT, A)?;
+    let devices = json!({"devices": [device(A, &keys, "trusted")], "removals": []}).to_string();
+    // No verified setting: no level, which is not Standard.
+    assert_eq!(engine.protection_level()?, r#"{"state":"unknown"}"#);
+    assert_eq!(engine.protection_seq(), 0.0);
+    assert_eq!(
+        engine
+            .sign_protection("sideways", NOW_S)
+            .expect_err("a level that does not exist")
+            .code,
+        "invalid_input"
+    );
+
+    let body: Value = serde_json::from_str(&engine.sign_protection("standard", NOW_S)?)
+        .map_err(|e| error("invalid_json", e))?;
+    assert_eq!(
+        (body["seq"].as_u64(), body["level"].as_str()),
+        (Some(1), Some("standard"))
+    );
+    let link = json!({
+        "level": body["level"], "seq": body["seq"], "prev": body["prev"],
+        "signed_at": body["signed_at"], "signer_device_id": A,
+        "signature": body["device_signature"],
+    });
+    let chain = json!({"links": [link], "more": false}).to_string();
+    let status: Value = serde_json::from_str(&engine.verify_protection(&chain, &devices)?)
+        .map_err(|e| error("invalid_json", e))?;
+    assert_eq!(status["seq"], 1);
+    assert_eq!(status["level"], "standard");
+    assert_eq!(
+        engine.protection_level()?,
+        r#"{"state":"verified","level":"standard"}"#
+    );
+    assert_eq!(engine.protection_seq(), 1.0);
+    assert_eq!(engine.protection_from(), 1.0);
+
+    // Advanced, then the old Standard again: a rollback, reported with its own code.
+    let advanced: Value = serde_json::from_str(&engine.sign_protection("advanced", NOW_S + 1.0)?)
+        .map_err(|e| error("invalid_json", e))?;
+    let second = json!({
+        "level": advanced["level"], "seq": advanced["seq"], "prev": advanced["prev"],
+        "signed_at": advanced["signed_at"], "signer_device_id": A,
+        "signature": advanced["device_signature"],
+    });
+    engine.verify_protection(
+        &json!({"links": [link, second], "more": false}).to_string(),
+        &devices,
+    )?;
+    assert_eq!(
+        engine.protection_level()?,
+        r#"{"state":"verified","level":"advanced"}"#
+    );
+    assert_eq!(
+        engine
+            .verify_protection(&chain, &devices)
+            .expect_err("a rollback")
+            .code,
+        "protection_rollback"
     );
     Ok(())
 }

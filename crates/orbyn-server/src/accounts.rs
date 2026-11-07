@@ -319,6 +319,7 @@ fn wire_device(device: accounts::Device, current: Uuid) -> wire::Device {
         approval_signature: device.approval_signature.map(|s| encode(&s)),
         approval_id: device.approval_id.map(|id| id.to_string()),
         approval_created_at: device.approval_created_at,
+        approval_endorsement_hash: device.approval_endorsement_hash.map(|h| encode(&h)),
         current: device.id == current,
     }
 }

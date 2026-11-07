@@ -65,6 +65,7 @@ fn entry(id: &str, keys: &DeviceKeys, state: wire::DeviceState) -> wire::Device 
         approval_signature: None,
         approval_id: None,
         approval_created_at: None,
+        approval_endorsement_hash: None,
         current: false,
     }
 }
@@ -121,6 +122,10 @@ fn approve(approver: &mut Device, new: &mut Device, list: &wire::DeviceList) -> 
         .expect("finish");
     new.entry.state = wire::DeviceState::Trusted;
     new.entry.approved_by = Some(approver.id.clone());
+    new.entry.approval_endorsement_hash = view
+        .endorsement
+        .as_deref()
+        .map(|e| b64(&auth::endorsement_hash(&unb64(e))));
     new.entry.approval_signature = Some(confirm.signature);
     new.entry.approval_id = Some(view.id);
     new.entry.approval_created_at = Some(view.created_at);
@@ -672,12 +677,12 @@ fn an_approval_signature_the_approver_did_not_make_is_refused() {
 fn a_device_the_server_adds_to_the_endorsement_is_refused() {
     let (mut a, _b, mut c, devices) = approving();
     let (pd, mut view, sas) = confirmed(&mut a, &c, &devices);
-    // Layout: format, sequence (8), count (2), entries of 96 bytes,
-    // signature (64).
+    // Layout: format, removal sequence (8), protection sequence (8) and hash (32), count (2),
+    // entries of 96 bytes, signature (64).
     let mut bytes = unb64(view.endorsement.as_deref().expect("endorsement"));
     let evil = DeviceKeys::generate().expect("keys").public();
-    let count = u16::from_be_bytes([bytes[9], bytes[10]]) + 1;
-    bytes[9..11].copy_from_slice(&count.to_be_bytes());
+    let count = u16::from_be_bytes([bytes[49], bytes[50]]) + 1;
+    bytes[49..51].copy_from_slice(&count.to_be_bytes());
     let at = bytes.len() - 64;
     let mut entry = uuid_bytes(EVIL).expect("uuid").to_vec();
     entry.extend_from_slice(&evil.signing);
@@ -2088,4 +2093,676 @@ fn a_record_the_server_refused_during_a_refetch_is_still_checked_after_a_restart
     assert!(b.engine.record(ZONE, "r2").is_none());
     assert!(!b.engine.has_pending(ZONE));
     Ok(())
+}
+
+// ---- Protection settings ----
+
+type Level = wire::ProtectionLevel;
+type State = orbyn_client::ProtectionState;
+
+/// `device` signs `level` as the next link of the chain it verified, as a server would store it.
+fn link(device: &Device, level: Level) -> wire::ProtectionLink {
+    let body = device
+        .engine
+        .sign_protection(level, NOW_S)
+        .expect("sign protection");
+    as_link(device, body)
+}
+
+fn as_link(device: &Device, body: wire::SetProtection) -> wire::ProtectionLink {
+    wire::ProtectionLink {
+        level: body.level,
+        seq: body.seq,
+        prev: body.prev,
+        signed_at: body.signed_at,
+        signer_device_id: device.id.clone(),
+        signature: body.device_signature,
+    }
+}
+
+/// The chain the server shows: these links, and no more.
+fn chain(links: &[&wire::ProtectionLink]) -> wire::ProtectionChain {
+    wire::ProtectionChain {
+        links: links.iter().map(|l| (*l).clone()).collect(),
+        more: false,
+    }
+}
+
+/// `a` signs Standard then Advanced and verifies both: its head is 2.
+fn a_with_two_settings(
+    a: &mut Device,
+    devices: &wire::DeviceList,
+) -> (wire::ProtectionLink, wire::ProtectionLink) {
+    let first = link(a, Level::Standard);
+    a.engine
+        .verify_protection(&chain(&[&first]), devices)
+        .expect("first");
+    let second = link(a, Level::Advanced);
+    let status = a
+        .engine
+        .verify_protection(&chain(&[&first, &second]), devices)
+        .expect("second");
+    assert_eq!(
+        (status.seq, status.state),
+        (2, State::Verified(Level::Advanced))
+    );
+    (first, second)
+}
+
+/// Approves `c` from `a` the usual way.
+fn approve_c(a: &mut Device, c: &mut Device, devices: &wire::DeviceList) {
+    let (pd, view, sas) = confirmed(a, c, devices);
+    c.engine
+        .finish_approval(pd, &view, Some(&sas), NOW_S + 30)
+        .expect("finish");
+}
+
+#[test]
+fn no_verified_setting_is_unknown_and_a_first_link_a_device_signed_itself_is_verified() {
+    let (mut a, _b, _c, devices) = approving();
+    assert_eq!(a.engine.protection_level(), State::Unknown, "not Standard");
+    assert_eq!(a.engine.protection_seq(), 0);
+    let first = link(&a, Level::Standard);
+    assert_eq!(
+        (first.seq, first.prev.as_str()),
+        (1, b64(&auth::PROTECTION_GENESIS).as_str())
+    );
+    let status = a
+        .engine
+        .verify_protection(&chain(&[&first]), &devices)
+        .expect("verify");
+    assert_eq!(
+        (status.seq, status.state, status.stopped),
+        (1, State::Verified(Level::Standard), None)
+    );
+    assert!(a.engine.protection_level().is_verified_standard());
+}
+
+#[test]
+fn a_setting_only_counts_from_a_device_this_device_trusts() {
+    let (mut a, _b, c, devices) = approving();
+    // c is pending: the server may list it, a does not trust it, so its setting does not count.
+    let from_stranger = link(&c, Level::Standard);
+    let status = a
+        .engine
+        .verify_protection(&chain(&[&from_stranger]), &devices)
+        .expect("verify");
+    assert_eq!(
+        (status.seq, status.state, status.stopped),
+        (0, State::Unknown, Some("untrusted_signer"))
+    );
+    // A signature that is not the signer's is refused too, and a made-up signer.
+    let mut forged_signature = link(&a, Level::Standard);
+    forged_signature.signature = b64(&[7; 64]);
+    let status = a
+        .engine
+        .verify_protection(&chain(&[&forged_signature]), &devices)
+        .expect("verify");
+    assert_eq!(status.stopped, Some("invalid_signature"));
+    let mut unknown = link(&a, Level::Standard);
+    unknown.signer_device_id = EVIL.into();
+    let status = a
+        .engine
+        .verify_protection(&chain(&[&unknown]), &devices)
+        .expect("verify");
+    assert_eq!(status.stopped, Some("untrusted_signer"));
+    assert_eq!(a.engine.protection_level(), State::Unknown);
+}
+
+#[test]
+fn a_lower_sequence_than_the_verified_head_is_refused() {
+    let (mut a, _b, _c, devices) = approving();
+    let (first, second) = a_with_two_settings(&mut a, &devices);
+    // The server shows only the old Standard: a rollback, and nothing changes.
+    assert_eq!(
+        a.engine.verify_protection(&chain(&[&first]), &devices),
+        Err(ClientError::ProtectionRollback)
+    );
+    assert_eq!(
+        a.engine.protection_level(),
+        State::Verified(Level::Advanced)
+    );
+    assert_eq!(a.engine.protection_seq(), 2);
+    // The honest chain, or just its head, is fine.
+    assert!(
+        a.engine
+            .verify_protection(&chain(&[&second]), &devices)
+            .is_ok()
+    );
+    assert_eq!(a.engine.protection_seq(), 2);
+}
+
+#[test]
+fn a_fork_at_a_verified_sequence_or_off_the_head_is_refused() {
+    let (mut a, b, mut c, devices) = approving();
+    let all = list(&[&a, &b, &c]);
+    c.entry.state = wire::DeviceState::Pending;
+    let (first, second) = a_with_two_settings(&mut a, &devices);
+    // b is trusted by a, so a setting it signs is a real one: a different second link from b,
+    // after the same first, is a fork at sequence 2.
+    let mut b_engine = b;
+    b_engine
+        .engine
+        .verify_protection(&chain(&[&first]), &all)
+        .expect("b follows the first");
+    let rival = link(&b_engine, Level::Standard);
+    assert_eq!(rival.seq, 2);
+    assert_ne!(rival.signature, second.signature);
+    assert_eq!(
+        a.engine.verify_protection(&chain(&[&first, &rival]), &all),
+        Err(ClientError::ProtectionFork)
+    );
+    assert_eq!(
+        a.engine.protection_level(),
+        State::Verified(Level::Advanced)
+    );
+    // A third link whose prev is not the head's hash is a fork off the head.
+    let mut off = link(&a, Level::Standard);
+    off.prev = b64(&[9; 32]);
+    assert_eq!(
+        a.engine.verify_protection(&chain(&[&second, &off]), &all),
+        Err(ClientError::ProtectionFork)
+    );
+    assert_eq!(a.engine.protection_seq(), 2);
+}
+
+#[test]
+fn a_replayed_old_standard_is_refused_by_a_device_approved_after_the_switch_to_advanced() {
+    let (mut a, b, mut c, devices) = approving();
+    let (first, second) = a_with_two_settings(&mut a, &devices);
+    approve_c(&mut a, &mut c, &devices);
+    let trusted = list(&[&a, &b, &c]);
+    // c knows nothing verified yet, but it holds its approver's view: it needs sequence 2.
+    assert_eq!(c.engine.protection_level(), State::Unknown);
+    // The server replays the genuine, old Standard: refused, and c is still at no level.
+    assert_eq!(
+        c.engine.verify_protection(&chain(&[&first]), &trusted),
+        Err(ClientError::ProtectionRollback)
+    );
+    assert_eq!(c.engine.protection_level(), State::Unknown);
+    // A different link at sequence 2 than the one a vouched for is refused as a fork.
+    let mut other = link(&a, Level::Standard);
+    other.seq = 2;
+    other.prev = first.prev.clone();
+    assert_eq!(
+        c.engine
+            .verify_protection(&chain(&[&first, &other]), &trusted),
+        Err(ClientError::ProtectionFork)
+    );
+    // The real head is accepted, with no earlier links needed: c now sees Advanced, verified,
+    // because its approver vouched for the chain.
+    let status = c
+        .engine
+        .verify_protection(&chain(&[&second]), &trusted)
+        .expect("verify");
+    assert_eq!(
+        (status.seq, status.state),
+        (2, State::Verified(Level::Advanced))
+    );
+    // And the old Standard stays refused from then on.
+    assert_eq!(
+        c.engine.verify_protection(&chain(&[&first]), &trusted),
+        Err(ClientError::ProtectionRollback)
+    );
+}
+
+#[test]
+fn a_chain_goes_on_past_the_vouched_setting_and_every_later_link_is_checked() {
+    let (mut a, b, mut c, devices) = approving();
+    let (_, second) = a_with_two_settings(&mut a, &devices);
+    approve_c(&mut a, &mut c, &devices);
+    let trusted = list(&[&a, &b, &c]);
+    let third = link(&a, Level::Standard);
+    assert_eq!(third.seq, 3);
+    let status = c
+        .engine
+        .verify_protection(&chain(&[&second, &third]), &trusted)
+        .expect("verify");
+    assert_eq!(
+        (status.seq, status.state),
+        (3, State::Verified(Level::Standard))
+    );
+    // A fourth link signed by a device c does not trust stops there: the head stays at the last
+    // verified link and what c knows is only a guess.
+    let message = auth::protection_message(
+        &uuid_bytes(ACCOUNT).expect("uuid"),
+        &uuid_bytes(EVIL).expect("uuid"),
+        auth::PROTECTION_STANDARD,
+        4,
+        &unb64(&b64(&auth::protection_hash(&auth::protection_message(
+            &uuid_bytes(ACCOUNT).expect("uuid"),
+            &uuid_bytes(A).expect("uuid"),
+            auth::PROTECTION_STANDARD,
+            3,
+            &unb64(&third.prev).try_into().expect("32"),
+            third.signed_at,
+        ))))
+        .try_into()
+        .expect("32"),
+        third.signed_at,
+    );
+    let mut forged = third.clone();
+    forged.seq = 4;
+    forged.signer_device_id = EVIL.into();
+    forged.prev = b64(&auth::protection_hash(&auth::protection_message(
+        &uuid_bytes(ACCOUNT).expect("uuid"),
+        &uuid_bytes(A).expect("uuid"),
+        auth::PROTECTION_STANDARD,
+        3,
+        &unb64(&third.prev).try_into().expect("32"),
+        third.signed_at,
+    )));
+    let _ = message;
+    let status = c
+        .engine
+        .verify_protection(&chain(&[&second, &third, &forged]), &trusted)
+        .expect("verify");
+    assert_eq!(status.seq, 3);
+    assert_eq!(status.stopped, Some("untrusted_signer"));
+    assert_eq!(status.state, State::Provisional(Level::Standard));
+}
+
+#[test]
+fn an_approver_that_knew_of_no_setting_anchors_nothing_so_the_level_is_only_provisional() {
+    let (mut a, b, mut c, devices) = approving();
+    // a knows of no setting: c is approved, fetches a first link a signed, and the walk reaches
+    // the end of the chain, but nothing vouched for it: a server could have cut the chain short.
+    approve_c(&mut a, &mut c, &devices);
+    let trusted = list(&[&a, &b, &c]);
+    let first = link(&a, Level::Standard);
+    let status = c
+        .engine
+        .verify_protection(&chain(&[&first]), &trusted)
+        .expect("verify");
+    assert_eq!(
+        (status.seq, status.state),
+        (1, State::Provisional(Level::Standard))
+    );
+    assert!(!c.engine.protection_level().is_verified_standard());
+    // Once c signs a link itself it is anchored, and the next full walk is verified.
+    c.entry.state = wire::DeviceState::Trusted;
+    let trusted = list(&[&a, &b, &c]);
+    let own = link(&c, Level::Advanced);
+    let status = c
+        .engine
+        .verify_protection(&chain(&[&first, &own]), &trusted)
+        .expect("verify");
+    assert_eq!(
+        (status.seq, status.state),
+        (2, State::Verified(Level::Advanced))
+    );
+}
+
+/// An approver from before approvals covered their endorsement signs the v1 message, and its
+/// endorsement is format 2: no field for a setting, and the old context.
+#[test]
+fn a_format_2_endorsement_under_a_v1_approval_is_still_accepted_and_says_no_setting_is_known() {
+    let (a2, _b2, d, devices2) = approving();
+    let mut a2 = a2;
+    let mut d = d;
+    let (mut pa, create) = a2.engine.start_approval(&d.entry, NOW_S).expect("start");
+    let mut view = view_of(&create, &a2, &d);
+    let (pd, nonce) = d.engine.join_approval(&view, NOW_S).expect("join");
+    view.device_nonce = Some(nonce.nonce);
+    view.approver_nonce = Some(pa.reveal(&view).expect("reveal").nonce);
+    let sas = pd.sas(&view).expect("sas");
+    let _ = a2.engine.confirm_approval(pa, &devices2).expect("confirm");
+    let v1_message = auth::approval_message(&auth::Pairing {
+        account_id: &uuid_bytes(ACCOUNT).expect("uuid"),
+        approval_id: &uuid_bytes(&view.id).expect("uuid"),
+        created_at: view.created_at,
+        approver_id: &uuid_bytes(&a2.id).expect("uuid"),
+        approver: &a2.keys.public(),
+        device_id: &uuid_bytes(&d.id).expect("uuid"),
+        device: &d.keys.public(),
+    });
+    view.signature = Some(b64(&a2
+        .keys
+        .sign(auth::DEVICE_APPROVAL_CONTEXT, &v1_message)));
+    let sequence = 0u64;
+    let mut message = Vec::new();
+    message.extend_from_slice(&uuid_bytes(&view.id).expect("uuid"));
+    message.extend_from_slice(&uuid_bytes(&d.id).expect("uuid"));
+    message.extend_from_slice(&sequence.to_be_bytes());
+    let signature = a2.keys.sign("orbyn/approval-endorsement/v2", &message);
+    let mut v2 = vec![2u8];
+    v2.extend_from_slice(&sequence.to_be_bytes());
+    v2.extend_from_slice(&0u16.to_be_bytes());
+    v2.extend_from_slice(&signature);
+    view.endorsement = Some(b64(&v2));
+    d.engine
+        .finish_approval(pd, &view, Some(&sas), NOW_S + 30)
+        .expect("a format 2 endorsement is accepted");
+    assert_eq!(d.engine.protection_level(), State::Unknown);
+    assert!(pins(&d).contains_key(A));
+}
+
+#[test]
+fn what_a_device_verified_survives_a_snapshot_and_still_refuses_a_rollback() {
+    let (mut a, b, mut c, devices) = approving();
+    let (first, second) = a_with_two_settings(&mut a, &devices);
+    approve_c(&mut a, &mut c, &devices);
+    // c holds only a's vouched floor; a holds a verified head. Both come back from a snapshot.
+    for device in [&mut a, &mut c] {
+        let snapshot = device.engine.snapshot();
+        let json = serde_json::to_string(&snapshot).expect("json");
+        let back: Snapshot = serde_json::from_str(&json).expect("snapshot");
+        assert_eq!(back, snapshot);
+        device.engine = Engine::restore(copy(&device.keys), back, device.now).expect("restore");
+    }
+    let trusted = list(&[&a, &b, &c]);
+    assert_eq!(
+        a.engine.protection_level(),
+        State::Verified(Level::Advanced),
+        "verified survives a restart"
+    );
+    for device in [&mut a, &mut c] {
+        assert_eq!(
+            device.engine.verify_protection(&chain(&[&first]), &trusted),
+            Err(ClientError::ProtectionRollback)
+        );
+    }
+    assert!(
+        c.engine
+            .verify_protection(&chain(&[&second]), &trusted)
+            .is_ok()
+    );
+    // A device that has only a floor cannot sign a next link: it must verify first.
+    let (mut a3, _b3, mut c3, devices3) = approving();
+    a_with_two_settings(&mut a3, &devices3);
+    approve_c(&mut a3, &mut c3, &devices3);
+    assert!(c3.engine.sign_protection(Level::Standard, NOW_S).is_err());
+}
+
+// ---- Review probes ----
+
+/// A hostile server strips the endorsement from the approval, hoping to hide the approver's
+/// setting and then serve a truncated chain. The approval signature covers the endorsement.
+#[test]
+fn a_stripped_or_swapped_endorsement_breaks_the_approval() {
+    let (mut a, _b, mut c, devices) = approving();
+    a_with_two_settings(&mut a, &devices);
+    let (pd, view, sas) = confirmed(&mut a, &c, &devices);
+    assert!(view.endorsement.is_some());
+    let mut stripped = view.clone();
+    stripped.endorsement = None;
+    assert_eq!(
+        c.engine
+            .finish_approval(pd, &stripped, Some(&sas), NOW_S + 30),
+        Err(ClientError::Mismatch),
+        "an approval with no endorsement, made when endorsements existed"
+    );
+    assert_eq!(pins(&c).len(), 1, "c trusts only itself");
+
+    // Another approval's endorsement in its place: signed by the same approver, for another
+    // approval, so it fails by itself; one from an older state of a is the realistic swap.
+    let (mut a2, _b2, mut c2, devices2) = approving();
+    let (pd2, mut view2, sas2) = confirmed(&mut a2, &c2, &devices2);
+    let (_, view_other, _) = confirmed(&mut a2, &c2, &devices2);
+    view2.endorsement = view_other.endorsement;
+    assert_eq!(
+        c2.engine
+            .finish_approval(pd2, &view2, Some(&sas2), NOW_S + 30),
+        Err(ClientError::Mismatch)
+    );
+    // The control: the endorsement as sent is accepted.
+    let (mut a3, _b3, mut c3, devices3) = approving();
+    approve_c(&mut a3, &mut c3, &devices3);
+    assert!(pins(&c3).contains_key(A));
+}
+
+/// An approver that signs only the v1 approval message (it cannot cover a v3 endorsement) is not
+/// taken for one that can: a format 3 endorsement under a v1 signature is refused.
+#[test]
+fn a_format_3_endorsement_under_a_v1_approval_signature_is_refused() {
+    let (mut a, _b, mut c, devices) = approving();
+    let (pd, mut view, sas) = confirmed(&mut a, &c, &devices);
+    let v1_message = auth::approval_message(&auth::Pairing {
+        account_id: &uuid_bytes(ACCOUNT).expect("uuid"),
+        approval_id: &uuid_bytes(&view.id).expect("uuid"),
+        created_at: view.created_at,
+        approver_id: &uuid_bytes(&a.id).expect("uuid"),
+        approver: &a.keys.public(),
+        device_id: &uuid_bytes(&c.id).expect("uuid"),
+        device: &c.keys.public(),
+    });
+    view.signature = Some(b64(&a
+        .keys
+        .sign(auth::DEVICE_APPROVAL_CONTEXT, &v1_message)));
+    assert_eq!(
+        c.engine.finish_approval(pd, &view, Some(&sas), NOW_S + 30),
+        Err(ClientError::Mismatch)
+    );
+    assert_eq!(pins(&c).len(), 1, "c trusts only itself");
+}
+
+/// Other devices check the approver's signature from the device list, and it covers the
+/// endorsement's hash: a server that drops the hash only makes the device untrusted.
+#[test]
+fn other_devices_check_the_approval_signature_with_the_endorsement_hash_from_the_list() {
+    let mut store = FakeStore::new(10);
+    let (a, b, _) = pair(&mut store);
+    let honest = list(&[&a, &b]);
+    assert!(honest.devices[1].approval_endorsement_hash.is_some());
+    // A device that has not pinned b yet decides from the list alone.
+    let trusts_b = |list: &wire::DeviceList| {
+        let mut fresh = Engine::new(copy(&a.keys), ACCOUNT, A).expect("engine");
+        fresh.verify_devices(list).iter().any(|p| p.device_id == B)
+    };
+    assert!(trusts_b(&honest), "the list as the approver made it");
+    let mut stripped = honest.clone();
+    stripped.devices[1].approval_endorsement_hash = None;
+    assert!(
+        !trusts_b(&stripped),
+        "a v2 approval does not verify without its hash"
+    );
+    let mut other = honest.clone();
+    other.devices[1].approval_endorsement_hash = Some(b64(&[3; 32]));
+    assert!(!trusts_b(&other), "nor with another hash");
+}
+
+/// An honest server and a lost phone: b (trusted by a) signed Advanced, a had not fetched it, and
+/// then a removed b. a cannot verify the newest link, so it must not say Standard; the person
+/// re-signs, and the chain moves on.
+#[test]
+fn a_removed_signer_leaves_a_provisional_level_until_a_trusted_device_signs_past_it() {
+    let mut store = FakeStore::new(10);
+    let (mut a, mut b, _) = pair(&mut store);
+    let all = list(&[&a, &b]);
+    let first = link(&a, Level::Standard);
+    a.engine
+        .verify_protection(&chain(&[&first]), &all)
+        .expect("a 1");
+    b.engine
+        .verify_protection(&chain(&[&first]), &all)
+        .expect("b 1");
+    let second = link(&b, Level::Advanced);
+    let mut after = all.clone();
+    after.removals.push(removal(&a, &b));
+    let status = a
+        .engine
+        .verify_protection(&chain(&[&first, &second]), &after)
+        .expect("a walks");
+    assert_eq!(status.stopped, Some("untrusted_signer"));
+    assert_eq!(
+        status.state,
+        State::Provisional(Level::Standard),
+        "a guess, not Standard to act on"
+    );
+    assert!(!a.engine.protection_level().is_verified_standard());
+
+    // A new device approved by a inherits what a verified, and is told the same: provisional.
+    let mut c = Device::new(C, a.now);
+    let with_c = list(&[&a, &c]);
+    approve_c(&mut a, &mut c, &with_c);
+    let c_list = list(&[&a, &c]);
+    let st = c
+        .engine
+        .verify_protection(&chain(&[&first, &second]), &c_list)
+        .expect("c walks");
+    assert_eq!(st.state, State::Provisional(Level::Standard));
+
+    // The person is shown the setting and re-signs: a signs seq 3 over the server's head. The
+    // chain now walks past b's removed link, because a trusted device signed after it.
+    let body = a
+        .engine
+        .resign_protection(Level::Advanced, &second, NOW_S)
+        .expect("resign");
+    assert_eq!(
+        (body.seq, body.prev.clone()),
+        (3, {
+            let m = auth::protection_message(
+                &uuid_bytes(ACCOUNT).expect("uuid"),
+                &uuid_bytes(B).expect("uuid"),
+                auth::PROTECTION_ADVANCED,
+                2,
+                &unb64(&second.prev).try_into().expect("32"),
+                second.signed_at,
+            );
+            b64(&auth::protection_hash(&m))
+        })
+    );
+    let third = as_link(&a, body);
+    let status = a
+        .engine
+        .verify_protection(&chain(&[&first, &second, &third]), &after)
+        .expect("a verifies");
+    assert_eq!(
+        (status.seq, status.state, status.stopped),
+        (3, State::Verified(Level::Advanced), None)
+    );
+    let st = c
+        .engine
+        .verify_protection(&chain(&[&first, &second, &third]), &c_list)
+        .expect("c verifies");
+    assert_eq!(
+        (st.seq, st.state),
+        (3, State::Verified(Level::Advanced)),
+        "c's approver vouched for the chain, and a trusted device signed the last link"
+    );
+    // A server head older than what a verified is not something to sign over.
+    assert_eq!(
+        a.engine.resign_protection(Level::Standard, &first, NOW_S),
+        Err(ClientError::ProtectionRollback)
+    );
+}
+
+#[test]
+fn an_unverified_link_in_the_middle_is_accepted_when_a_later_trusted_link_commits_to_it() {
+    let (mut a, _b, _c, devices) = approving();
+    let first = link(&a, Level::Standard);
+    a.engine
+        .verify_protection(&chain(&[&first]), &devices)
+        .expect("first");
+    // Link 2 comes from a device a does not trust; a trusted device (a) signs link 3 over it.
+    let stranger = Device::new(EVIL, a.now);
+    let mut theirs = stranger;
+    theirs
+        .engine
+        .verify_protection(&chain(&[&first]), &list(&[&a]))
+        .ok();
+    let second = wire::ProtectionLink {
+        level: Level::Advanced,
+        seq: 2,
+        prev: {
+            let m = auth::protection_message(
+                &uuid_bytes(ACCOUNT).expect("uuid"),
+                &uuid_bytes(A).expect("uuid"),
+                auth::PROTECTION_STANDARD,
+                1,
+                &auth::PROTECTION_GENESIS,
+                first.signed_at,
+            );
+            b64(&auth::protection_hash(&m))
+        },
+        signed_at: NOW_S,
+        signer_device_id: EVIL.into(),
+        signature: b64(&[5; 64]),
+    };
+    let alone = a
+        .engine
+        .verify_protection(&chain(&[&first, &second]), &devices)
+        .expect("walk");
+    assert_eq!(alone.stopped, Some("untrusted_signer"));
+    let body = a
+        .engine
+        .resign_protection(Level::Standard, &second, NOW_S)
+        .expect("resign");
+    let third = as_link(&a, body);
+    let status = a
+        .engine
+        .verify_protection(&chain(&[&first, &second, &third]), &devices)
+        .expect("committed");
+    assert_eq!(
+        (status.seq, status.state, status.stopped),
+        (3, State::Verified(Level::Standard), None)
+    );
+}
+
+#[test]
+fn a_chain_that_is_not_complete_is_only_provisional() {
+    let (mut a, _b, _c, devices) = approving();
+    let first = link(&a, Level::Standard);
+    let mut page = chain(&[&first]);
+    page.more = true;
+    let status = a
+        .engine
+        .verify_protection(&page, &devices)
+        .expect("first page");
+    assert_eq!(status.state, State::Provisional(Level::Standard));
+    // The last page completes it.
+    let status = a
+        .engine
+        .verify_protection(&chain(&[&first]), &devices)
+        .expect("last page");
+    assert_eq!(status.state, State::Verified(Level::Standard));
+    // And an empty answer later confirms nothing.
+    let status = a
+        .engine
+        .verify_protection(&chain(&[]), &devices)
+        .expect("empty");
+    assert_eq!(status.state, State::Provisional(Level::Standard));
+}
+
+#[test]
+fn the_vouched_link_is_bound_to_its_level_and_its_signer() {
+    let (mut a, b, mut c, devices) = approving();
+    let (first, second) = a_with_two_settings(&mut a, &devices);
+    approve_c(&mut a, &mut c, &devices);
+    let trusted = list(&[&a, &b, &c]);
+    // The server swaps the level of the vouched link: its hash changes, so it is a fork.
+    let mut swapped = second.clone();
+    swapped.level = Level::Standard;
+    swapped.signature = b64(&[0; 64]);
+    assert_eq!(
+        c.engine
+            .verify_protection(&chain(&[&first, &swapped]), &trusted),
+        Err(ClientError::ProtectionFork)
+    );
+    // The signer is inside the signed bytes, so naming another one is a fork too.
+    let mut relabeled = second.clone();
+    relabeled.signer_device_id = EVIL.to_owned();
+    relabeled.signature = b64(&[1; 64]);
+    assert_eq!(
+        c.engine.verify_protection(&chain(&[&relabeled]), &trusted),
+        Err(ClientError::ProtectionFork)
+    );
+    assert_eq!(c.engine.protection_level(), State::Unknown);
+}
+
+#[test]
+fn an_old_link_replayed_as_the_successor_is_refused() {
+    let (mut a, _b, _c, devices) = approving();
+    let (first, second) = a_with_two_settings(&mut a, &devices);
+    let mut replay = first.clone();
+    replay.seq = 3;
+    assert_eq!(
+        a.engine
+            .verify_protection(&chain(&[&second, &replay]), &devices),
+        Err(ClientError::ProtectionFork)
+    );
+    assert_eq!(
+        a.engine.protection_level(),
+        State::Verified(Level::Advanced)
+    );
 }
