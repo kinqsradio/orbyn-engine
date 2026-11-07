@@ -1,7 +1,7 @@
 [package]
 name = "orbyn-keyservice-client"
-description = "The record server's client for the key service's internal API (mutual TLS, pinned CA). AGPL-3.0-only, like the service."
-license = "AGPL-3.0-only"
+description = "The record server's client for the key service's internal API (mutual TLS, pinned CA)."
+license = "MIT OR Apache-2.0"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -1,6 +1,6 @@
 # orbyn-engine
 
-The core every Orbyn app shares, open source by side (see Licence): one account, encrypted sync and the keychain under every Orbyn app. Orbyn Planner is the first app on it; Orbyn Engineering, Orbyn Notes and Orbyn Studio are planned to join. It has two halves: the device core that every app embeds, which keeps everything on the device and syncs it encrypted end to end, and the server, which holds accounts, encrypted records and keys and ships as one Docker image.
+The core every Orbyn app shares, open source under MIT or Apache 2.0, your choice: one account, encrypted sync and the keychain under every Orbyn app. Orbyn Planner is the first app on it; Orbyn Engineering, Orbyn Notes and Orbyn Studio are planned to join. It has two halves: the device core that every app embeds, which keeps everything on the device and syncs it encrypted end to end, and the server, which holds accounts, encrypted records and keys and ships as one Docker image.
 
 **Private by design · Local first · One account · Agent ready.** Records are encrypted on the device before upload, every device works offline and keeps a full copy, one account will sign in to every Orbyn app, and agents will reach it only through grants the person controls (planned).
 
@@ -46,13 +46,8 @@ cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
 
 ## Licence
 
-The engine is split in two, so that anyone can audit the encryption and embed the client, while the server stays free to self-host.
+Open source: MIT or Apache 2.0, your choice (`MIT OR Apache-2.0`), for every crate, the server included. See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
 
-| Crates | Licence | Files |
-| --- | --- | --- |
-| App-side, the device half that apps embed: `orbyn-contracts`, `orbyn-crypto`, `orbyn-client`, `orbyn-sync`, `orbyn-wasm`, `orbyn-planner`, `orbyn-auth-client`, `orbyn-translog` | MIT or Apache 2.0, at your option (`MIT OR Apache-2.0`) | [LICENSE-MIT](LICENSE-MIT), [LICENSE-APACHE](LICENSE-APACHE) |
-| Server-side: `orbyn-server`, `orbyn-store`, `orbyn-core`, `orbyn-worker`, `orbyn-cli`, `orbyn-keyservice`, `orbyn-keyservice-server`, `orbyn-keyservice-daemon`, `orbyn-keyservice-client`, `orbyn-witness` | GNU Affero General Public License 3.0 only (`AGPL-3.0-only`) | [LICENSE-AGPL](LICENSE-AGPL) |
-
-Each crate's `Cargo.toml` names its licence. CI checks that no app-side crate depends on a server-side one (`scripts/check_licence_split.py`).
+Each crate's `Cargo.toml` names its licence, and CI checks that every crate does (`scripts/check_licence.py`).
 
 The Orbyn name and logo are trademarks and are not licensed; a fork must use another name. Outside contributions need a contributor licence agreement, which is being set up; until then, pull requests from outside are not accepted.
