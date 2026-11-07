@@ -30,6 +30,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+cryptoki.workspace = true
 orbyn-keyservice = { workspace = true, features = ["pkcs11", "test-support"] }
 rcgen.workspace = true
 rustls-pki-types.workspace = true
