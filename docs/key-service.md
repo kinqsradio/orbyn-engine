@@ -250,6 +250,7 @@ A cancel is a statement signed by a device (`orbyn/recovery-cancel/v1`: account,
   - If checks stop for any reason, including a server withholding the log or the app staying closed, it fires anyway, with no push or email from the server involved.
   - With the 72-hour wait, that leaves at least 48 hours to cancel.
   - On the web, where a closed tab cannot schedule one, the check runs when the page opens, and the desktop and phone apps carry the guarantee.
+- **The identity map.** The same log carries a second map, the identity map, keyed by `VRF(normalised email)`, for sharing ([sharing.md](sharing.md)). It holds identity statements that the key service appends only after checking their signatures and chain, and links each reset to the account's recovery-finish entry. It is independent of the service key and of the protection level.
 - **Its limit.** The log catches a recovery hidden from the device list. It cannot catch an operator who reads keys without any recovery; the off-machine audit and the HSM roles below are the control for that.
 
 ## Audit and HSM access
