@@ -3,11 +3,13 @@
 //! Accounts and devices are made with plain SQL: these tests are about records,
 //! and each test makes its own accounts, so they run side by side.
 
+use orbyn_auth_client as auth;
 use orbyn_core::Database;
-use orbyn_core::accounts::{DeviceState, Session};
+use orbyn_core::accounts::{DeviceState, Limit, Session};
+use orbyn_crypto::DeviceKeys;
 use orbyn_store::{
-    Change, ChangeToken, Hub, KEY_ID_LEN, Limits, NewEnvelope, Notice, Rotation, Store, StoreError,
-    Upload, ZONE_CHANGED_JOB,
+    Change, ChangeToken, Hub, KEY_ID_LEN, Limits, NewEnvelope, NewProtection, Notice,
+    ProtectionLevel, Rotation, Store, StoreError, Upload, ZONE_CHANGED_JOB,
 };
 use std::time::Duration;
 use uuid::Uuid;
@@ -2182,4 +2184,565 @@ async fn thirty_accounts_from_thirty_addresses_meet_the_replica_cap_and_never_th
     }
     assert_eq!(answered, 20);
     assert!(refused > 0, "the replica cap refused some of the flood");
+}
+
+// ---- Protection settings ----
+
+/// A device of `account_id` in `state` with real keys, so what it signs can be checked.
+async fn keyed_device(db: &Database, account_id: Uuid, state: &str) -> (Session, DeviceKeys) {
+    let keys = DeviceKeys::generate().expect("keys");
+    let public = keys.public();
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO devices (id, account_id, name, platform, signing_key, agreement_key, state)
+         VALUES ($1, $2, 'Test', 'linux', $3, $4, $5)",
+    )
+    .bind(id)
+    .bind(account_id)
+    .bind(public.signing.as_slice())
+    .bind(public.agreement.as_slice())
+    .bind(state)
+    .execute(db.pool())
+    .await
+    .expect("device");
+    let session = Session {
+        id: Uuid::new_v4(),
+        account_id,
+        device_id: id,
+        device_state: if state == "trusted" {
+            DeviceState::Trusted
+        } else {
+            DeviceState::Pending
+        },
+    };
+    (session, keys)
+}
+
+fn now_secs() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+/// The setting `keys` sign for `account` (as the account of `session`).
+fn setting(
+    session: &Session,
+    keys: &DeviceKeys,
+    level: ProtectionLevel,
+    seq: u64,
+    prev: [u8; 32],
+    signed_at: i64,
+) -> NewProtection {
+    let byte = match level {
+        ProtectionLevel::Standard => auth::PROTECTION_STANDARD,
+        ProtectionLevel::Advanced => auth::PROTECTION_ADVANCED,
+    };
+    let message = auth::protection_message(
+        session.account_id.as_bytes(),
+        session.device_id.as_bytes(),
+        byte,
+        seq,
+        &prev,
+        signed_at,
+    );
+    NewProtection {
+        level,
+        seq,
+        prev,
+        signed_at,
+        signature: keys.sign(auth::PROTECTION_CONTEXT, &message),
+    }
+}
+
+/// The hash the next setting after `new` must name.
+fn hash_of(session: &Session, new: &NewProtection) -> [u8; 32] {
+    let byte = match new.level {
+        ProtectionLevel::Standard => auth::PROTECTION_STANDARD,
+        ProtectionLevel::Advanced => auth::PROTECTION_ADVANCED,
+    };
+    auth::protection_hash(&auth::protection_message(
+        session.account_id.as_bytes(),
+        session.device_id.as_bytes(),
+        byte,
+        new.seq,
+        &new.prev,
+        new.signed_at,
+    ))
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_protection_setting_must_be_the_heads_successor() {
+    // Every attempt with a valid signature counts toward the rate limit, conflicts included, so this
+    // test, which tries many, runs with a limit it will not reach.
+    let (store, db) = store_with(Limits {
+        protection_per_hour: Limit::new(1000, Duration::from_secs(3600)),
+        protection_per_day: Limit::new(1000, Duration::from_secs(86_400)),
+        ..Limits::default()
+    })
+    .await;
+    let account = account(&db).await;
+    let (me, keys) = keyed_device(&db, account, "trusted").await;
+    let genesis = auth::PROTECTION_GENESIS;
+
+    // The first setting is 1 over 32 zero bytes: another sequence, or another prev, is refused
+    // and there is no head to show.
+    for (seq, prev) in [(2, genesis), (1, [1; 32]), (3, [1; 32])] {
+        let bad = setting(&me, &keys, ProtectionLevel::Standard, seq, prev, now_secs());
+        assert_eq!(
+            store
+                .put_protection(&me, &bad)
+                .await
+                .expect_err("a conflict")
+                .to_string(),
+            StoreError::ProtectionConflict(None).to_string()
+        );
+    }
+    let first = setting(
+        &me,
+        &keys,
+        ProtectionLevel::Standard,
+        1,
+        genesis,
+        now_secs(),
+    );
+    let stored = store.put_protection(&me, &first).await.expect("first");
+    assert_eq!(
+        (stored.seq, stored.level, stored.signer_device_id),
+        (1, ProtectionLevel::Standard, me.device_id)
+    );
+
+    // A replay of the accepted request is a conflict whose head is that very setting, so a device
+    // that lost the answer finds its request went through.
+    let Err(StoreError::ProtectionConflict(Some(head))) = store.put_protection(&me, &first).await
+    else {
+        panic!("a replay is a conflict with the head");
+    };
+    assert_eq!((head.seq, head.signature), (1, first.signature));
+
+    // The next one needs seq 2 and the hash of the first.
+    let hash1 = hash_of(&me, &first);
+    for (seq, prev) in [(1, genesis), (2, genesis), (3, hash1), (2, [9; 32])] {
+        let bad = setting(&me, &keys, ProtectionLevel::Advanced, seq, prev, now_secs());
+        assert!(
+            matches!(store.put_protection(&me, &bad).await, Err(StoreError::ProtectionConflict(Some(h))) if h.seq == 1),
+            "seq {seq}"
+        );
+    }
+    let second = setting(&me, &keys, ProtectionLevel::Advanced, 2, hash1, now_secs());
+    store.put_protection(&me, &second).await.expect("second");
+
+    // Another trusted device of the account continues the chain; the chain is all there, in order.
+    let (other, other_keys) = keyed_device(&db, account, "trusted").await;
+    let third = setting(
+        &other,
+        &other_keys,
+        ProtectionLevel::Standard,
+        3,
+        hash_of(&me, &second),
+        now_secs(),
+    );
+    store.put_protection(&other, &third).await.expect("third");
+    let (links, more) = store.protection_chain(&me, 1).await.expect("chain");
+    assert!(!more);
+    let seen: Vec<_> = links
+        .iter()
+        .map(|l| (l.seq, l.level, l.signer_device_id))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (1, ProtectionLevel::Standard, me.device_id),
+            (2, ProtectionLevel::Advanced, me.device_id),
+            (3, ProtectionLevel::Standard, other.device_id),
+        ]
+    );
+    // From a sequence on, and from before the start.
+    assert_eq!(
+        store
+            .protection_chain(&me, 3)
+            .await
+            .expect("from 3")
+            .0
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .protection_chain(&me, 0)
+            .await
+            .expect("from 0")
+            .0
+            .len(),
+        3
+    );
+    assert!(
+        store
+            .protection_chain(&me, 4)
+            .await
+            .expect("empty")
+            .0
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn only_a_trusted_device_with_a_fresh_signature_of_its_own_can_set_protection() {
+    let (store, db) = store().await;
+    let account = account(&db).await;
+    let (me, keys) = keyed_device(&db, account, "trusted").await;
+    let (pending, pending_keys) = keyed_device(&db, account, "pending").await;
+    let genesis = auth::PROTECTION_GENESIS;
+    let now = now_secs();
+
+    // A pending device, even with a valid signature, is not trusted: no write and no read.
+    let from_pending = setting(
+        &pending,
+        &pending_keys,
+        ProtectionLevel::Standard,
+        1,
+        genesis,
+        now,
+    );
+    assert!(matches!(
+        store.put_protection(&pending, &from_pending).await,
+        Err(StoreError::DeviceNotTrusted)
+    ));
+    assert!(matches!(
+        store.protection_chain(&pending, 1).await,
+        Err(StoreError::DeviceNotTrusted)
+    ));
+    // Another device's signature, or one made for another account, or another level, is refused.
+    let by_other_key = setting(
+        &me,
+        &pending_keys,
+        ProtectionLevel::Standard,
+        1,
+        genesis,
+        now,
+    );
+    let stranger = Session {
+        account_id: Uuid::new_v4(),
+        ..me
+    };
+    let for_other_account = setting(&stranger, &keys, ProtectionLevel::Standard, 1, genesis, now);
+    let mut other_level = setting(&me, &keys, ProtectionLevel::Standard, 1, genesis, now);
+    other_level.level = ProtectionLevel::Advanced;
+    for bad in [by_other_key, for_other_account, other_level] {
+        assert!(matches!(
+            store.put_protection(&me, &bad).await,
+            Err(StoreError::InvalidProtectionSignature)
+        ));
+    }
+    // A signature from outside the five minutes, either way, is refused, so a captured request
+    // cannot be sent later.
+    for at in [now - 6 * 60, now + 6 * 60] {
+        let stale = setting(&me, &keys, ProtectionLevel::Standard, 1, genesis, at);
+        assert!(matches!(
+            store.put_protection(&me, &stale).await,
+            Err(StoreError::InvalidProtectionSignature)
+        ));
+    }
+    // Nothing was stored, and a sequence of zero or past 2^53 is not even considered.
+    assert!(
+        store
+            .protection_chain(&me, 1)
+            .await
+            .expect("chain")
+            .0
+            .is_empty()
+    );
+    for seq in [0, auth::MAX_PROTECTION_SEQUENCE + 1] {
+        let bad = setting(&me, &keys, ProtectionLevel::Standard, seq, genesis, now);
+        assert!(matches!(
+            store.put_protection(&me, &bad).await,
+            Err(StoreError::InvalidProtection)
+        ));
+    }
+    // A removed device that was trusted cannot sign either.
+    let (gone, gone_keys) = keyed_device(&db, account, "trusted").await;
+    sqlx::query("UPDATE devices SET state = 'removed' WHERE id = $1")
+        .bind(gone.device_id)
+        .execute(db.pool())
+        .await
+        .expect("remove");
+    let by_removed = setting(
+        &gone,
+        &gone_keys,
+        ProtectionLevel::Standard,
+        1,
+        genesis,
+        now,
+    );
+    assert!(matches!(
+        store.put_protection(&gone, &by_removed).await,
+        Err(StoreError::DeviceNotTrusted)
+    ));
+    // Accounts have chains of their own.
+    let (second_account, second_keys) =
+        keyed_device(&db, self::account(&db).await, "trusted").await;
+    let first = setting(
+        &second_account,
+        &second_keys,
+        ProtectionLevel::Standard,
+        1,
+        genesis,
+        now,
+    );
+    store
+        .put_protection(&second_account, &first)
+        .await
+        .expect("own chain");
+    assert!(
+        store
+            .protection_chain(&me, 1)
+            .await
+            .expect("chain")
+            .0
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_setting_waits_for_a_concurrent_one_and_then_finds_the_chain_has_moved() {
+    let (store, db) = store().await;
+    let account = account(&db).await;
+    let (a, a_keys) = keyed_device(&db, account, "trusted").await;
+    let (b, _) = keyed_device(&db, account, "trusted").await;
+    let from_a = setting(
+        &a,
+        &a_keys,
+        ProtectionLevel::Standard,
+        1,
+        auth::PROTECTION_GENESIS,
+        now_secs(),
+    );
+
+    // A rival setting holds the account's lock, stores sequence 1 and commits a moment later.
+    let mut rival = db.pool().begin().await.expect("begin");
+    sqlx::query("SELECT 1 FROM accounts WHERE id = $1 FOR NO KEY UPDATE")
+        .bind(account)
+        .execute(&mut *rival)
+        .await
+        .expect("lock");
+    let rival_setting = async {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        sqlx::query(
+            "INSERT INTO protection_settings
+                 (account_id, seq, level, prev, hash, signed_at, signer_device_id, signature)
+             VALUES ($1, 1, 'advanced', $2, $3, 0, $4, $5)",
+        )
+        .bind(account)
+        .bind(auth::PROTECTION_GENESIS.as_slice())
+        .bind([7u8; 32].as_slice())
+        .bind(b.device_id)
+        .bind([0u8; 64].as_slice())
+        .execute(&mut *rival)
+        .await
+        .expect("rival setting");
+        rival.commit().await.expect("commit");
+    };
+    let (put, ()) = tokio::join!(store.put_protection(&a, &from_a), rival_setting);
+    // The request waited for the account's lock, so it saw the rival's setting as the head and is
+    // a conflict that shows it, instead of failing on the table's own uniqueness.
+    assert!(
+        matches!(&put, Err(StoreError::ProtectionConflict(Some(h))) if h.seq == 1 && h.level == ProtectionLevel::Advanced),
+        "{put:?}"
+    );
+    assert_eq!(
+        store.protection_chain(&a, 1).await.expect("chain").0.len(),
+        1
+    );
+}
+
+/// A distinct 32-byte hash per number; 0 is the genesis `prev`.
+fn chain_hash(n: i64) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[..8].copy_from_slice(&n.to_be_bytes());
+    out
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn the_chain_is_paged_with_no_cap_on_its_length() {
+    let (store, db) = store().await;
+    let account = account(&db).await;
+    let (me, keys) = keyed_device(&db, account, "trusted").await;
+    // 1500 settings written straight into the table (the rules above cover how they get there),
+    // each with the hash the next one must name: the chain has no cap.
+    for seq in 1..=1500_i64 {
+        sqlx::query(
+            "INSERT INTO protection_settings
+                 (account_id, seq, level, prev, hash, signed_at, signer_device_id, signature)
+             VALUES ($1, $2, 'standard', $3, $4, 0, $5, $6)",
+        )
+        .bind(account)
+        .bind(seq)
+        .bind(chain_hash(seq - 1).as_slice())
+        .bind(chain_hash(seq).as_slice())
+        .bind(me.device_id)
+        .bind([0u8; 64].as_slice())
+        .execute(db.pool())
+        .await
+        .expect("setting");
+    }
+    let (page, more) = store.protection_chain(&me, 1).await.expect("page");
+    assert_eq!((page.len(), more, page[99].seq), (100, true, 100));
+    let (last, more) = store.protection_chain(&me, 1401).await.expect("last page");
+    assert_eq!((last.len(), more), (100, false));
+    // The 1501st goes in like any other.
+    let next = setting(
+        &me,
+        &keys,
+        ProtectionLevel::Advanced,
+        1501,
+        chain_hash(1500),
+        now_secs(),
+    );
+    store.put_protection(&me, &next).await.expect("the 1501st");
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn protection_settings_are_rate_limited_per_account_after_the_signature_verifies() {
+    let (db_store, db) = store_with(Limits {
+        protection_per_hour: Limit::new(3, Duration::from_secs(3600)),
+        protection_per_day: Limit::new(5, Duration::from_secs(86_400)),
+        ..Limits::default()
+    })
+    .await;
+    let store = db_store;
+    let account = account(&db).await;
+    let (me, keys) = keyed_device(&db, account, "trusted").await;
+    let (other, other_keys) = keyed_device(&db, account, "trusted").await;
+    let now = now_secs();
+    // Requests that are not validly signed by a trusted device of the account use none of it,
+    // however many: a pending device, a bad signature, a stale time.
+    let (pending, pending_keys) = keyed_device(&db, account, "pending").await;
+    for _ in 0..10 {
+        let from_pending = setting(
+            &pending,
+            &pending_keys,
+            ProtectionLevel::Standard,
+            1,
+            auth::PROTECTION_GENESIS,
+            now,
+        );
+        assert!(matches!(
+            store.put_protection(&pending, &from_pending).await,
+            Err(StoreError::DeviceNotTrusted)
+        ));
+        let mut bad = setting(
+            &me,
+            &keys,
+            ProtectionLevel::Standard,
+            1,
+            auth::PROTECTION_GENESIS,
+            now,
+        );
+        bad.signature[0] ^= 1;
+        assert!(matches!(
+            store.put_protection(&me, &bad).await,
+            Err(StoreError::InvalidProtectionSignature)
+        ));
+        let stale = setting(
+            &me,
+            &keys,
+            ProtectionLevel::Standard,
+            1,
+            auth::PROTECTION_GENESIS,
+            now - 600,
+        );
+        assert!(matches!(
+            store.put_protection(&me, &stale).await,
+            Err(StoreError::InvalidProtectionSignature)
+        ));
+    }
+    // Three valid settings in the hour, from either device: the fourth is refused, even though it
+    // is the right next link.
+    let mut prev = auth::PROTECTION_GENESIS;
+    for seq in 1..=3u64 {
+        let (who, who_keys) = if seq % 2 == 1 {
+            (&me, &keys)
+        } else {
+            (&other, &other_keys)
+        };
+        let next = setting(who, who_keys, ProtectionLevel::Standard, seq, prev, now);
+        prev = hash_of(who, &next);
+        store
+            .put_protection(who, &next)
+            .await
+            .expect("within the limit");
+    }
+    let fourth = setting(&me, &keys, ProtectionLevel::Advanced, 4, prev, now);
+    assert!(matches!(
+        store.put_protection(&me, &fourth).await,
+        Err(StoreError::TooManyProtectionChanges)
+    ));
+    // Nothing was stored for it, and a conflict (a valid signature on a request that does not
+    // fit) counts like any other attempt.
+    assert_eq!(
+        store.protection_chain(&me, 1).await.expect("chain").0.len(),
+        3
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn concurrent_successors_leave_one_winner_and_a_conflict_with_the_head() {
+    let (store, db) = store().await;
+    for _round in 0..20 {
+        let account = account(&db).await;
+        let (a, ak) = keyed_device(&db, account, "trusted").await;
+        let (b, bk) = keyed_device(&db, account, "trusted").await;
+        let g = auth::PROTECTION_GENESIS;
+        let sa = setting(&a, &ak, ProtectionLevel::Standard, 1, g, now_secs());
+        let sb = setting(&b, &bk, ProtectionLevel::Advanced, 1, g, now_secs());
+        let (ra, rb) = tokio::join!(store.put_protection(&a, &sa), store.put_protection(&b, &sb));
+        let ok = [ra.is_ok(), rb.is_ok()].iter().filter(|x| **x).count();
+        let conflict = [&ra, &rb]
+            .iter()
+            .filter(|r| matches!(r, Err(StoreError::ProtectionConflict(Some(_)))))
+            .count();
+        assert_eq!((ok, conflict), (1, 1), "{ra:?} {rb:?}");
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_replay_after_the_chain_moved_is_a_conflict_and_only_a_signed_request_learns_the_head() {
+    let (store, db) = store().await;
+    let account = account(&db).await;
+    let (a, ak) = keyed_device(&db, account, "trusted").await;
+    let g = auth::PROTECTION_GENESIS;
+    let first = setting(&a, &ak, ProtectionLevel::Standard, 1, g, now_secs());
+    store.put_protection(&a, &first).await.expect("1");
+    let second = setting(
+        &a,
+        &ak,
+        ProtectionLevel::Advanced,
+        2,
+        hash_of(&a, &first),
+        now_secs(),
+    );
+    store.put_protection(&a, &second).await.expect("2");
+    for old in [&first, &second] {
+        assert!(matches!(
+            store.put_protection(&a, old).await,
+            Err(StoreError::ProtectionConflict(Some(h))) if h.seq == 2
+        ));
+    }
+    // A pending device, and a trusted device whose signature is bad, learn no head.
+    let (p, pk) = keyed_device(&db, account, "pending").await;
+    let probe = setting(&p, &pk, ProtectionLevel::Standard, 9, g, now_secs());
+    assert!(matches!(
+        store.put_protection(&p, &probe).await,
+        Err(StoreError::DeviceNotTrusted)
+    ));
+    let mut bad = setting(&a, &ak, ProtectionLevel::Standard, 9, g, now_secs());
+    bad.signature[0] ^= 1;
+    assert!(matches!(
+        store.put_protection(&a, &bad).await,
+        Err(StoreError::InvalidProtectionSignature)
+    ));
 }

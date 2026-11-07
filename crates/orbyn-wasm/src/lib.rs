@@ -63,6 +63,8 @@ impl From<ClientError> for Error {
             ClientError::InvalidInput => "invalid_input",
             ClientError::Random => "random_failed",
             ClientError::ExpiredAgain => "expired_again",
+            ClientError::ProtectionRollback => "protection_rollback",
+            ClientError::ProtectionFork => "protection_fork",
         };
         error(code, err)
     }
@@ -809,6 +811,73 @@ impl SyncEngine {
     pub fn sign_removal(&self, device_json: &str) -> Result<String> {
         let device: wire::Device = parse(device_json)?;
         to_json(&self.engine.sign_removal(&device)?)
+    }
+
+    /// The `SetProtection` body for `POST /v1/keychain/protection`: `level` (`standard` or
+    /// `advanced`) as the next link of the chain this device verified, signed now.
+    #[wasm_bindgen(js_name = signProtection)]
+    pub fn sign_protection(&self, level: &str, now_secs: f64) -> Result<String> {
+        let level = match level {
+            "standard" => wire::ProtectionLevel::Standard,
+            "advanced" => wire::ProtectionLevel::Advanced,
+            _ => return Err(error("invalid_input", "the level is standard or advanced")),
+        };
+        to_json(&self.engine.sign_protection(level, now_secs as i64)?)
+    }
+
+    /// Checks a `ProtectionChain` (from `GET /v1/keychain/protection?from=` `protectionFrom()`,
+    /// page by page, with its `more` flag) against the devices of `devices_json` this device
+    /// verifies, and moves the verified head forward over every link a trusted device signed or
+    /// committed to. Returns `{seq, state, level, stopped}`; `state` is `verified`, `provisional`
+    /// or `unknown` (see `protectionLevel`). Throws `protection_rollback` or `protection_fork`,
+    /// changing nothing.
+    #[wasm_bindgen(js_name = verifyProtection)]
+    pub fn verify_protection(&mut self, chain_json: &str, devices_json: &str) -> Result<String> {
+        let chain: wire::ProtectionChain = parse(chain_json)?;
+        let devices: wire::DeviceList = parse(devices_json)?;
+        to_json(&self.engine.verify_protection(&chain, &devices)?)
+    }
+
+    /// What this device knows about the protection level, as `{state, level}`: `verified` (the
+    /// whole chain was walked to the server's head and nothing stopped it, from an anchor this
+    /// device trusts: the only state in which Standard may be acted on, for escrow),
+    /// `provisional` (a verified setting that may not be the newest: show it as a guess), or
+    /// `unknown` (no level, and not Standard).
+    #[wasm_bindgen(js_name = protectionLevel)]
+    pub fn protection_level(&self) -> Result<String> {
+        to_json(&self.engine.protection_level())
+    }
+
+    /// The body that signs `level` as the link after the server's newest link `head_json` (a
+    /// `ProtectionLink`), even one this device could not verify: it moves the chain past a link
+    /// signed by a removed device or a setting this device refused. The app must show the person
+    /// the setting and ask before calling it, and never sign on its own.
+    #[wasm_bindgen(js_name = resignProtection)]
+    pub fn resign_protection(&self, level: &str, head_json: &str, now_secs: f64) -> Result<String> {
+        let level = match level {
+            "standard" => wire::ProtectionLevel::Standard,
+            "advanced" => wire::ProtectionLevel::Advanced,
+            _ => return Err(error("invalid_input", "the level is standard or advanced")),
+        };
+        let head: wire::ProtectionLink = parse(head_json)?;
+        to_json(
+            &self
+                .engine
+                .resign_protection(level, &head, now_secs as i64)?,
+        )
+    }
+
+    /// The sequence of the newest verified setting, 0 for none.
+    #[wasm_bindgen(js_name = protectionSeq)]
+    pub fn protection_seq(&self) -> f64 {
+        self.engine.protection_seq() as f64
+    }
+
+    /// Where to fetch the chain from (`GET /v1/keychain/protection?from=`): the verified head's
+    /// sequence, or the one an approver vouched for, or 1.
+    #[wasm_bindgen(js_name = protectionFrom)]
+    pub fn protection_from(&self) -> f64 {
+        self.engine.protection_from() as f64
     }
 
     /// The `DeleteZone` body for `DELETE /v1/zones/{zone}`.

@@ -4,19 +4,87 @@
 use crate::AppState;
 use crate::accounts::{Authed, encode, time};
 use crate::records::{Answer, Body, Refusal, bytes, store};
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
 use orbyn_contracts as wire;
-use orbyn_store::{NewEnvelope, Rotation};
+use orbyn_store::{NewEnvelope, NewProtection, ProtectionLevel, ProtectionRecord, Rotation};
+use serde::Deserialize;
 use uuid::Uuid;
 
 pub(crate) fn routes() -> Router<AppState> {
-    Router::new().route(
-        "/v1/keychain/envelopes",
-        get(list_envelopes).post(put_envelopes),
-    )
+    Router::new()
+        .route(
+            "/v1/keychain/envelopes",
+            get(list_envelopes).post(put_envelopes),
+        )
+        .route(
+            "/v1/keychain/protection",
+            get(protection_chain).post(set_protection),
+        )
+}
+
+fn wire_level(level: ProtectionLevel) -> wire::ProtectionLevel {
+    match level {
+        ProtectionLevel::Standard => wire::ProtectionLevel::Standard,
+        ProtectionLevel::Advanced => wire::ProtectionLevel::Advanced,
+    }
+}
+
+pub(crate) fn wire_protection(r: ProtectionRecord) -> wire::ProtectionLink {
+    wire::ProtectionLink {
+        level: wire_level(r.level),
+        seq: r.seq,
+        prev: encode(&r.prev),
+        signed_at: r.signed_at,
+        signer_device_id: r.signer_device_id.to_string(),
+        signature: encode(&r.signature),
+    }
+}
+
+async fn set_protection(
+    State(state): State<AppState>,
+    Authed(session): Authed,
+    Body(body): Body<wire::SetProtection>,
+) -> Answer<(StatusCode, Json<wire::ProtectionLink>)> {
+    let level = match body.level {
+        wire::ProtectionLevel::Standard => ProtectionLevel::Standard,
+        wire::ProtectionLevel::Advanced => ProtectionLevel::Advanced,
+    };
+    let new = NewProtection {
+        level,
+        seq: body.seq,
+        prev: bytes(&body.prev)?
+            .try_into()
+            .map_err(|_| Refusal::BadRequest)?,
+        signed_at: body.signed_at,
+        signature: bytes(&body.device_signature)?
+            .try_into()
+            .map_err(|_| Refusal::BadRequest)?,
+    };
+    let stored = store(&state)?.put_protection(&session, &new).await?;
+    Ok((StatusCode::CREATED, Json(wire_protection(stored))))
+}
+
+#[derive(Deserialize)]
+struct ChainQuery {
+    from: Option<u64>,
+}
+
+async fn protection_chain(
+    State(state): State<AppState>,
+    Authed(session): Authed,
+    query: Result<Query<ChainQuery>, axum::extract::rejection::QueryRejection>,
+) -> Answer<Json<wire::ProtectionChain>> {
+    let Query(query) = query.map_err(|_| Refusal::BadRequest)?;
+    let (links, more) = store(&state)?
+        .protection_chain(&session, query.from.unwrap_or(1))
+        .await?;
+    Ok(Json(wire::ProtectionChain {
+        links: links.into_iter().map(wire_protection).collect(),
+        more,
+    }))
 }
 
 async fn put_envelopes(

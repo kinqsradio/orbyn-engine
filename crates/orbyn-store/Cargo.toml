@@ -9,7 +9,9 @@ publish.workspace = true
 [dependencies]
 base64.workspace = true
 chrono.workspace = true
+orbyn-auth-client.workspace = true
 orbyn-core.workspace = true
+orbyn-crypto.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

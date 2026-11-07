@@ -35,6 +35,11 @@
 //! The endorsement carries the approver's removal sequence. The new device
 //! drops an endorsed list whose sequence is below the newest removal it has
 //! counted: the approver made it before it knew of that removal.
+//!
+//! Since format 3 it also carries the sequence and hash of the approver's newest verified
+//! protection setting, so the new device starts from the approver's view and accepts no older
+//! setting (see `protection`). Format 2, from an approver that predates settings, is still
+//! accepted and says no setting is known.
 
 use crate::trust::{key32, public_of, uuid_bytes};
 use crate::{ClientError, Engine, Result, b64, random, unb64};
@@ -44,8 +49,12 @@ use orbyn_crypto::DevicePublic;
 use zeroize::Zeroizing;
 
 /// The context of the approver's signed list of devices it trusts.
-pub const ENDORSEMENT_CONTEXT: &str = "orbyn/approval-endorsement/v2";
-const ENDORSEMENT_FORMAT: u8 = 2;
+pub const ENDORSEMENT_CONTEXT: &str = "orbyn/approval-endorsement/v3";
+const ENDORSEMENT_FORMAT: u8 = 3;
+/// The context and format of endorsements made before protection settings existed. They are
+/// read, never made.
+const ENDORSEMENT_CONTEXT_V2: &str = "orbyn/approval-endorsement/v2";
+const ENDORSEMENT_FORMAT_V2: u8 = 2;
 /// A device id, its two keys and the id of the device the approver pinned it
 /// under (all zero for an anchor).
 const ENTRY_LEN: usize = 16 + 32 + 32 + 16;
@@ -85,8 +94,15 @@ impl Bound {
         self.with(|p| auth::approval_sas(p, approver_nonce, device_nonce))
     }
 
+    /// The v1 approval message, which approvers that predate endorsements' protection settings
+    /// signed.
     fn message(&self) -> Vec<u8> {
         self.with(auth::approval_message)
+    }
+
+    /// The v2 approval message, which covers the endorsement's hash.
+    fn message_v2(&self, endorsement_hash: &[u8; 32]) -> Vec<u8> {
+        self.with(|p| auth::approval_message_v2(p, endorsement_hash))
     }
 }
 
@@ -201,11 +217,22 @@ fn fresh(created_at: i64, now_secs: i64) -> bool {
     (-5 * 60..=auth::APPROVAL_MAX_AGE_SECS).contains(&age)
 }
 
-fn endorsement_message(bound: &Bound, sequence: u64, entries: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(40 + entries.len());
+/// What the approver signs: the approval, the removal sequence, the protection setting it vouches
+/// for (`None` for a format-2 endorsement, which signs no such field) and the device list.
+fn endorsement_message(
+    bound: &Bound,
+    sequence: u64,
+    protection: Option<(u64, [u8; 32])>,
+    entries: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(80 + entries.len());
     out.extend_from_slice(&bound.approval_id);
     out.extend_from_slice(&bound.device_id);
     out.extend_from_slice(&sequence.to_be_bytes());
+    if let Some((seq, hash)) = protection {
+        out.extend_from_slice(&seq.to_be_bytes());
+        out.extend_from_slice(&hash);
+    }
     out.extend_from_slice(entries);
     out
 }
@@ -268,9 +295,6 @@ impl Engine {
         if pairing.device_nonce.is_none() {
             return Err(ClientError::Mismatch);
         }
-        let signature = self
-            .keys
-            .sign(auth::DEVICE_APPROVAL_CONTEXT, &pairing.bound.message());
         let peers = self.verify_devices(devices);
         let mut entries = Vec::new();
         let mut count: u16 = 0;
@@ -289,15 +313,25 @@ impl Engine {
             count += 1;
         }
         let sequence = self.trust.removal_sequence();
+        let protection = self.protection.endorsed();
         let endorsement_signature = self.keys.sign(
             ENDORSEMENT_CONTEXT,
-            &endorsement_message(&pairing.bound, sequence, &entries),
+            &endorsement_message(&pairing.bound, sequence, Some(protection), &entries),
         );
         let mut endorsement = vec![ENDORSEMENT_FORMAT];
         endorsement.extend_from_slice(&sequence.to_be_bytes());
+        endorsement.extend_from_slice(&protection.0.to_be_bytes());
+        endorsement.extend_from_slice(&protection.1);
         endorsement.extend_from_slice(&count.to_be_bytes());
         endorsement.extend_from_slice(&entries);
         endorsement.extend_from_slice(&endorsement_signature);
+        // The approval signature covers the endorsement, so it cannot be dropped or swapped.
+        let signature = self.keys.sign(
+            auth::DEVICE_APPROVAL_V2_CONTEXT,
+            &pairing
+                .bound
+                .message_v2(&auth::endorsement_hash(&endorsement)),
+        );
         Ok(wire::ConfirmApproval {
             signature: b64(&signature),
             endorsement: Some(b64(&endorsement)),
@@ -372,26 +406,52 @@ impl Engine {
             .and_then(|s| unb64(s).ok())
             .and_then(|s| s.try_into().ok())
             .ok_or(ClientError::Mismatch)?;
-        orbyn_crypto::verify(
-            &pairing.bound.approver,
-            auth::DEVICE_APPROVAL_CONTEXT,
-            &pairing.bound.message(),
-            &signature,
-        )
-        .map_err(|_| ClientError::Mismatch)?;
-        let endorsed = match view.endorsement.as_deref() {
-            None => Vec::new(),
-            Some(text) => {
-                let (sequence, endorsed) = read_endorsement(&pairing.bound, &unb64(text)?)?;
-                if sequence < self.trust.removal_sequence() {
+        let endorsement_bytes = view.endorsement.as_deref().map(unb64).transpose()?;
+        // An approver that covers its endorsement signs the v2 message over its hash: dropping or
+        // swapping the endorsement then breaks the signature, and an approval with no endorsement
+        // cannot pass as one. Only an approver that predates this signs the v1 message, and it
+        // cannot make a format 3 endorsement.
+        let v2 = endorsement_bytes.as_deref().is_some_and(|e| {
+            orbyn_crypto::verify(
+                &pairing.bound.approver,
+                auth::DEVICE_APPROVAL_V2_CONTEXT,
+                &pairing.bound.message_v2(&auth::endorsement_hash(e)),
+                &signature,
+            )
+            .is_ok()
+        });
+        if !v2 {
+            orbyn_crypto::verify(
+                &pairing.bound.approver,
+                auth::DEVICE_APPROVAL_CONTEXT,
+                &pairing.bound.message(),
+                &signature,
+            )
+            .map_err(|_| ClientError::Mismatch)?;
+        }
+        let (endorsed, vouched) = match endorsement_bytes.as_deref() {
+            None => (Vec::new(), None),
+            Some(bytes) => {
+                let read = read_endorsement(&pairing.bound, bytes)?;
+                if read.format == ENDORSEMENT_FORMAT && !v2 {
+                    return Err(ClientError::Mismatch);
+                }
+                let endorsed = if read.removal_sequence < self.trust.removal_sequence() {
                     Vec::new()
                 } else {
-                    endorsed
-                }
+                    read.devices
+                };
+                (endorsed, read.protection)
             }
         };
+        // Both are checked before either is kept, so a refusal leaves this device as it was.
+        let mut protection = self.protection.clone();
+        if let Some((seq, hash)) = vouched {
+            protection.vouch(seq, hash)?;
+        }
         self.trust
             .pin_approval(&pairing.approver_id, pairing.bound.approver, endorsed)?;
+        self.protection = protection;
         Ok(sas)
     }
 }
@@ -400,26 +460,53 @@ impl Engine {
 /// pinned it under, if any.
 type Endorsed = (String, DevicePublic, Option<String>);
 
-/// An endorsement's removal sequence and the devices it lists, after checking
-/// the approver's signature.
-fn read_endorsement(bound: &Bound, bytes: &[u8]) -> Result<(u64, Vec<Endorsed>)> {
+/// What a verified endorsement says.
+struct Read {
+    format: u8,
+    removal_sequence: u64,
+    /// The approver's newest protection setting (sequence and hash), `None` when the endorsement
+    /// is format 2 or the approver knew of none.
+    protection: Option<(u64, [u8; 32])>,
+    devices: Vec<Endorsed>,
+}
+
+/// An endorsement's removal sequence, protection setting and the devices it lists, after
+/// checking the approver's signature.
+fn read_endorsement(bound: &Bound, bytes: &[u8]) -> Result<Read> {
     let bad = || ClientError::Mismatch;
     let (&format, rest) = bytes.split_first().ok_or_else(bad)?;
-    if format != ENDORSEMENT_FORMAT || rest.len() < 8 + 2 + 64 {
+    let (context, has_protection) = match format {
+        ENDORSEMENT_FORMAT => (ENDORSEMENT_CONTEXT, true),
+        ENDORSEMENT_FORMAT_V2 => (ENDORSEMENT_CONTEXT_V2, false),
+        _ => return Err(bad()),
+    };
+    let fixed = 8 + if has_protection { 8 + 32 } else { 0 } + 2 + 64;
+    if rest.len() < fixed {
         return Err(bad());
     }
     let (sequence, rest) = rest.split_at(8);
     let sequence = u64::from_be_bytes(sequence.try_into().map_err(|_| bad())?);
+    let (protection, rest) = if has_protection {
+        let (seq, rest) = rest.split_at(8);
+        let (hash, rest) = rest.split_at(32);
+        let seq = u64::from_be_bytes(seq.try_into().map_err(|_| bad())?);
+        let hash: [u8; 32] = hash.try_into().map_err(|_| bad())?;
+        // Zero means the approver had verified no setting.
+        ((seq != 0).then_some((seq, hash)), rest)
+    } else {
+        (None, rest)
+    };
     let count = usize::from(u16::from_be_bytes([rest[0], rest[1]]));
     let entries = &rest[2..rest.len() - 64];
     if count > MAX_ENDORSED || entries.len() != count * ENTRY_LEN {
         return Err(bad());
     }
     let signature: [u8; 64] = rest[rest.len() - 64..].try_into().map_err(|_| bad())?;
+    let signed_protection = has_protection.then(|| protection.unwrap_or((0, [0; 32])));
     orbyn_crypto::verify(
         &bound.approver,
-        ENDORSEMENT_CONTEXT,
-        &endorsement_message(bound, sequence, entries),
+        context,
+        &endorsement_message(bound, sequence, signed_protection, entries),
         &signature,
     )
     .map_err(|_| bad())?;
@@ -438,5 +525,10 @@ fn read_endorsement(bound: &Bound, bytes: &[u8]) -> Result<(u64, Vec<Endorsed>)>
             ))
         })
         .collect::<Result<_>>()?;
-    Ok((sequence, devices))
+    Ok(Read {
+        format,
+        removal_sequence: sequence,
+        protection,
+        devices,
+    })
 }

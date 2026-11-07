@@ -15,12 +15,17 @@
 //! - The keychain keeps zone keys that one trusted device sealed to another
 //!   trusted device of the account, as envelopes the server never opens.
 //!
+//! - The protection level is a chain of settings signed by trusted devices. The
+//!   server checks each new one against the head and stores the chain; devices
+//!   verify the signatures themselves.
+//!
 //! Every operation checks in the database that the session's account owns the
 //! zone and that its device is trusted, not only the route.
 
 mod inflight;
 mod keychain;
 mod live;
+mod protection;
 mod purge;
 mod records;
 mod token;
@@ -28,6 +33,7 @@ mod zones;
 
 pub use keychain::{Envelope, KEY_ID_LEN, NewEnvelope, Rotation};
 pub use live::{Feed, Hub, Notice};
+pub use protection::{NewProtection, PROTECTION_PAGE, ProtectionLevel, ProtectionRecord};
 #[cfg(feature = "test-support")]
 pub use purge::purge_accounts;
 pub use purge::{Purged, purge};
@@ -94,6 +100,11 @@ pub struct Limits {
     pub max_uploads_in_flight_global: usize,
     /// `/v1/sync` sockets one account may have open on a replica.
     pub max_sockets_per_account: usize,
+    /// Protection settings one account may make in an hour and in a day, counted after the
+    /// signature verified (a request that is not signed by a trusted device of the account uses
+    /// none). A setting costs a few hundred bytes, so there is no cap on the chain itself.
+    pub protection_per_hour: Limit,
+    pub protection_per_day: Limit,
 }
 
 impl Limits {
@@ -133,6 +144,8 @@ impl Default for Limits {
             max_uploads_in_flight_per_address: 16,
             max_uploads_in_flight_global: 5,
             max_sockets_per_account: 16,
+            protection_per_hour: Limit::new(10, Duration::from_secs(60 * 60)),
+            protection_per_day: Limit::new(50, Duration::from_secs(24 * 60 * 60)),
         }
     }
 }
@@ -181,6 +194,17 @@ pub enum StoreError {
     RecipientNotTrusted,
     #[error("the device has too many key envelopes")]
     TooManyEnvelopes,
+    #[error("a protection setting is not valid")]
+    InvalidProtection,
+    /// The signature does not verify under the session device's key, or is not from the last
+    /// five minutes.
+    #[error("the protection setting is not signed by this device now")]
+    InvalidProtectionSignature,
+    /// The setting is not the head's successor. Carries the current head, if any.
+    #[error("the protection setting does not follow the current one")]
+    ProtectionConflict(Option<Box<ProtectionRecord>>),
+    #[error("the account changed its protection too many times; try again later")]
+    TooManyProtectionChanges,
     #[error("the account stores as many bytes as it may")]
     QuotaExceeded,
     /// The device or account uploaded faster than its limit; try again after `retry_after`.

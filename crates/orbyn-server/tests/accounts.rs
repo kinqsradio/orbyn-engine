@@ -83,10 +83,15 @@ async fn build_server(limits: Limits, pinned: bool) -> Server {
         accounts = accounts.with_clock(move || at);
     }
     let feeds = orbyn_core::feeds::Feeds::new(db.pool().clone()).expect("feeds");
+    let store = orbyn_store::Store::new(
+        db.pool().clone(),
+        orbyn_store::Hub::start(db.pool().clone()),
+    );
     let app = router(
         AppState::new(Arc::new(Up))
             .with_accounts(accounts)
-            .with_feeds(feeds),
+            .with_feeds(feeds)
+            .with_store(store),
         &[],
     );
     Server {
@@ -1418,6 +1423,164 @@ async fn feed_fetch_refuses_plain_http_internal_addresses_and_strangers() {
         )
         .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+// ---- Protection settings ----
+
+/// The body that sets protection: signed by `keys`, which belong to the device of `session`.
+fn protection_body(
+    session: &Value,
+    keys: &DeviceKeys,
+    level: &str,
+    seq: u64,
+    prev: &[u8; 32],
+    signed_at: i64,
+) -> Value {
+    let byte = if level == "standard" {
+        auth::PROTECTION_STANDARD
+    } else {
+        auth::PROTECTION_ADVANCED
+    };
+    let message = auth::protection_message(
+        uuid_of(&session["account_id"]).as_bytes(),
+        uuid_of(&session["device_id"]).as_bytes(),
+        byte,
+        seq,
+        prev,
+        signed_at,
+    );
+    json!({
+        "level": level, "seq": seq, "prev": b64(prev), "signed_at": signed_at,
+        "device_signature": b64(&keys.sign(auth::PROTECTION_CONTEXT, &message)),
+    })
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn protection_settings_chain_over_http_and_a_conflict_shows_the_head() {
+    let _turn = TURN.lock().await;
+    let server = server().await;
+    let p = pair(&server).await; // device B is pending
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64;
+    async fn post(server: &Server, session: &Value, body: Value) -> (StatusCode, Value) {
+        server
+            .call(
+                Method::POST,
+                "/v1/keychain/protection",
+                Some(token(session)),
+                Some(body),
+            )
+            .await
+    }
+
+    // The first setting is 1 over zeros; the answer is the stored link.
+    let first = protection_body(
+        &p.a_session,
+        &p.a,
+        "standard",
+        1,
+        &auth::PROTECTION_GENESIS,
+        now,
+    );
+    let (status, link) = post(&server, &p.a_session, first.clone()).await;
+    assert_eq!(status, StatusCode::CREATED, "{link}");
+    assert_eq!(
+        (
+            link["seq"].as_u64(),
+            &link["level"],
+            &link["signer_device_id"]
+        ),
+        (Some(1), &json!("standard"), &p.a_session["device_id"])
+    );
+
+    // A replay, or a setting that skips ahead, is 409 `protection_conflict` and carries the head.
+    for body in [
+        first.clone(),
+        protection_body(&p.a_session, &p.a, "advanced", 3, &[5; 32], now),
+    ] {
+        let (status, conflict) = post(&server, &p.a_session, body).await;
+        assert_eq!(
+            (status, &conflict["code"]),
+            (StatusCode::CONFLICT, &json!("protection_conflict"))
+        );
+        assert_eq!(conflict["head"], link, "{conflict}");
+    }
+    // The pending device can neither write nor read; no session is 401.
+    let from_b = protection_body(&p.b_session, &p.b, "advanced", 2, &[5; 32], now);
+    let (status, body) = post(&server, &p.b_session, from_b).await;
+    assert_eq!(
+        (status, &body["code"]),
+        (StatusCode::FORBIDDEN, &json!("device_not_trusted"))
+    );
+    assert_eq!(
+        server
+            .call(
+                Method::GET,
+                "/v1/keychain/protection",
+                Some(token(&p.b_session)),
+                None
+            )
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        server
+            .call(Method::GET, "/v1/keychain/protection", None, None)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    // A signature that is not this device's, or is from ten minutes ago, is 400 `invalid_signature`.
+    let hash = auth::protection_hash(&auth::protection_message(
+        uuid_of(&p.a_session["account_id"]).as_bytes(),
+        uuid_of(&p.a_session["device_id"]).as_bytes(),
+        auth::PROTECTION_STANDARD,
+        1,
+        &auth::PROTECTION_GENESIS,
+        now,
+    ));
+    for body in [
+        protection_body(&p.a_session, &p.b, "advanced", 2, &hash, now),
+        protection_body(&p.a_session, &p.a, "advanced", 2, &hash, now - 600),
+    ] {
+        let (status, body) = post(&server, &p.a_session, body).await;
+        assert_eq!(
+            (status, &body["code"]),
+            (StatusCode::BAD_REQUEST, &json!("invalid_signature"))
+        );
+    }
+    // The right next link goes through, and the chain reads back in order from any sequence.
+    let (status, second) = post(
+        &server,
+        &p.a_session,
+        protection_body(&p.a_session, &p.a, "advanced", 2, &hash, now),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{second}");
+    let (status, chain) = server
+        .call(
+            Method::GET,
+            "/v1/keychain/protection",
+            Some(token(&p.a_session)),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{chain}");
+    assert_eq!(chain["links"], json!([link, second]));
+    assert_eq!(chain["more"], false);
+    let (_, tail) = server
+        .call(
+            Method::GET,
+            "/v1/keychain/protection?from=2",
+            Some(token(&p.a_session)),
+            None,
+        )
+        .await;
+    assert_eq!(tail["links"], json!([second]));
 }
 
 // ---- TOTP as a second factor ----

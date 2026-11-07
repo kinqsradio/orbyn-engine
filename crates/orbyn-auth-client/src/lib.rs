@@ -45,6 +45,12 @@ pub const DEVICE_REGISTER_CONTEXT: &str = "orbyn/device-register/v1";
 pub const DEVICE_LOGIN_CONTEXT: &str = "orbyn/device-login/v1";
 /// What a trusted device signs to approve another: [`approval_message`].
 pub const DEVICE_APPROVAL_CONTEXT: &str = "orbyn/device-approval/v1";
+/// See [`approval_message_v2`].
+pub const DEVICE_APPROVAL_V2_CONTEXT: &str = "orbyn/device-approval/v2";
+/// What an approver signs since endorsements carry a protection setting: [`approval_message_v2`],
+/// the approval message plus the hash of the endorsement, so the endorsement cannot be removed or
+/// swapped without breaking the approval signature. Approvals made before it are still read under
+/// [`DEVICE_APPROVAL_CONTEXT`].
 /// Context for [`trusted_start_message`].
 pub const TRUSTED_START_CONTEXT: &str = "orbyn/trusted-login-start/v1";
 /// Context for [`totp_manage_message`].
@@ -277,6 +283,46 @@ pub fn totp_manage_message(
     out
 }
 
+/// What a trusted device signs to set the account's protection level.
+pub const PROTECTION_CONTEXT: &str = "orbyn/protection/v1";
+/// The level byte of `standard` in a protection message.
+pub const PROTECTION_STANDARD: u8 = 1;
+/// The level byte of `advanced` in a protection message.
+pub const PROTECTION_ADVANCED: u8 = 2;
+/// The highest protection sequence, so JavaScript reads every one exactly.
+pub const MAX_PROTECTION_SEQUENCE: u64 = (1 << 53) - 1;
+/// The `prev` of the first setting of an account: 32 zero bytes.
+pub const PROTECTION_GENESIS: [u8; 32] = [0; 32];
+
+/// What a trusted device signs, under [`PROTECTION_CONTEXT`], to set the protection level:
+/// the account, the signing device, the level byte ([`PROTECTION_STANDARD`] or [`PROTECTION_ADVANCED`]), the setting's
+/// sequence (the first is 1), the hash of the previous setting's message
+/// ([`PROTECTION_GENESIS`] for the first) and the time in Unix seconds, which the server accepts
+/// for five minutes either side of its clock. Settings form a chain through `prev`: a setting
+/// replayed later no longer fits the head, and one that is not the next link is refused.
+pub fn protection_message(
+    account_id: &[u8; 16],
+    signer_device_id: &[u8; 16],
+    level: u8,
+    sequence: u64,
+    prev: &[u8; 32],
+    signed_at: i64,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16 + 16 + 1 + 8 + 32 + 8);
+    out.extend_from_slice(account_id);
+    out.extend_from_slice(signer_device_id);
+    out.push(level);
+    out.extend_from_slice(&sequence.to_be_bytes());
+    out.extend_from_slice(prev);
+    out.extend_from_slice(&signed_at.to_be_bytes());
+    out
+}
+
+/// The hash the next setting names as its `prev`: SHA-256 of this setting's signed message.
+pub fn protection_hash(message: &[u8]) -> [u8; 32] {
+    sha256(message)
+}
+
 /// Committing to the approver's nonce before it sees the new device's.
 pub const APPROVAL_COMMIT_CONTEXT: &str = "orbyn/approval-commit/v1";
 /// The short authentication string both screens show.
@@ -350,6 +396,20 @@ pub fn approval_sas(
 /// it when they verify the new device by its approval chain.
 pub fn approval_message(pairing: &Pairing<'_>) -> Vec<u8> {
     pairing_bytes(DEVICE_APPROVAL_CONTEXT, pairing)
+}
+
+/// What the approver signs under [`DEVICE_APPROVAL_V2_CONTEXT`]: the approval, and the SHA-256 of
+/// the endorsement it attaches, so a server cannot drop the endorsement or put another in its
+/// place. `endorsement_hash` is [`endorsement_hash`] of the endorsement bytes as sent.
+pub fn approval_message_v2(pairing: &Pairing<'_>, endorsement_hash: &[u8; 32]) -> Vec<u8> {
+    let mut out = pairing_bytes(DEVICE_APPROVAL_V2_CONTEXT, pairing);
+    out.extend_from_slice(endorsement_hash);
+    out
+}
+
+/// The hash of an endorsement that [`approval_message_v2`] covers.
+pub fn endorsement_hash(endorsement: &[u8]) -> [u8; 32] {
+    sha256(endorsement)
 }
 
 /// The highest removal sequence, so JavaScript reads every one exactly.
@@ -546,5 +606,92 @@ mod totp_manage_tests {
             totp_manage_message(&[1; 16], &[2; 16], "enrol", "x", 0),
             totp_manage_message(&[1; 16], &[2; 16], "enro", "lx", 0)
         );
+    }
+}
+
+#[cfg(test)]
+mod protection_tests {
+    use super::*;
+
+    #[test]
+    fn a_protection_message_binds_every_field_and_chains_through_its_hash() {
+        let base = protection_message(
+            &[1; 16],
+            &[3; 16],
+            PROTECTION_STANDARD,
+            1,
+            &PROTECTION_GENESIS,
+            100,
+        );
+        for other in [
+            protection_message(
+                &[2; 16],
+                &[3; 16],
+                PROTECTION_STANDARD,
+                1,
+                &PROTECTION_GENESIS,
+                100,
+            ),
+            protection_message(
+                &[1; 16],
+                &[4; 16],
+                PROTECTION_STANDARD,
+                1,
+                &PROTECTION_GENESIS,
+                100,
+            ),
+            protection_message(
+                &[1; 16],
+                &[3; 16],
+                PROTECTION_ADVANCED,
+                1,
+                &PROTECTION_GENESIS,
+                100,
+            ),
+            protection_message(
+                &[1; 16],
+                &[3; 16],
+                PROTECTION_STANDARD,
+                2,
+                &PROTECTION_GENESIS,
+                100,
+            ),
+            protection_message(&[1; 16], &[3; 16], PROTECTION_STANDARD, 1, &[1; 32], 100),
+            protection_message(
+                &[1; 16],
+                &[3; 16],
+                PROTECTION_STANDARD,
+                1,
+                &PROTECTION_GENESIS,
+                101,
+            ),
+        ] {
+            assert_ne!(base, other);
+            assert_ne!(protection_hash(&base), protection_hash(&other));
+        }
+    }
+
+    #[test]
+    fn the_v2_approval_message_covers_the_endorsement_and_has_its_own_context() {
+        let account = [1; 16];
+        let (approval, approver, device) = ([2; 16], [3; 16], [4; 16]);
+        let keys = DevicePublic {
+            signing: [5; 32],
+            agreement: [6; 32],
+        };
+        let pairing = Pairing {
+            account_id: &account,
+            approval_id: &approval,
+            created_at: 10,
+            approver_id: &approver,
+            approver: &keys,
+            device_id: &device,
+            device: &keys,
+        };
+        let a = approval_message_v2(&pairing, &endorsement_hash(b"one"));
+        let b = approval_message_v2(&pairing, &endorsement_hash(b"two"));
+        assert_ne!(a, b);
+        assert_ne!(DEVICE_APPROVAL_CONTEXT, DEVICE_APPROVAL_V2_CONTEXT);
+        assert_ne!(a, approval_message(&pairing));
     }
 }

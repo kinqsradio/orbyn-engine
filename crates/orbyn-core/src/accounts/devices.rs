@@ -24,8 +24,9 @@ use super::{
 };
 use chrono::{DateTime, Utc};
 use orbyn_auth_client::{
-    DEVICE_APPROVAL_CONTEXT, DEVICE_REMOVAL_CONTEXT, MAX_REMOVAL_SEQUENCE, Pairing,
-    approval_commitment, approval_message, approval_sas, removal_message,
+    DEVICE_APPROVAL_CONTEXT, DEVICE_APPROVAL_V2_CONTEXT, DEVICE_REMOVAL_CONTEXT,
+    MAX_REMOVAL_SEQUENCE, Pairing, approval_commitment, approval_message, approval_message_v2,
+    approval_sas, endorsement_hash, removal_message,
 };
 use orbyn_crypto::DevicePublic;
 use sqlx::{Postgres, Transaction};
@@ -56,6 +57,7 @@ struct DeviceRow {
     approval_signature: Option<Vec<u8>>,
     approval_id: Option<Uuid>,
     approval_created_at: Option<i64>,
+    approval_endorsement_hash: Option<Vec<u8>>,
 }
 
 /// id, signing key, agreement key, removed by, removal sequence, removal signature.
@@ -87,7 +89,8 @@ macro_rules! select_devices {
     ($tail:literal) => {
         concat!(
             "SELECT id, name, platform, state, signing_key, agreement_key, created_at, ",
-            "approved_by, approval_signature, approval_id, approval_created_at FROM devices ",
+            "approved_by, approval_signature, approval_id, approval_created_at, ",
+            "approval_endorsement_hash FROM devices ",
             $tail
         )
     };
@@ -121,6 +124,7 @@ impl TryFrom<DeviceRow> for Device {
                 .transpose()?,
             approval_id: row.approval_id,
             approval_created_at: row.approval_created_at,
+            approval_endorsement_hash: fixed(row.approval_endorsement_hash)?,
         })
     }
 }
@@ -176,6 +180,37 @@ fn pairing_of<'a>(
         device_id: &ids.2,
         device: &view.device_keys,
     }
+}
+
+/// How an approval signature verified: under the v2 message that covers the endorsement, or the
+/// v1 message of an approver that predates it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ApprovalSignature {
+    V2,
+    V1,
+}
+
+/// Checks an approver's signature on an approval: the v2 message over the endorsement's hash when
+/// an endorsement came with it, else (or when that fails, for an older approver) the v1 message.
+fn verify_approval(
+    signer: &DevicePublic,
+    pairing: &Pairing<'_>,
+    endorsement: Option<&[u8]>,
+    signature: &[u8; 64],
+) -> Result<ApprovalSignature> {
+    if let Some(endorsement) = endorsement {
+        let message = approval_message_v2(pairing, &endorsement_hash(endorsement));
+        if verify_signed(signer, DEVICE_APPROVAL_V2_CONTEXT, &message, signature).is_ok() {
+            return Ok(ApprovalSignature::V2);
+        }
+    }
+    verify_signed(
+        signer,
+        DEVICE_APPROVAL_CONTEXT,
+        &approval_message(pairing),
+        signature,
+    )?;
+    Ok(ApprovalSignature::V1)
 }
 
 fn verify_signed(
@@ -492,11 +527,10 @@ impl Accounts {
             *view.device_id.as_bytes(),
         );
         let account = *session.account_id.as_bytes();
-        let message = approval_message(&pairing_of(&account, &view, &ids));
-        if verify_signed(
+        if verify_approval(
             &view.approver_keys,
-            DEVICE_APPROVAL_CONTEXT,
-            &message,
+            &pairing_of(&account, &view, &ids),
+            endorsement,
             signature,
         )
         .is_err()
@@ -598,27 +632,35 @@ impl Accounts {
             .device(&mut tx, session.account_id, view.approver_id)
             .await?
             .is_some_and(|d| d.state == DeviceState::Trusted && d.keys == view.approver_keys);
-        let message = approval_message(&pairing);
-        if !approver_trusted
-            || verify_signed(
+        let signed = if approver_trusted {
+            verify_approval(
                 &view.approver_keys,
-                DEVICE_APPROVAL_CONTEXT,
-                &message,
+                &pairing,
+                view.endorsement.as_deref(),
                 &signature,
             )
-            .is_err()
-        {
+            .ok()
+        } else {
+            None
+        };
+        let Some(signed) = signed else {
             close(&mut tx, approval_id).await?;
             tx.commit().await?;
             return Err(AccountError::InvalidSignature);
-        }
+        };
+        // Only a v2 signature covers the endorsement, so only then does a hash go with the device.
+        let endorsement_hash = match (signed, view.endorsement.as_deref()) {
+            (ApprovalSignature::V2, Some(endorsement)) => Some(endorsement_hash(endorsement)),
+            _ => None,
+        };
         sqlx::query("UPDATE device_approvals SET state = 'used' WHERE id = $1")
             .bind(approval_id)
             .execute(&mut *tx)
             .await?;
         sqlx::query(
             "UPDATE devices SET state = 'trusted', approved_by = $2, approval_signature = $3,
-                    approval_id = $4, approval_created_at = $5, approved_at = now()
+                    approval_id = $4, approval_created_at = $5, approved_at = now(),
+                    approval_endorsement_hash = $6
              WHERE id = $1 AND state IN ('pending', 'trusted')",
         )
         .bind(view.device_id)
@@ -626,6 +668,7 @@ impl Accounts {
         .bind(signature.as_slice())
         .bind(view.id)
         .bind(view.created_at)
+        .bind(endorsement_hash.as_ref().map(<[u8; 32]>::as_slice))
         .execute(&mut *tx)
         .await?;
         self.audit(
