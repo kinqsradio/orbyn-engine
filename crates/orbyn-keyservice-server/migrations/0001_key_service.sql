@@ -99,20 +99,26 @@ CREATE INDEX rate_events_count ON rate_events (action, subject, at);
 
 -- Append-only guards. A row of these tables is never deleted and never changed, except that an
 -- entry's `included_in_head` goes from null to a value once.
-CREATE FUNCTION ks_refuse() RETURNS trigger LANGUAGE plpgsql AS $$
+--
+-- Both functions pin their `search_path` (with `pg_temp` last, so a temporary table cannot come
+-- first) and name every table with its schema, so a session cannot shadow `heads` with a table of
+-- its own to get past the check. Temporary tables are also revoked from the runtime role.
+CREATE FUNCTION ks_refuse() RETURNS trigger LANGUAGE plpgsql
+    SET search_path = pg_catalog, public, pg_temp AS $$
 BEGIN
     RAISE EXCEPTION '% is append-only: % is refused', TG_TABLE_NAME, TG_OP
         USING ERRCODE = 'restrict_violation';
 END;
 $$;
 
-CREATE FUNCTION ks_log_entries_update() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE FUNCTION ks_log_entries_update() RETURNS trigger LANGUAGE plpgsql
+    SET search_path = pg_catalog, public, pg_temp AS $$
 BEGIN
     -- Only the head that covers the entry: its size reaches the entry's position.
     IF OLD.included_in_head IS NULL
        AND NEW.included_in_head IS NOT NULL
        AND (to_jsonb(NEW) - 'included_in_head') = (to_jsonb(OLD) - 'included_in_head')
-       AND (SELECT size FROM heads WHERE id = NEW.included_in_head) >= NEW.seq THEN
+       AND (SELECT h.size FROM public.heads h WHERE h.id = NEW.included_in_head) >= NEW.seq THEN
         RETURN NEW;
     END IF;
     RAISE EXCEPTION 'log_entries is append-only: only included_in_head may be set, once, from null, to a head that covers the entry'

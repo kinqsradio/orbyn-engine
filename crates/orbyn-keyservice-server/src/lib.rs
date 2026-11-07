@@ -164,25 +164,21 @@ pub async fn migrate(owner: &PgPool, runtime_role: &str) -> Result<()> {
     // of schema public (on Postgres 15 and later `public` belongs to `pg_database_owner`, so the
     // database's owner owns it), or a member of any of those, could drop the triggers or write what
     // the grants forbid.
-    let row = sqlx::query(
-        "SELECT rolsuper, \
-         pg_has_role(rolname, current_user, 'MEMBER') AS owner_member, \
-         pg_has_role(rolname, (SELECT datdba FROM pg_database WHERE datname = current_database()), 'MEMBER') AS database_owner_member, \
-         pg_has_role(rolname, (SELECT nspowner FROM pg_namespace WHERE nspname = 'public'), 'MEMBER') AS schema_owner_member \
-         FROM pg_roles WHERE rolname = $1",
+    let migrating_as_member: bool = sqlx::query_scalar(
+        "SELECT pg_has_role(r.rolname, current_user, 'MEMBER') FROM pg_roles r WHERE r.rolname = $1",
     )
     .bind(runtime_role)
     .fetch_optional(owner)
     .await?
     .ok_or(StoreError::UnsafeRole)?;
-    if row.try_get::<bool, _>("rolsuper")?
-        || row.try_get::<bool, _>("owner_member")?
-        || row.try_get::<bool, _>("database_owner_member")?
-        || row.try_get::<bool, _>("schema_owner_member")?
-    {
+    if migrating_as_member {
         return Err(StoreError::UnsafeRole);
     }
+    check_plain_role(owner, runtime_role).await?;
     MIGRATOR.run(owner).await?;
+    // And again against who really owns the tables and functions now, which is not necessarily the
+    // role that ran this: a table made earlier by another owner counts.
+    check_plain_role(owner, runtime_role).await?;
     let role = format!("\"{runtime_role}\"");
     let mut tx = owner.begin().await?;
     for statement in [
@@ -207,7 +203,73 @@ pub async fn migrate(owner: &PgPool, runtime_role: &str) -> Result<()> {
             .execute(&mut *tx)
             .await?;
     }
+    // No temporary tables for anyone: a runtime session cannot make a table of its own in
+    // `pg_temp`, which is searched before `public`. (The trigger functions also pin their search
+    // path and name their tables, so this is the second wall.)
+    sqlx::raw_sql(
+        "DO $$ BEGIN \
+         EXECUTE format('REVOKE TEMPORARY ON DATABASE %I FROM PUBLIC', current_database()); \
+         END $$",
+    )
+    .execute(&mut *tx)
+    .await?;
+    let revoke: String = sqlx::query_scalar(
+        "SELECT format('REVOKE TEMPORARY ON DATABASE %I FROM %I', current_database(), $1::text)",
+    )
+    .bind(runtime_role)
+    .fetch_one(&mut *tx)
+    .await?;
+    // Built by Postgres with `%I`, which quotes both names.
+    sqlx::raw_sql(sqlx::AssertSqlSafe(revoke))
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
+    Ok(())
+}
+
+/// The tables the key service owns, by name.
+const TABLES: [&str; 6] = [
+    "service_keys",
+    "log_entries",
+    "log_nodes",
+    "map_nodes",
+    "heads",
+    "rate_events",
+];
+
+/// Refuses a role that could undo the guards: a superuser, or a member of the owner of this
+/// database, of schema `public`, of any of the key service's tables, or of any of its trigger
+/// functions (`ks_*`). Looks at the owners as they are, not at who ran the migration.
+async fn check_plain_role<'e, E>(executor: E, role: &str) -> Result<()>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    let row = sqlx::query(
+        "SELECT r.rolsuper, \
+         pg_has_role(r.rolname, (SELECT datdba FROM pg_database WHERE datname = current_database()), 'MEMBER') AS database_owner, \
+         pg_has_role(r.rolname, (SELECT nspowner FROM pg_namespace WHERE nspname = 'public'), 'MEMBER') AS schema_owner, \
+         COALESCE((SELECT bool_or(pg_has_role(r.rolname, c.relowner, 'MEMBER')) \
+                   FROM pg_class c WHERE c.relnamespace = 'public'::regnamespace AND c.relname = ANY($2)), false) AS table_owner, \
+         COALESCE((SELECT bool_or(pg_has_role(r.rolname, p.proowner, 'MEMBER')) \
+                   FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace AND p.proname LIKE 'ks\\_%'), false) AS function_owner \
+         FROM pg_roles r WHERE r.rolname = $1",
+    )
+    .bind(role)
+    .bind(&TABLES[..])
+    .fetch_optional(executor)
+    .await?
+    .ok_or(StoreError::UnsafeRole)?;
+    for column in [
+        "rolsuper",
+        "database_owner",
+        "schema_owner",
+        "table_owner",
+        "function_owner",
+    ] {
+        if row.try_get::<bool, _>(column)? {
+            return Err(StoreError::UnsafeRole);
+        }
+    }
     Ok(())
 }
 
@@ -219,11 +281,40 @@ pub struct Store {
 }
 
 impl Store {
-    pub fn new(pool: PgPool) -> Self {
-        Self {
+    /// A store on `pool`, after checking the pool's own role: the role the pool connects as must
+    /// not be a superuser, nor a member of the owner of the database, the schema, the tables or the
+    /// trigger functions, because such a role can drop the guards. Run as the runtime role
+    /// [`migrate`] granted, not as the owner.
+    pub async fn connect(pool: PgPool) -> Result<Self> {
+        let role: String = sqlx::query_scalar("SELECT current_user::text")
+            .fetch_one(&pool)
+            .await?;
+        check_plain_role(&pool, &role).await?;
+        Ok(Self {
             pool,
             timeouts: Timeouts::default(),
-        }
+        })
+    }
+
+    /// The settings a write transaction really runs under, read inside one: lock timeout,
+    /// statement timeout and isolation level. For tests of [`Store::with_timeouts`].
+    #[doc(hidden)]
+    pub async fn write_settings(&self) -> Result<(String, String, String)> {
+        let mut tx = begin_write(&self.pool, &self.timeouts).await?;
+        let row = sqlx::query(
+            "SELECT current_setting('lock_timeout') AS lock, \
+             current_setting('statement_timeout') AS statement, \
+             current_setting('transaction_isolation') AS isolation",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let settings = (
+            row.try_get("lock")?,
+            row.try_get("statement")?,
+            row.try_get("isolation")?,
+        );
+        tx.rollback().await?;
+        Ok(settings)
     }
 
     /// The same store with other lock and statement timeouts for its write transactions.

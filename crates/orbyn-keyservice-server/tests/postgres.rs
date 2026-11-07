@@ -21,6 +21,14 @@ struct TestDb {
     runtime: PgPool,
 }
 
+/// Every call to the store or a pool in a test runs under this: a missing timeout fails the test
+/// instead of hanging it.
+async fn within<T>(future: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(std::time::Duration::from_secs(60), future)
+        .await
+        .expect("timed out after 60 s: a lock wait with no timeout?")
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -109,8 +117,11 @@ impl TestDb {
         }
     }
 
-    fn store(&self) -> Store {
-        Store::new(self.runtime.clone())
+    /// The store as the runtime role, through the check `Store::connect` makes.
+    async fn store(&self) -> Store {
+        Store::connect(self.runtime.clone())
+            .await
+            .expect("the runtime role is a plain role")
     }
 
     async fn cleanup(self) {
@@ -245,7 +256,7 @@ async fn migrating_twice_changes_nothing_and_the_key_service_has_its_own_migrati
 #[ignore = "needs ORBYN_KEYSERVICE_DATABASE_URL"]
 async fn append_numbers_without_gaps_and_keeps_each_accounts_chain() {
     let db = TestDb::new().await;
-    let store = db.store();
+    let store = db.store().await;
     assert_eq!(store.size().await.expect("size"), 0);
 
     let first = entry(MapId::Service, 1, [0; 32], 0);
@@ -289,7 +300,7 @@ async fn append_numbers_without_gaps_and_keeps_each_accounts_chain() {
 #[ignore = "needs ORBYN_KEYSERVICE_DATABASE_URL"]
 async fn the_log_root_is_right_at_every_size() {
     let db = TestDb::new().await;
-    let store = db.store();
+    let store = db.store().await;
     let mut leaves = Vec::new();
     let mut last: std::collections::HashMap<(u8, u8), Hash> = Default::default();
     for i in 0..40u64 {
@@ -327,7 +338,7 @@ async fn the_log_root_is_right_at_every_size() {
 #[ignore = "needs ORBYN_KEYSERVICE_DATABASE_URL"]
 async fn concurrent_appends_are_serialized_without_gaps() {
     let db = TestDb::new().await;
-    let store = db.store();
+    let store = db.store().await;
     let mut tasks = Vec::new();
     for i in 0..24u64 {
         let store = store.clone();
@@ -364,7 +375,7 @@ async fn concurrent_appends_are_serialized_without_gaps() {
 #[ignore = "needs ORBYN_KEYSERVICE_DATABASE_URL"]
 async fn heads_follow_the_model_and_chain_and_idle_heads_repeat_the_roots() {
     let db = TestDb::new().await;
-    let store = db.store();
+    let store = db.store().await;
 
     // Genesis: nothing appended, empty roots, no previous head.
     let genesis = store.build_head(1_000, 1, None).await.expect("genesis");
@@ -502,7 +513,7 @@ async fn heads_follow_the_model_and_chain_and_idle_heads_repeat_the_roots() {
 #[ignore = "needs ORBYN_KEYSERVICE_DATABASE_URL"]
 async fn a_head_cannot_go_back_in_time_or_be_stored_twice_or_after_another() {
     let db = TestDb::new().await;
-    let store = db.store();
+    let store = db.store().await;
     store
         .append(&entry(MapId::Service, 1, [0; 32], 0))
         .await
@@ -558,7 +569,7 @@ fn denied(result: Result<sqlx::postgres::PgQueryResult, sqlx::Error>, what: &str
 #[ignore = "needs ORBYN_KEYSERVICE_DATABASE_URL"]
 async fn the_runtime_role_cannot_update_delete_truncate_or_change_the_schema() {
     let db = TestDb::new().await;
-    let store = db.store();
+    let store = db.store().await;
     store
         .append(&entry(MapId::Service, 1, [0; 32], 0))
         .await
@@ -717,7 +728,7 @@ async fn the_runtime_role_cannot_update_delete_truncate_or_change_the_schema() {
 #[ignore = "needs ORBYN_KEYSERVICE_DATABASE_URL"]
 async fn the_triggers_stop_even_the_owner_from_changing_or_truncating_the_log() {
     let db = TestDb::new().await;
-    let store = db.store();
+    let store = db.store().await;
     store
         .append(&entry(MapId::Service, 1, [0; 32], 0))
         .await
@@ -784,7 +795,7 @@ async fn the_triggers_stop_even_the_owner_from_changing_or_truncating_the_log() 
 #[ignore = "needs ORBYN_KEYSERVICE_DATABASE_URL"]
 async fn a_head_with_a_wrong_map_root_is_refused_and_later_heads_still_build() {
     let db = TestDb::new().await;
-    let store = db.store();
+    let store = db.store().await;
     for i in 0..6u64 {
         let map = if i % 2 == 0 {
             MapId::Service
@@ -864,7 +875,7 @@ async fn a_head_with_a_wrong_map_root_is_refused_and_later_heads_still_build() {
 #[ignore = "needs ORBYN_KEYSERVICE_DATABASE_URL"]
 async fn the_chain_of_heads_cannot_fork_even_when_the_database_defaults_to_repeatable_read() {
     let db = TestDb::repeatable_read().await;
-    let store = db.store();
+    let store = db.store().await;
     // The default really is repeatable read for a session that does not say otherwise.
     let level: String = sqlx::query("SHOW default_transaction_isolation")
         .fetch_one(&db.runtime)
@@ -955,7 +966,7 @@ async fn the_chain_of_heads_cannot_fork_even_when_the_database_defaults_to_repea
 #[ignore = "needs ORBYN_KEYSERVICE_DATABASE_URL"]
 async fn an_entry_that_could_not_be_read_back_is_never_appended() {
     let db = TestDb::new().await;
-    let store = db.store();
+    let store = db.store().await;
     for kind in [0u8, 3, 4, 5, 200] {
         let bad = Entry {
             kind,
@@ -991,7 +1002,7 @@ async fn an_entry_that_could_not_be_read_back_is_never_appended() {
 #[ignore = "needs ORBYN_KEYSERVICE_DATABASE_URL"]
 async fn a_head_covers_at_most_max_entries_and_the_rest_wait() {
     let db = TestDb::new().await;
-    let store = db.store();
+    let store = db.store().await;
     let mut model = Model::new();
     for i in 0..25u64 {
         let e = entry(MapId::Service, i as u8, [0; 32], i);
@@ -1072,7 +1083,7 @@ async fn the_runtime_role_must_be_a_plain_role_and_public_cannot_create() {
         "create as another role",
         &["permission denied"],
     );
-    other.close().await;
+    within(other.close()).await;
     // A role that owns the database (and so, on Postgres 15 and later, schema public, which belongs
     // to `pg_database_owner`) could drop the log tables itself; so could a member of that role.
     let (dbo_role, dbo_member, dbo_db) = (
@@ -1119,7 +1130,7 @@ async fn the_runtime_role_must_be_a_plain_role_and_public_cannot_create() {
     migrate(&there, &format!("{name}_other"))
         .await
         .expect("a plain role");
-    there.close().await;
+    within(there.close()).await;
     let _ = run(
         admin,
         format!("DROP DATABASE IF EXISTS \"{dbo_db}\" WITH (FORCE)"),
@@ -1138,10 +1149,13 @@ async fn the_runtime_role_must_be_a_plain_role_and_public_cannot_create() {
 #[ignore = "needs ORBYN_KEYSERVICE_DATABASE_URL"]
 async fn a_writer_that_cannot_get_the_lock_gets_a_retryable_error() {
     let db = TestDb::new().await;
-    let store = db.store().with_timeouts(orbyn_keyservice_server::Timeouts {
-        lock: "200ms".to_owned(),
-        statement: "30s".to_owned(),
-    });
+    let store = db
+        .store()
+        .await
+        .with_timeouts(orbyn_keyservice_server::Timeouts {
+            lock: "200ms".to_owned(),
+            statement: "30s".to_owned(),
+        });
     // Another session holds the write lock.
     let mut holder = db.runtime.begin().await.expect("holder");
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
@@ -1150,13 +1164,13 @@ async fn a_writer_that_cannot_get_the_lock_gets_a_retryable_error() {
         .await
         .expect("lock");
     let started = std::time::Instant::now();
-    let result = store.append(&entry(MapId::Service, 1, [0; 32], 0)).await;
+    let result = within(store.append(&entry(MapId::Service, 1, [0; 32], 0))).await;
     assert!(matches!(result, Err(StoreError::Busy)), "{result:?}");
     assert!(
         started.elapsed() < std::time::Duration::from_secs(5),
         "it did not wait for the default"
     );
-    let result = store.build_head(1, 1, None).await;
+    let result = within(store.build_head(1, 1, None)).await;
     assert!(matches!(result, Err(StoreError::Busy)), "{result:?}");
     // Nothing was written, and once the lock is free the same call goes through.
     holder.rollback().await.expect("release");
@@ -1193,7 +1207,7 @@ async fn a_writer_that_cannot_get_the_lock_gets_a_retryable_error() {
 #[ignore = "needs ORBYN_KEYSERVICE_DATABASE_URL"]
 async fn a_thousand_entry_head_builds_and_commits_in_reasonable_time() {
     let db = TestDb::new().await;
-    let store = db.store();
+    let store = db.store().await;
     let mut last: std::collections::HashMap<(u8, u8), Hash> = Default::default();
     for i in 0..1000u64 {
         let map = if i % 4 == 0 {
@@ -1221,5 +1235,212 @@ async fn a_thousand_entry_head_builds_and_commits_in_reasonable_time() {
     let commit = committed.elapsed();
     eprintln!("1000 entries: build {build:?}, commit {commit:?}");
     assert!(build + commit < std::time::Duration::from_secs(60));
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "needs ORBYN_KEYSERVICE_DATABASE_URL"]
+async fn a_temporary_table_cannot_shadow_heads_to_pass_the_append_only_check() {
+    let db = TestDb::new().await;
+    let store = db.store().await;
+    store
+        .append(&entry(MapId::Service, 1, [0; 32], 0))
+        .await
+        .expect("append");
+
+    // First wall: the runtime role has no right to make temporary tables.
+    let mut conn = db.runtime.acquire().await.expect("connection");
+    let denied_temp = sqlx::query("CREATE TEMP TABLE heads (id bigint, size bigint)")
+        .execute(&mut *conn)
+        .await;
+    denied(denied_temp, "temp table", &["permission denied"]);
+
+    // Second wall: even where temporary tables are allowed (here granted back by the owner), the
+    // trigger function pins its search path and names `public.heads`, so a table of the same name
+    // in `pg_temp` is not the one it reads.
+    run(
+        &db.owner,
+        format!(
+            "GRANT TEMPORARY ON DATABASE \"{}\" TO \"{}\"",
+            db.name, db.runtime_role
+        ),
+    )
+    .await
+    .expect("grant temp");
+    let mut conn2 = db.runtime.acquire().await.expect("connection");
+    sqlx::query("CREATE TEMP TABLE heads (id bigint, size bigint)")
+        .execute(&mut *conn2)
+        .await
+        .expect("a temporary table, once allowed");
+    sqlx::query("INSERT INTO heads VALUES (1, 999)")
+        .execute(&mut *conn2)
+        .await
+        .expect("a fake head");
+    // The shadow is what an unqualified `heads` would find on this connection...
+    let seen: i64 = sqlx::query("SELECT count(*) AS n FROM heads")
+        .fetch_one(&mut *conn2)
+        .await
+        .expect("count")
+        .get("n");
+    assert_eq!(seen, 1);
+    // ...and still the entry cannot be marked as included in a head that is not in `public.heads`.
+    let result = sqlx::query("UPDATE log_entries SET included_in_head = 1 WHERE seq = 1")
+        .execute(&mut *conn2)
+        .await;
+    denied(
+        result,
+        "included_in_head through a shadow",
+        &["append-only"],
+    );
+    drop(conn);
+    drop(conn2);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "needs ORBYN_KEYSERVICE_DATABASE_URL"]
+async fn a_store_refuses_a_pool_whose_role_could_undo_the_guards() {
+    let db = TestDb::new().await;
+    let options: PgConnectOptions = std::env::var("ORBYN_KEYSERVICE_DATABASE_URL")
+        .expect("url")
+        .parse()
+        .expect("url");
+    // The runtime role is fine.
+    within(Store::connect(db.runtime.clone()))
+        .await
+        .expect("plain role");
+    // The owner, a superuser (the test admin), and a member of the owner are not.
+    let name = db.name.clone();
+    let member = format!("{name}_inowner");
+    run(
+        &db.admin,
+        format!(
+            "CREATE ROLE \"{member}\" LOGIN IN ROLE \"{}\"",
+            db.owner_role
+        ),
+    )
+    .await
+    .expect("member of the owner");
+    let as_member = pool_as(options.clone().database(&name), &member).await;
+    let as_admin = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(options.clone().database(&name))
+        .await
+        .expect("admin pool");
+    for (what, pool) in [
+        ("owner", &db.owner),
+        ("member of the owner", &as_member),
+        ("superuser", &as_admin),
+    ] {
+        let result = within(Store::connect(pool.clone())).await;
+        assert!(
+            matches!(result, Err(StoreError::UnsafeRole)),
+            "{what}: {result:?}"
+        );
+    }
+    within(as_member.close()).await;
+    within(as_admin.close()).await;
+
+    // The real owner of the tables counts, not only who ran the migration: hand the tables and the
+    // trigger functions to another role the runtime role belongs to, and both the migration and a
+    // new connection refuse.
+    let holder = format!("{name}_holder");
+    run(&db.admin, format!("CREATE ROLE \"{holder}\" NOLOGIN"))
+        .await
+        .expect("holder");
+    run(
+        &db.admin,
+        format!("GRANT \"{holder}\" TO \"{}\"", db.owner_role),
+    )
+    .await
+    .expect("owner may hand over");
+    run(
+        &db.owner,
+        format!("GRANT CREATE ON SCHEMA public TO \"{holder}\""),
+    )
+    .await
+    .expect("create");
+    for table in [
+        "service_keys",
+        "log_entries",
+        "log_nodes",
+        "map_nodes",
+        "heads",
+        "rate_events",
+    ] {
+        run(
+            &db.owner,
+            format!("ALTER TABLE {table} OWNER TO \"{holder}\""),
+        )
+        .await
+        .expect("hand over");
+    }
+    run(
+        &db.admin,
+        format!("GRANT \"{holder}\" TO \"{}\"", db.runtime_role),
+    )
+    .await
+    .expect("runtime joins");
+    let result = migrate(&db.owner, &db.runtime_role).await;
+    assert!(matches!(result, Err(StoreError::UnsafeRole)), "{result:?}");
+    let result = within(Store::connect(db.runtime.clone())).await;
+    assert!(matches!(result, Err(StoreError::UnsafeRole)), "{result:?}");
+    // Nothing was granted on the way.
+    run(
+        &db.admin,
+        format!("REVOKE \"{holder}\" FROM \"{}\"", db.runtime_role),
+    )
+    .await
+    .expect("leave");
+    let _ = run(&db.admin, format!("DROP ROLE IF EXISTS \"{member}\"")).await;
+    db.cleanup().await;
+    let _ = run_admin_drop(&holder).await;
+}
+
+/// Drops a role a test made, with the admin connection from the environment.
+async fn run_admin_drop(role: &str) -> Result<(), sqlx::Error> {
+    let url = std::env::var("ORBYN_KEYSERVICE_DATABASE_URL").expect("url");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await?;
+    let result = run(
+        &pool,
+        format!("DROP OWNED BY \"{role}\"; DROP ROLE IF EXISTS \"{role}\""),
+    )
+    .await;
+    pool.close().await;
+    result
+}
+
+#[tokio::test]
+#[ignore = "needs ORBYN_KEYSERVICE_DATABASE_URL"]
+async fn write_transactions_really_run_under_the_configured_timeouts_and_read_committed() {
+    let db = TestDb::repeatable_read().await;
+    let default = db.store().await;
+    assert_eq!(
+        within(default.write_settings()).await.expect("settings"),
+        (
+            "10s".to_owned(),
+            "2min".to_owned(),
+            "read committed".to_owned()
+        ),
+        "the defaults, on a database whose own default is repeatable read"
+    );
+    let custom = db
+        .store()
+        .await
+        .with_timeouts(orbyn_keyservice_server::Timeouts {
+            lock: "7s".to_owned(),
+            statement: "250ms".to_owned(),
+        });
+    assert_eq!(
+        within(custom.write_settings()).await.expect("settings"),
+        (
+            "7s".to_owned(),
+            "250ms".to_owned(),
+            "read committed".to_owned()
+        )
+    );
     db.cleanup().await;
 }
