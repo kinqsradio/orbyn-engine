@@ -118,6 +118,71 @@ Each is a **path-compressed sparse Merkle tree** (SHA-256, only branching nodes 
 - **The 24-hour alarm is separate.** The dead man's switch (the local notification a successful check reschedules for 24 hours ahead) is about the device not being able to check at all, and stays as written. **24 hours > 2 hours holds**: a device warns at 2 hours of stale heads and the switch fires at 24 hours of no successful check.
 - **Recovery's 72 hours** are measured from the witness's signed time in the first cosigned head that includes the start (key-service.md), not from the head's `time_ms`.
 
+## The head publisher (PR 5b, contract, not built)
+
+PR 5 left a gap: `Store::build_head`, `KeyService::sign_head` and `Cosigner` exist and nothing runs them. Until this lands a running service never publishes a head, so `head_covers_entry` is never true and slices 6 and 8 have nothing to serve. This section settles how it runs, in the order it will be built.
+
+**Where it runs.** A task inside `orbyn-keyservice serve`, started after the migrations check and the identity check. With no witness configured **it does not start**, the service runs, certifications and retirements are still appended, and no head is ever published (recovery stays refused, as above). Settings: `ORBYN_KS_WITNESSES` (comma-separated URLs; `https` only, except a loopback address for development), `ORBYN_KS_WITNESS_KEYS` (the pinned public keys, hex, in the same order, no key twice), `ORBYN_KS_WITNESS_THRESHOLD` (above half of the pinned witnesses), `ORBYN_KS_LOG_KEY_VERSION` (the log key must exist in the HSM) and `ORBYN_KS_HEAD_INTERVAL_SECS` (default 600, accepted from 60 to 900: a longer interval would break the 30-minute lag bound below). `serve` refuses to start on any of these that is wrong, using `Cosigner::new`'s own refusals for the threshold and duplicate keys. One publisher runs per database. A second one is safe, never wrong: the store's write lock and `prev_head_hash` uniqueness make the later commit lose (`HeadSuperseded`), and it does nothing that cycle.
+
+### A head is signed first, cosigned after
+
+**The crash window.** If a head is stored only after the witnesses cosigned it (the order above), a crash between the cosignatures and the store leaves the witnesses standing on a head the key service does not have. The next head, built on the old last head, names a different previous head, and every witness refuses it as a fork. The head could be rebuilt identically only if nothing new was appended meanwhile, which cannot be promised. So the order changes:
+
+1. The head is **built, signed with the log key and stored first**, with no cosignatures. It is now part of the chain, whatever happens next.
+2. The witnesses are asked to cosign **that stored head**. Nothing newer is built until it has enough cosignatures; a restart finds the newest stored head and goes on cosigning it.
+3. Cosignatures are rows in a new append-only table `head_cosignatures (head_id, witness_key, cosignature)`, and a head is **published** when `published_heads` (a second append-only table, one row per head, written once) says so: when at least the threshold of pinned witnesses have a verified cosignature of it. Migration 0003 adds both, with the same grants and triggers as the other tables; `heads.cosignatures` stays in the schema and is unused.
+4. **What is public is only the newest published head.** `head_covers_entry` becomes true only when a published head covers the entry, not when a stored one does. The public API (PR 6) serves a head only once it is published, and never a stored head that has no cosignatures.
+
+This changes what PR 3 and 4 wrote down ("stores the head with the cosignatures only when the threshold is met"). `Store::commit_head` stores a signed head and no longer takes the cosignatures; `Store::add_cosignature` and `Store::publish_head` are new. A head that is stored and never published, because the witnesses are down, blocks later heads, which is intended: the chain has no branches, so the witnesses never see two heads that name one previous head.
+
+### The cycle
+
+Every interval (and straight away when the last cycle ended with more entries pending than one head covers):
+
+1. **Build.** `build_head(now, log_key_version, cap)`, at most 1000 entries. Before it is signed, the request a witness will be sent for it is measured (the entries and their map paths): over **16 MiB** the head is built again with half the entries, until it fits, so a head is never cut after it is signed. An idle log builds an idle head (the same size and roots, a later time), which is how it stays fresh. If the clock is behind the last head's time (`TimeRegression`) the cycle is skipped and counted as a refused interval.
+2. **Sign, store.** `sign_head`, then `commit_head`.
+3. **Cosign.** `Cosigner::cosign(StoreSource, head)`, all witnesses at once, each on its own.
+4. **Publish** when `cosigned_enough` holds, after recording each verified cosignature. Otherwise the head stays stored and unpublished, and the next cycle starts at step 3 for the **same** head (a witness already on it is asked to cosign it again, which is how a witness returns).
+5. **A backlog** (more than 1000 entries pending after a publish) runs the next cycle at once, so a long outage does not take 10 minutes per 1000 entries to clear.
+
+### The request source
+
+`StoreSource` implements `orbyn_witness::client::RequestSource` over the stored chain of heads. `next(after)` returns the request for the stored head that names `after` as its previous head (the first stored head for `None`): the head, its stored log signature, the **consistency proof** from the previous head's size to its size, and for each entry in between, in order, its chain length and the **map path as the maps stood before it**.
+
+- **Consistency proof.** Every hash in an RFC 9162 consistency proof is the root of an aligned complete subtree, which `log_nodes` stores, so it is read, not recomputed (`Store::consistency_proof(old, new)`, checked against `orbyn_translog::merkle::consistency_proof` over a model for every pair up to a small size).
+- **Map paths.** From the previous head's two roots, for each entry in order: `MapStore::prove` the key under the current root, keep the path, then `orbyn_translog::map::update` for the next root. Nothing is written; the nodes are the ones `build_head` already wrote, content-addressed, so any old head's roots still answer. The final roots must equal the head's, or the source fails (`Corrupt`) instead of sending a request the witness would refuse.
+- **A witness the chain does not contain.** If `after` is not a stored head, the source fails for that witness. That witness holds a head the key service never stored, which is evidence of a fork or a wrong pin, and is reported (below). The others are unaffected.
+- **Idle heads.** A witness that was away for a day walks about 144 idle heads, one request each; that is the cost of keeping the chain one line.
+
+### Witnesses down, slow or refusing
+
+- **Threshold met.** The head is published. A witness that did not answer is simply behind and walks the chain when it returns.
+- **Below the threshold.** The head stays stored and unpublished and is retried each interval; the previous published head stays the newest the public API serves, so its witness-signed time ages. New certifications and retirements are still accepted and appended (they wait for the next published head); `head_covers_entry` stays false for them.
+- **Refusals are evidence, not noise.** A `fork`, `map_mismatch` or `bad_proof` refusal, or an invalid answer, is logged with the witness's index, the refusal's code and the head it holds if it sent one (machine-only fields), and counted separately from a witness that could not be reached.
+- **Alerts** (structured log lines, for the operator's monitoring; no paging system is built here): `head_unpublished` after **3 intervals** (30 minutes) in which no head was published, and again every hour after, with how many witnesses answered and how many refused; `head_published` when the first head after such a stretch is published.
+- **What a device does** is already settled in *Freshness and monitoring*: a published head whose witness-signed time is over **2 hours** old, or a key-service head more than 30 minutes behind the witness, is a possible-takeover warning on the device, and a failed fetch is availability and is left to the **24-hour** dead man's switch. The publisher does not implement either; it is why the interval is capped at 15 minutes and why witnesses down for **more than two hours** become a visible warning on every device even though nothing was taken. The runbook (PR 7) says so.
+- **Witness clock.** A witness refusing for clock skew (`clock_skew`) counts as unreachable for the threshold and is reported with that code.
+
+### Tests (PR 5b)
+
+Run against real `orbyn_witness` services in process (three witnesses, threshold 2) and a real Postgres:
+
+- A certification is in the next published head, and `head_covers_entry` is false while the head is stored and unpublished (witnesses down), true after.
+- 2 of 3 witnesses up: published; the third, started later, walks every stored head (idle heads, heads with entries) and cosigns the newest.
+- A backlog of more than 1000 entries: published in several heads without waiting an interval between them; a request over the 16 MiB cap is rebuilt smaller before it is signed.
+- **The crash window:** the process stops after a head is stored and before any cosignature; restarted, it cosigns the same head, builds nothing new, and entries appended during the stop go into the head after it. The same with a stop between two witnesses' cosignatures.
+- Below the threshold: no publish, retried each interval, the older head still the newest published; `head_unpublished` after 3 intervals; a witness returning catches up.
+- A witness that holds a head the key service never stored: the source fails for it, the refusal is reported, the others still publish.
+- A fork attempt (two heads naming one previous head, forced by test) cannot be made by the publisher; the store refuses the second.
+- `consistency_proof` equals the model for every pair of sizes up to 40; map paths replayed over 200 random entries end on the head's roots; a tampered stored node makes the source fail.
+- With no witness configured the publisher does not start, appends still work and no head appears; every invalid setting stops `serve` at start.
+
+### Decisions for the owner
+
+1. **Sign first, cosign after** (the crash window above), which changes PR 3 and 4's "stored only when cosigned" and adds migration 0003. The alternative, keeping the old order and re-sending an identical head after a crash, fails when anything was appended during the stop.
+2. **A stored-but-unpublished head blocks the next one.** Entries wait, as above, rather than a second head being built on a head the witnesses have not accepted.
+3. **Interval cap of 15 minutes** and the 30-minute alert, tied to the 30-minute lag bound already settled for devices.
+
 ## 3. Pull requests, in order
 
 Each is one review's worth, with its own tests, and builds on the one before.
@@ -129,6 +194,7 @@ Each is one review's worth, with its own tests, and builds on the one before.
 | 3 | **The key service's store.** `orbyn-keyservice-server` as a library: migrator, the tables above, `LogStore` and `MapStore` on Postgres, append, head building without signing, the append-only grants and trigger. Tests on `ORBYN_KEYSERVICE_DATABASE_URL`; CI gets the second database. | Medium. The migrations and the append-only guarantees. |
 | 4 | **Head signing and the witness.** The log key and `HsmMessage::LogHead` (the rename of `IdentityMessage`) in `orbyn-keyservice` (SoftHSM and memory); the head signer; `orbyn-witness` (library, binary, `TestWitness`) **including the map-update check**; the cosign client and the threshold rule; every witness test above. This needs the map's path and update functions from PR 2. | Large; may split into the witness library and the signer. Security: the signing oracle stays closed, and the witness's refusals. |
 | 5 | **The binary and the internal API.** `orbyn-keyservice serve/migrate/init`, rustls mutual TLS and reload, the service-key endpoints and their log entries, `orbyn-keyservice-client`. Tests: a wrong CA and a wrong SAN refused, create is idempotent, a certification appears in the next head. | Medium. TLS settings and what the endpoints can and cannot do. |
+| 5b | **The head publisher.** The loop in `serve` that builds, signs, cosigns and publishes heads, the store's request source for witnesses, and the store change that lets a head be signed before it is cosigned. Contract: *The head publisher* below. | Medium to large. The crash window, the witness catch-up and what a device is told while witnesses are down. |
 | 6 | **The public API.** Head, consistency, entries, lookup proofs and keys; CORS, cache headers, rate limits; the cross-origin contract test. A client-side verifier test in `orbyn-translog` against the served bytes. **Gated on PR 4**: lookup proofs are served only once the witness's map check has landed, so a proof is never served against roots nobody checked. | Small to medium. |
 | 7 | **Deployment.** The Dockerfile, the compose profile, the CI image and health check, the runbook (the key ceremony, the pinned keys to publish, rotating a certificate), and the partial-`init` and trusted-KEK steps from 3b. Docs and packaging only. | Small. |
 | later | **The audit sink** (a trait with file and object-store implementations, written for each HSM open, certification and rotation; no keys, codes or emails), **the cancel route** (step 5) and **the identity map's content** (sharing). | Each its own PR. |
