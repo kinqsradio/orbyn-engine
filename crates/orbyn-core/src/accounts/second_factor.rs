@@ -582,6 +582,22 @@ impl Accounts {
         );
         orbyn_crypto::verify(&keys, TOTP_MANAGE_CONTEXT, &message, &proof.signature)
             .map_err(|_| AccountError::DeviceProofRequired)?;
+        // Each signed change is accepted once: its time must be after the last one accepted for
+        // this device and action. In the same transaction, so a change that fails leaves no mark.
+        let newer: Option<i64> = sqlx::query_scalar(
+            "INSERT INTO totp_manage_seen (device_id, action, signed_at) VALUES ($1, $2, $3)
+             ON CONFLICT (device_id, action) DO UPDATE SET signed_at = EXCLUDED.signed_at
+             WHERE totp_manage_seen.signed_at < EXCLUDED.signed_at
+             RETURNING signed_at",
+        )
+        .bind(session.device_id)
+        .bind(action.as_str())
+        .bind(proof.signed_at)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if newer.is_none() {
+            return Err(AccountError::DeviceProofRequired);
+        }
         let subject = self
             .secrets
             .digest("totp-manage", session.device_id.as_bytes());

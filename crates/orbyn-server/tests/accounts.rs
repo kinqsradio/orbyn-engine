@@ -2215,6 +2215,70 @@ async fn a_right_code_gives_its_attempt_back() {
 
 #[tokio::test]
 #[ignore = "needs DATABASE_URL"]
+async fn a_signed_change_is_accepted_once_and_only_a_later_one_follows() {
+    let _turn = TURN.lock().await;
+    let server = server().await;
+    let p = protected(&server).await;
+    let now = now_secs() as i64;
+    let call = |path: &'static str, body: Value| {
+        server.call(Method::POST, path, Some(token(&p.session)), Some(body))
+    };
+    // A captured disable is accepted once ...
+    let captured = proof_at(&p.session, &p.laptop, "disable", "", now + 2);
+    let (status, body) = call("/v1/accounts/totp/disable", captured.clone()).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    // ... and after the owner turns the factor on again, sending it again changes nothing.
+    let (status, body) = call(
+        "/v1/accounts/totp",
+        proof_at(&p.session, &p.laptop, "enrol", "", now + 3),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let secret = base32_decode(body["secret"].as_str().expect("secret"));
+    let code = code_for(&secret, 0);
+    let mut confirm = proof_at(&p.session, &p.laptop, "confirm", &code, now + 3);
+    confirm["code"] = json!(code);
+    let (status, body) = call("/v1/accounts/totp/confirm", confirm).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let cases = [
+        (
+            "/v1/accounts/totp/disable",
+            "the captured disable",
+            captured,
+        ),
+        (
+            "/v1/accounts/totp/disable",
+            "an older disable",
+            proof_at(&p.session, &p.laptop, "disable", "", now + 1),
+        ),
+        (
+            "/v1/accounts/totp",
+            "the same enrol again",
+            proof_at(&p.session, &p.laptop, "enrol", "", now + 3),
+        ),
+    ];
+    for (path, what, body) in cases {
+        let (status, answer) = call(path, body).await;
+        assert_eq!(
+            (status, &answer["code"]),
+            (StatusCode::UNAUTHORIZED, &json!("device_proof_required")),
+            "{what}"
+        );
+    }
+    // The factor is still on, and a later signed disable still works.
+    server
+        .password_step(&p.email, b"pw", &DeviceKeys::generate().expect("keys"))
+        .await;
+    let (status, body) = call(
+        "/v1/accounts/totp/disable",
+        proof_at(&p.session, &p.laptop, "disable", "", now + 4),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
 async fn disabling_needs_only_the_trusted_devices_signature_and_ends_the_second_factor() {
     let _turn = TURN.lock().await;
     let server = server().await;
