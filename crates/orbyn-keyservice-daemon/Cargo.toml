@@ -1,6 +1,7 @@
 [package]
 name = "orbyn-keyservice-daemon"
 description = "The key service binary: its internal API over mutual TLS, migrations and first-time setup. AGPL-3.0-only."
+license = "AGPL-3.0-only"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

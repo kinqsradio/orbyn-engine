@@ -1,6 +1,7 @@
 [package]
 name = "orbyn-keyservice-server"
 description = "The key service's store: its own migrations, the transparency log and map on Postgres, and head building."
+license = "AGPL-3.0-only"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
