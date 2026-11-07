@@ -100,7 +100,7 @@ Each is a **path-compressed sparse Merkle tree** (SHA-256, only branching nodes 
 - **Cadence.** A cosigned head every 10 minutes (above).
 - **Three outcomes, kept apart.**
   - **Possible withholding:** a successful response carrying a head whose witness-signed time is more than **2 hours** old, or a key-service head lagging the witness by more than 30 minutes. The device warns of a possible takeover, as for an unknown recovery.
-  - **Availability:** failed fetches (network errors, 5xx, offline) are not a takeover signal. They are left to the 24-hour dead man's switch, and a failed fetch never blocks sync.
+  - **Availability:** failed fetches (network errors, 5xx, a 429 from the witness or the key service, offline) are not a takeover signal. They are left to the 24-hour dead man's switch, and a failed fetch never blocks sync.
   - **Fork:** different roots at the same size, from any source. The device warns at once.
 - **The 24-hour alarm is separate.** The dead man's switch (the local notification a successful check reschedules for 24 hours ahead) is about the device not being able to check at all, and stays as written. **24 hours > 2 hours holds**: a device warns at 2 hours of stale heads and the switch fires at 24 hours of no successful check.
 - **Recovery's 72 hours** are measured from the witness's signed time in the first cosigned head that includes the start (key-service.md), not from the head's `time_ms`.
