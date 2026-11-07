@@ -39,6 +39,29 @@ impl LogStore {
         to_u64(row.try_get("size")?)
     }
 
+    /// The position and entry hash of an account's latest entry in a map, or `None` if it has none.
+    pub async fn latest(
+        conn: &mut PgConnection,
+        map: MapId,
+        map_key: &[u8; 32],
+    ) -> Result<Option<(u64, Hash)>> {
+        let row = sqlx::query(
+            "SELECT chain_index, leaf_hash FROM log_entries \
+             WHERE map = $1 AND map_key = $2 ORDER BY chain_index DESC LIMIT 1",
+        )
+        .bind(map_column(map))
+        .bind(map_key.as_slice())
+        .fetch_optional(conn)
+        .await?;
+        row.map(|row| {
+            Ok((
+                to_u64(row.try_get::<i64, _>("chain_index")?)?,
+                to_hash(row.try_get("leaf_hash")?, "leaf hash")?,
+            ))
+        })
+        .transpose()
+    }
+
     /// Appends `entry`. Its `prev` must be the entry hash of its account's latest entry in its
     /// map, or zeros for the first; anything else is [`StoreError::ChainMismatch`].
     pub async fn append(conn: &mut PgConnection, entry: &Entry) -> Result<Appended> {
@@ -50,21 +73,11 @@ impl LogStore {
         let leaf = orbyn_translog::merkle::leaf_hash(&payload);
         let map = map_column(entry.map);
 
-        let latest = sqlx::query(
-            "SELECT chain_index, leaf_hash FROM log_entries \
-             WHERE map = $1 AND map_key = $2 ORDER BY chain_index DESC LIMIT 1",
-        )
-        .bind(map)
-        .bind(entry.map_key.as_slice())
-        .fetch_optional(&mut *conn)
-        .await?;
-        let (chain_index, expected_prev) = match latest {
-            None => (0u64, [0u8; 32]),
-            Some(row) => (
-                to_u64(row.try_get::<i64, _>("chain_index")?)? + 1,
-                to_hash(row.try_get("leaf_hash")?, "leaf hash")?,
-            ),
-        };
+        let (chain_index, expected_prev) =
+            match Self::latest(conn, entry.map, &entry.map_key).await? {
+                None => (0u64, [0u8; 32]),
+                Some((index, hash)) => (index + 1, hash),
+            };
         if entry.prev != expected_prev {
             return Err(StoreError::ChainMismatch);
         }

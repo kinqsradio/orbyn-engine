@@ -35,6 +35,41 @@ pub fn service_account_map_key(public: &[u8; 33]) -> [u8; 32] {
     h.finalize().into()
 }
 
+/// The length of a service-key statement: three length-prefixed fields (the identity version, the
+/// account id, the compressed key). See `orbyn_crypto::service_key_statement`.
+pub const CERTIFICATION_STATEMENT_LEN: usize = 3 * 8 + 4 + 16 + 33;
+
+/// The `fields` of a service-key certification entry (kind 1): the statement the identity signed
+/// and the identity's signature, `statement ‖ signature`. A device reads the statement back with
+/// [`parse_certification`] and verifies the signature with `verify_service_key_statement`.
+pub fn certification_fields(statement: &[u8], signature: &[u8; 64]) -> Option<Vec<u8>> {
+    (statement.len() == CERTIFICATION_STATEMENT_LEN).then(|| {
+        let mut out = Vec::with_capacity(statement.len() + signature.len());
+        out.extend_from_slice(statement);
+        out.extend_from_slice(signature);
+        out
+    })
+}
+
+/// The statement and signature in a certification entry's `fields`, or `None` for any other
+/// length.
+pub fn parse_certification(fields: &[u8]) -> Option<(&[u8], [u8; 64])> {
+    let (statement, signature) = fields.split_at_checked(CERTIFICATION_STATEMENT_LEN)?;
+    Some((statement, signature.try_into().ok()?))
+}
+
+/// The `fields` of a service-key retirement entry (kind 6): the compressed public key it retires,
+/// so a reader sees which certification the chain's end belongs to. Nothing is signed here: the
+/// key service signs heads, and the head covers the entry.
+pub fn retirement_fields(public: &[u8; 33]) -> Vec<u8> {
+    public.to_vec()
+}
+
+/// The key a retirement entry's `fields` names, or `None` for any other length.
+pub fn parse_retirement(fields: &[u8]) -> Option<[u8; 33]> {
+    fields.try_into().ok()
+}
+
 fn kind_is_built(kind: u8) -> bool {
     matches!(
         kind,
@@ -305,5 +340,26 @@ mod tests {
         }
         assert_ne!(map_value(&base, 1), map_value(&base, 2));
         assert_ne!(map_value(&base, 1), map_value(&[0; 32], 1));
+    }
+
+    #[test]
+    fn certification_and_retirement_fields_round_trip_and_refuse_other_lengths() {
+        let statement = [7u8; CERTIFICATION_STATEMENT_LEN];
+        let fields = certification_fields(&statement, &[9; 64]).expect("fields");
+        assert_eq!(fields.len(), CERTIFICATION_STATEMENT_LEN + 64);
+        assert_eq!(
+            parse_certification(&fields),
+            Some((statement.as_slice(), [9; 64]))
+        );
+        assert!(certification_fields(&statement[1..], &[9; 64]).is_none());
+        assert!(parse_certification(&fields[1..]).is_none());
+        let mut longer = fields.clone();
+        longer.push(0);
+        assert!(parse_certification(&longer).is_none());
+        assert_eq!(
+            parse_retirement(&retirement_fields(&[3; 33])),
+            Some([3; 33])
+        );
+        assert!(parse_retirement(&[3; 32]).is_none());
     }
 }

@@ -22,9 +22,11 @@
 mod head;
 mod log;
 mod map;
+mod service_keys;
 
 pub use head::StoredHead;
 pub use log::Appended;
+pub use service_keys::{CreateError, NewServiceKey, ServiceKeyRecord, ServiceKeyState};
 
 // The log and the maps are reached only through `Store`: it takes the write lock, starts the
 // transaction at READ COMMITTED with timeouts, and has been through the role check. Their write
@@ -199,6 +201,8 @@ pub async fn migrate(owner: &PgPool, runtime_role: &str) -> Result<()> {
         ),
         // The one change an entry ever gets: the head that covers it.
         format!("GRANT UPDATE (included_in_head) ON log_entries TO {role}"),
+        // And the one a service key ever gets: its wrapped key destroyed when it is retired.
+        format!("GRANT UPDATE (wrapped, retired_at) ON service_keys TO {role}"),
         format!("GRANT SELECT, INSERT, DELETE ON rate_events TO {role}"),
         format!("GRANT USAGE ON SEQUENCE heads_id_seq, rate_events_id_seq TO {role}"),
     ] {
