@@ -350,17 +350,26 @@ impl Accounts {
         Ok(id)
     }
 
-    /// Tells the owner of an address that someone tried to sign up with it. No code in it.
+    /// Tells the owner of an address that someone tried to sign up with it, and when. The time and
+    /// the sign-in link travel only in the sealed queue entry, like a code, and nothing about who
+    /// tried. Without an account URL there is no link, and the email has no button.
     async fn queue_notice(&self, tx: &mut Transaction<'_, Postgres>, email: &str) -> Result<()> {
         let account: Option<Uuid> = sqlx::query_scalar("SELECT id FROM accounts WHERE email = $1")
             .bind(email)
             .fetch_optional(&mut **tx)
             .await?;
+        let attempted = chrono::DateTime::from_timestamp(i64::try_from(self.now()).unwrap_or(0), 0)
+            .unwrap_or_default();
+        let link = self
+            .account_url
+            .as_ref()
+            .map(|url| format!("{url}/sign-in"))
+            .unwrap_or_default();
         let message = Mail {
             kind: Kind::SignUpAttempt,
             account,
             to: email.to_owned(),
-            code: None,
+            code: Some(format!("{}\n{link}", attempted.to_rfc3339())),
         };
         mail::enqueue(&mut **tx, &self.secrets, &message).await?;
         Ok(())

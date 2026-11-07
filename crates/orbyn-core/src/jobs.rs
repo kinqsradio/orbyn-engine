@@ -163,6 +163,14 @@ pub async fn renew(
     Ok(renewed.rows_affected() == 1)
 }
 
+/// Whether a job row exists. An email job whose row is gone was deleted with its account.
+pub async fn exists(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM jobs WHERE id = $1)")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+}
+
 /// Marks a job done. Only the worker holding the lease can finish it.
 pub async fn complete(pool: &PgPool, id: Uuid, worker: &str) -> Result<bool, sqlx::Error> {
     let done = sqlx::query(

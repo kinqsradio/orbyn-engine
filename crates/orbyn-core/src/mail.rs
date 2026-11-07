@@ -10,6 +10,10 @@
 //! - The SMTP sender lives in `orbyn-worker`. [`LogOnly`] is what the worker uses with no SMTP
 //!   configured, and [`Capture`] is what tests use to read what would have been sent.
 
+mod render;
+
+pub use render::Rendered;
+
 use crate::accounts::secrets::AuthSecrets;
 use crate::jobs::{self, Job};
 use serde_json::{Value, json};
@@ -66,9 +70,10 @@ pub struct Mail {
     /// that has one, `None` for an address with neither. Bound into the sealed payload.
     pub account: Option<Uuid>,
     pub to: String,
-    /// The one value a message carries: a verification code, or for a deletion notice the time the
-    /// account will be deleted (RFC 3339), a newline, and the cancel link (or its token alone when
-    /// the deployment has no account URL).
+    /// The one value a message carries, sealed in the queue like the address: a verification code;
+    /// for an address that already has an account, the time of the attempt (RFC 3339), a newline
+    /// and the sign-in link (empty when the deployment has no account URL); for a deletion notice,
+    /// the time the account will be deleted, a newline and the cancel link (empty likewise).
     pub code: Option<String>,
 }
 
@@ -82,62 +87,189 @@ impl std::fmt::Debug for Mail {
 }
 
 impl Mail {
-    pub fn subject(&self) -> &'static str {
-        match self.kind {
-            Kind::VerifyEmail => "Your Orbyn verification code",
-            Kind::SignUpAttempt => "Someone tried to sign up with your email",
-            Kind::DeletionScheduled => "Your Orbyn account will be deleted",
-        }
-    }
-
-    pub fn body(&self) -> String {
+    /// Why [`Mail::render`] gave nothing, in the words the worker logs when it gives the message
+    /// up: `the message couldn't be built (<reason>)`. Never the address or the value.
+    pub fn cannot_build_reason(&self) -> &'static str {
         match (self.kind, &self.code) {
-            (Kind::VerifyEmail, Some(code)) => format!(
-                "Your Orbyn verification code is {code}.\n\nIt works for 30 minutes. If you did not sign up for Orbyn, ignore this message.\n"
-            ),
-            (Kind::VerifyEmail, None) => "Your Orbyn verification code has expired. Ask for a new one in the app.\n".to_owned(),
-            (Kind::DeletionScheduled, value) => {
-                let (when, link) = deletion_parts(value.as_deref());
-                format!(
-                    "Your Orbyn account will be deleted on {when}, with everything in it.\n\nIf this was not you, cancel the deletion now: {link}\n\nThat opens a page with a \"Cancel deletion\" button; it works once and needs no sign-in. You can also cancel from any signed-in device, or sign in on the Orbyn sign-in page and choose \"cancel deletion\". Until then your account works as usual. If this was you, there is nothing to do.\n"
-                )
-            }
-            (Kind::SignUpAttempt, _) => "Someone tried to sign up for Orbyn with this email address, which already has an account.\n\nIf it was you, sign in instead. If it was not, you can ignore this message: nothing was changed.\n".to_owned(),
+            (Kind::VerifyEmail, _) => "the message couldn't be built (it has no code)",
+            (_, None) => "the message couldn't be built (it has no time)",
+            (_, Some(_)) => "the message couldn't be built (its time can't be read)",
         }
+    }
+
+    /// The message as designed: subject, plain text and HTML, to be sent together. `None` for a
+    /// message that lacks the value its kind needs (a code email without its code, or a notice
+    /// without its time), which cannot be sent.
+    pub fn render(&self) -> Option<Rendered> {
+        render::render(self)
     }
 }
 
-/// The date and the cancel link of a deletion notice, from its value: the time, a newline, the link.
-fn deletion_parts(value: Option<&str>) -> (String, String) {
-    let (when, link) = value
-        .and_then(|v| v.split_once('\n'))
-        .unwrap_or(("", "the app"));
-    let when = if when.is_empty() {
-        "the date shown in the app".to_owned()
-    } else {
-        deletion_date(when)
-    };
-    (when, link.to_owned())
+/// An email kind in plain words, for the log: from the kind name in a queue entry.
+pub fn kind_in_words(kind: &str) -> &'static str {
+    match Kind::parse(kind) {
+        Some(Kind::VerifyEmail) => "verification code",
+        Some(Kind::SignUpAttempt) => "sign-up notice",
+        Some(Kind::DeletionScheduled) => "account deletion notice",
+        None => "email",
+    }
 }
 
-/// "2026-11-14 12:00 UTC" from an RFC 3339 time; the text itself when it is not one.
-fn deletion_date(rfc3339: &str) -> String {
-    chrono::DateTime::parse_from_rfc3339(rfc3339).map_or_else(
-        |_| rfc3339.to_owned(),
-        |at| {
-            at.with_timezone(&chrono::Utc)
-                .format("%Y-%m-%d %H:%M UTC")
-                .to_string()
-        },
-    )
+/// A time that has passed, in words: "24 hours", "1 hour 5 minutes", "7 minutes", "30 seconds".
+pub fn lifetime_words(seconds: u64) -> String {
+    let plural = |n: u64, unit: &str| format!("{n} {unit}{}", if n == 1 { "" } else { "s" });
+    let (hours, minutes) = (seconds / 3600, seconds % 3600 / 60);
+    match (hours, minutes) {
+        (0, 0) => plural(seconds, "second"),
+        (0, m) => plural(m, "minute"),
+        (h, 0) => plural(h, "hour"),
+        (h, m) => format!("{} {}", plural(h, "hour"), plural(m, "minute")),
+    }
+}
+
+/// The longest text from a server or a library that goes into a log line.
+pub const SCRUBBED_MAX: usize = 200;
+
+/// Text a mail server or a mail library sent, made safe for a log line, in two layers.
+///
+/// 1. **The recipient, exactly** ([`scrub_for`] only): the address as given, its local part and
+///    both percent-encoded forms go first, so whatever shape the address has, it does not survive
+///    in the text, however odd (`a!b@x`, `"sam smith"@x`, `sam@[192.0.2.1]`).
+/// 2. **Every other address-like token**: the text is cut into tokens at whitespace, `<`, `>`, `"`,
+///    `,`, `;`, `(` and `)`, and **every token that contains `@` or `%40` becomes `<address>`**
+///    (a quoted part right before an `@` belongs to its token, and one pair of angle brackets
+///    around a token goes with it). This is deliberately wider than any grammar: a token that
+///    only looks like an address goes too.
+///
+/// Control characters go, and the result is cut to [`SCRUBBED_MAX`] characters.
+pub fn scrub(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let delimiter = |c: char| c.is_whitespace() || "<>\",;()".contains(c);
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if !delimiter(chars[i]) || (chars[i] == '"' && quoted_local_end(&chars, i).is_some()) {
+            // A token: from here to the next delimiter, taking in a quoted local part.
+            let mut end = i;
+            if chars[i] == '"' {
+                end = quoted_local_end(&chars, i).unwrap_or(i);
+            }
+            while end < chars.len() && !delimiter(chars[end]) {
+                end += 1;
+            }
+            let token: String = chars[i..end].iter().collect();
+            let lower = token.to_ascii_lowercase();
+            if (token.contains('@') && token.chars().count() > 1) || lower.contains("%40") {
+                let bracketed = out.ends_with('<') && chars.get(end) == Some(&'>');
+                if bracketed {
+                    out.pop();
+                    end += 1;
+                }
+                out.push_str("<address>");
+            } else {
+                out.push_str(&token);
+            }
+            i = end;
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out.chars()
+        .filter(|c| !c.is_control())
+        .take(SCRUBBED_MAX)
+        .collect()
+}
+
+/// For a `"` at `open`: the index just after the closing `"` when an `@` follows it at once.
+fn quoted_local_end(chars: &[char], open: usize) -> Option<usize> {
+    let close = chars[open + 1..].iter().position(|&c| c == '"')? + open + 1;
+    (chars.get(close + 1) == Some(&'@')).then_some(close + 1)
+}
+
+/// [`scrub`], after the recipient `to` is taken out exactly: the address as given, its local part
+/// and the percent-encoded forms of both, whatever case the server used. A local part goes only
+/// as a whole word, so a short one does not eat the middle of other words (a one-letter local
+/// part still removes every standalone use of that letter, which is the price of never
+/// echoing it).
+pub fn scrub_for(text: &str, to: &str) -> String {
+    let to = to.trim();
+    let mut out = text.to_owned();
+    if to.is_empty() {
+        return scrub(&out);
+    }
+    let local = to.rsplit_once('@').map_or("", |(local, _)| local);
+    let mut whole = [
+        to.to_owned(),
+        percent_encode(to),
+        to.replace('@', "%40"),
+        to.trim_matches('"').to_owned(),
+    ];
+    whole.sort_by_key(|form| std::cmp::Reverse(form.len()));
+    for form in whole.iter().filter(|form| !form.is_empty()) {
+        out = replace_ignoring_case(&out, form, false);
+    }
+    for form in [
+        local.to_owned(),
+        percent_encode(local),
+        local.trim_matches('"').to_owned(),
+    ] {
+        if !form.is_empty() {
+            out = replace_ignoring_case(&out, &form, true);
+        }
+    }
+    // The recipient inside one pair of angle brackets keeps just the one pair.
+    scrub(&out.replace("<<address>>", "<address>"))
+}
+
+/// Every byte that is not an ASCII letter, digit or one of `-._~` as `%XX`.
+fn percent_encode(text: &str) -> String {
+    text.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+                char::from(b).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+/// Replaces every occurrence of `needle` in `text`, whatever its case, with `<address>`; with
+/// `whole_word`, only where the characters on both sides are not letters or digits.
+fn replace_ignoring_case(text: &str, needle: &str, whole_word: bool) -> String {
+    let (hay, pat): (Vec<char>, Vec<char>) = (
+        text.chars().map(|c| c.to_ascii_lowercase()).collect(),
+        needle.chars().map(|c| c.to_ascii_lowercase()).collect(),
+    );
+    let original: Vec<char> = text.chars().collect();
+    let word = |c: Option<&char>| c.is_some_and(|c| c.is_alphanumeric());
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < original.len() {
+        let end = i + pat.len();
+        let hit = end <= hay.len()
+            && hay[i..end] == pat[..]
+            && (!whole_word
+                || (!word(i.checked_sub(1).and_then(|j| hay.get(j))) && !word(hay.get(end))));
+        if hit {
+            out.push_str("<address>");
+            i = end;
+        } else {
+            out.push(original[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Why a message could not be sent. Never carries an address or a code.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("{reason}")]
 pub struct SendError {
-    /// A fixed description, such as "the mail server refused the message".
-    pub reason: &'static str,
+    /// What happened, in words for the log: never an address, and never a code. Text a server or a
+    /// library sent goes through [`scrub`] first.
+    pub reason: String,
     /// True when trying again cannot help, such as an address that cannot be one.
     pub permanent: bool,
 }
@@ -270,9 +402,9 @@ pub enum Delivery {
     /// Sent, or deliberately not sent and logged: the job is done.
     Sent,
     /// Failed for now: run the job again after the queue's backoff. The text has no personal data.
-    Retry(&'static str),
+    Retry(String),
     /// Cannot succeed or is too old: stop. The text has no personal data.
-    GiveUp(&'static str),
+    GiveUp(String),
 }
 
 /// Decides one delivery of an email `job`. With no `secrets` (a worker without
@@ -289,17 +421,26 @@ async fn deliver_at(
 ) -> Delivery {
     use base64::Engine;
     let Some(kind) = job.payload["kind"].as_str() else {
-        return Delivery::GiveUp("the email job has no kind");
+        return Delivery::GiveUp("the email job has no kind".to_owned());
     };
     let account = job.payload["account"]
         .as_str()
         .and_then(|text| Uuid::parse_str(text).ok());
-    if job.payload["give_up_at"].as_u64().is_none_or(|at| now > at) {
+    let give_up_at = job.payload["give_up_at"].as_u64();
+    if give_up_at.is_none_or(|at| now > at) {
         log_not_sent(kind, account);
-        return Delivery::GiveUp("the email was still unsent 24 hours after it was queued");
+        // How long it really waited: from when it was queued (the limit before its give-up time)
+        // to now.
+        let waited = give_up_at
+            .map(|at| now.saturating_sub(at.saturating_sub(GIVE_UP_AFTER.as_secs())))
+            .unwrap_or(GIVE_UP_AFTER.as_secs());
+        return Delivery::GiveUp(format!(
+            "it waited in the queue for {} and expired",
+            lifetime_words(waited)
+        ));
     }
     let Some(parsed) = Kind::parse(kind) else {
-        return Delivery::GiveUp("the email job has an unknown kind");
+        return Delivery::GiveUp("the email job has an unknown kind".to_owned());
     };
     let Some(secrets) = secrets else {
         log_not_sent(kind, account);
@@ -315,10 +456,10 @@ async fn deliver_at(
         .and_then(|sealed| secrets.open_mail(&aad(job.id, kind, account), &sealed))
         .and_then(|body| serde_json::from_slice::<Value>(&body).ok());
     let Some(body) = opened else {
-        return Delivery::GiveUp("the email could not be opened");
+        return Delivery::GiveUp("the email could not be opened".to_owned());
     };
     let Some(to) = body["to"].as_str() else {
-        return Delivery::GiveUp("the email has no address");
+        return Delivery::GiveUp("the email has no address".to_owned());
     };
     let mail = Mail {
         kind: parsed,
@@ -328,8 +469,9 @@ async fn deliver_at(
     };
     match sender.send(&mail).await {
         Ok(()) => Delivery::Sent,
-        Err(error) if error.permanent => Delivery::GiveUp(error.reason),
-        Err(error) => Delivery::Retry(error.reason),
+        // Whatever a sender says, the address is taken out of it before it is logged or stored.
+        Err(error) if error.permanent => Delivery::GiveUp(scrub_for(&error.reason, &mail.to)),
+        Err(error) => Delivery::Retry(scrub_for(&error.reason, &mail.to)),
     }
 }
 
@@ -351,11 +493,11 @@ pub async fn deliver_queued(
                 delivered += 1;
             }
             Delivery::Retry(reason) => {
-                jobs::fail(pool, job.id, &worker, reason, jobs::backoff(job.attempts)).await?;
+                jobs::fail(pool, job.id, &worker, &reason, jobs::backoff(job.attempts)).await?;
                 break;
             }
             Delivery::GiveUp(reason) => {
-                jobs::abandon(pool, job.id, &worker, reason).await?;
+                jobs::abandon(pool, job.id, &worker, &reason).await?;
             }
         }
     }
@@ -426,6 +568,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn whatever_a_sender_says_the_delivery_has_no_part_of_the_address() {
+        let secrets = secrets();
+        let queued = 1_000_000;
+        for shape in [
+            "a!b@example.com",
+            "first=last@example.com",
+            "x/y@example.com",
+            "a#b@example.com",
+            "sam@mail_x.example.com",
+            "sam@[192.0.2.1]",
+            "\"sam smith\"@example.com",
+        ] {
+            let mut m = mail(Some("123456"));
+            m.to = shape.to_owned();
+            let id = Uuid::new_v4();
+            let mut job = job(payload(&secrets, id, &m, queued).expect("payload"));
+            job.id = id;
+            for text in [
+                format!("550 <{shape}> no such user"),
+                format!("550 {} no", shape.replace('@', "%40")),
+                format!("rejected {shape}."),
+            ] {
+                let sender = Failing(SendError {
+                    reason: text,
+                    permanent: true,
+                });
+                let Delivery::GiveUp(reason) =
+                    deliver_at(&job, Some(&secrets), &sender, queued).await
+                else {
+                    panic!("given up")
+                };
+                for part in [
+                    "sam", "smith", "a!b", "first", "x/y", "a#b", "192.0", "example", "%40",
+                ] {
+                    assert!(!reason.contains(part), "{shape}: {reason}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn a_delivery_is_sent_retried_or_given_up_on() {
         let secrets = secrets();
         let m = mail(Some("123456"));
@@ -444,20 +627,20 @@ mod tests {
 
         // A failing server is retried (the queue backs off), a permanent refusal is not.
         let transient = Failing(SendError {
-            reason: "the mail server is busy",
+            reason: "the mail server is busy".into(),
             permanent: false,
         });
         assert_eq!(
             deliver_at(&job, Some(&secrets), &transient, queued).await,
-            Delivery::Retry("the mail server is busy")
+            Delivery::Retry("the mail server is busy".into())
         );
         let permanent = Failing(SendError {
-            reason: "the address cannot receive mail",
+            reason: "the address cannot receive mail".into(),
             permanent: true,
         });
         assert_eq!(
             deliver_at(&job, Some(&secrets), &permanent, queued).await,
-            Delivery::GiveUp("the address cannot receive mail")
+            Delivery::GiveUp("the address cannot receive mail".into())
         );
 
         // Still retried 24 hours in; given up on a second later, without trying.
@@ -467,10 +650,15 @@ mod tests {
             Delivery::Retry(_)
         ));
         let late = Capture::default();
-        assert!(matches!(
+        // Given up on, with how long it really waited in the queue.
+        assert_eq!(
             deliver_at(&job, Some(&secrets), &late, at + 1).await,
-            Delivery::GiveUp(_)
-        ));
+            Delivery::GiveUp("it waited in the queue for 24 hours and expired".into())
+        );
+        assert_eq!(
+            deliver_at(&job, Some(&secrets), &late, at + 5 * 60 + 1).await,
+            Delivery::GiveUp("it waited in the queue for 24 hours 5 minutes and expired".into())
+        );
         assert!(late.sent().is_empty());
     }
 
@@ -498,5 +686,98 @@ mod tests {
             Delivery::GiveUp(_)
         ));
         assert!(capture.sent().is_empty());
+    }
+
+    #[test]
+    fn server_and_library_text_loses_every_address_and_is_cut_short() {
+        // A server echoing the recipient: the address goes, and its angle brackets with it.
+        assert_eq!(
+            scrub("550 5.1.1 <sam@example.com>: user unknown"),
+            "550 5.1.1 <address>: user unknown"
+        );
+        // Without brackets, several of them, odd local parts, and one at the very end.
+        assert_eq!(
+            scrub("rejected sam.o'brien+tag@mail.example.co.uk and bob@x.org, then a@b.c"),
+            "rejected <address> and <address>, then <address>"
+        );
+        assert_eq!(scrub("<a@b.com> <c@d.com>"), "<address> <address>");
+        // Not addresses: nothing to remove.
+        for plain in ["user @ host", "550 mailbox full", ""] {
+            assert_eq!(scrub(plain), plain);
+        }
+        // Token-based, so anything with an @ in it goes, grammar or not.
+        assert_eq!(scrub("@mention"), "<address>");
+        assert_eq!(scrub("trailing@ x"), "<address> x");
+        // Control characters go, and the text is cut to 200 characters.
+        assert_eq!(scrub("a\r\nb\u{7}c"), "abc");
+        assert_eq!(scrub(&"x".repeat(500)).chars().count(), 200);
+        let long = format!("{} sam@example.com", "y".repeat(190));
+        assert!(!scrub(&long).contains("example.com"));
+        assert!(scrub(&long).chars().count() <= 200);
+    }
+
+    #[test]
+    fn every_shape_of_address_goes_from_server_text() {
+        for shape in [
+            "a!b@example.com",
+            "first=last@example.com",
+            "x/y@example.com",
+            "a#b@example.com",
+            "sam@mail_x.example.com",
+            "sam@[192.0.2.1]",
+            "\"sam smith\"@example.com",
+            "sam%40example.com",
+            "SAM@EXAMPLE.COM",
+        ] {
+            // Said back by a server that knows nothing about the recipient.
+            let said = format!("550 5.1.1 <{shape}>: user unknown; also {shape}, bye");
+            let clean = scrub(&said);
+            for part in [
+                "sam", "smith", "a!b", "first", "x/y", "a#b", "192.0", "example", "EXAMPLE", "%40",
+            ] {
+                assert!(!clean.contains(part), "{shape}: {clean}");
+            }
+            // And with the recipient known, in any case or percent-encoded.
+            let known = format!("{said} {} {}", shape.to_uppercase(), percent_encode(shape));
+            let clean = scrub_for(&known, shape);
+            for part in [
+                "sam", "smith", "a!b", "first", "x/y", "a#b", "192.0", "example",
+            ] {
+                assert!(!clean.to_lowercase().contains(part), "{shape}: {clean}");
+            }
+        }
+        // The recipient's local part alone is removed too, as a word, even when no @ follows.
+        assert_eq!(
+            scrub_for("user smithy rejected, smith unknown", "smith@example.com"),
+            "user smithy rejected, <address> unknown"
+        );
+        assert!(!scrub_for("%73mith@example.com", "smith@example.com").contains("mith"));
+        assert_eq!(
+            scrub_for("550 mailbox full", "sam@example.com"),
+            "550 mailbox full"
+        );
+    }
+
+    #[test]
+    fn a_wait_is_said_in_words_and_a_kind_in_plain_words() {
+        for (seconds, words) in [
+            (1, "1 second"),
+            (30, "30 seconds"),
+            (60, "1 minute"),
+            (420, "7 minutes"),
+            (3600, "1 hour"),
+            (3900, "1 hour 5 minutes"),
+            (86_400, "24 hours"),
+            (86_400 + 3 * 60, "24 hours 3 minutes"),
+        ] {
+            assert_eq!(lifetime_words(seconds), words, "{seconds}");
+        }
+        assert_eq!(kind_in_words("verify_email"), "verification code");
+        assert_eq!(kind_in_words("sign_up_attempt"), "sign-up notice");
+        assert_eq!(
+            kind_in_words("deletion_scheduled"),
+            "account deletion notice"
+        );
+        assert_eq!(kind_in_words("anything else"), "email");
     }
 }

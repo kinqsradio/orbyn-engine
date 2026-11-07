@@ -28,6 +28,9 @@ use uuid::Uuid;
 static TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// One server setup for the run: a password record only works with the setup
 /// it was made under.
+/// The account site the test server's emails link to.
+const ACCOUNT_URL: &str = "https://account.example.com";
+
 static SETUP: OnceLock<String> = OnceLock::new();
 
 struct Up;
@@ -94,7 +97,9 @@ async fn build_server_full(limits: Limits, pinned: bool, trace: Option<Trace>) -
     db.migrate().await.expect("migrate");
     let setup = SETUP.get_or_init(|| AuthSecrets::generate().to_string());
     let secrets = AuthSecrets::from_encoded(setup).expect("setup");
-    let mut accounts = Accounts::new(db.pool().clone(), secrets).with_limits(limits);
+    let mut accounts = Accounts::new(db.pool().clone(), secrets)
+        .with_limits(limits)
+        .with_account_url(ACCOUNT_URL);
     if pinned {
         let at = PIN.load(Ordering::SeqCst);
         accounts = accounts.with_clock(move || at);
@@ -3313,13 +3318,20 @@ async fn a_taken_address_gets_an_answer_of_the_same_shape_and_its_owner_a_messag
     );
     let mailbox = server.mailbox().await;
     assert_eq!(mailbox.count(&norm, Kind::SignUpAttempt), 1);
-    assert!(
-        mailbox
-            .sent()
-            .iter()
-            .filter(|m| m.to == norm && m.kind == Kind::SignUpAttempt)
-            .all(|m| m.code.is_none())
-    );
+    // It says when and where to sign in, and carries no code and nothing about who tried.
+    for m in mailbox
+        .sent()
+        .iter()
+        .filter(|m| m.to == norm && m.kind == Kind::SignUpAttempt)
+    {
+        let value = m.code.as_deref().expect("the attempt time and the link");
+        let (at, link) = value.split_once('\n').expect("time and link");
+        assert!(chrono::DateTime::parse_from_rfc3339(at).is_ok(), "{at}");
+        assert_eq!(link, format!("{ACCOUNT_URL}/sign-in"));
+        let rendered = m.render().expect("renders");
+        assert!(rendered.text.contains(&norm) && rendered.text.contains("UTC."));
+        assert!(rendered.text.contains(&format!("{ACCOUNT_URL}/sign-in")));
+    }
 }
 
 #[tokio::test]
@@ -4036,7 +4048,7 @@ impl Server {
     }
 
     /// The cancel tokens in the deletion emails sent to `email`, oldest first (from the link's
-    /// fragment, or the token alone when the deployment has no account URL).
+    /// fragment).
     async fn cancel_tokens(&self, email: &str) -> Vec<String> {
         let to = normalized(email);
         self.mailbox()
@@ -4398,12 +4410,9 @@ async fn asking_again_keeps_the_time_and_the_one_email_and_a_new_schedule_is_lim
         .into_iter()
         .find(|m| m.to == to && m.kind == Kind::DeletionScheduled)
         .expect("notice");
-    assert!(
-        notice
-            .body()
-            .contains(&deletes_at.format("%Y-%m-%d").to_string())
-    );
-    assert!(notice.body().contains("cancel"));
+    let text = notice.render().expect("a deletion notice renders").text;
+    assert!(text.contains(&deletes_at.format("%A %-d %B %Y at %H:%M UTC").to_string()));
+    assert!(text.contains(&format!("{ACCOUNT_URL}/cancel-deletion#")));
 }
 
 #[tokio::test]
@@ -5124,7 +5133,10 @@ async fn the_email_link_cancels_once_without_a_sign_in_and_a_repeat_request_keep
         .rev()
         .find(|m| m.kind == Kind::DeletionScheduled)
         .expect("notice");
-    assert!(notice.body().contains("Cancel deletion"));
+    let rendered = notice.render().expect("a deletion notice renders");
+    assert!(
+        rendered.text.contains("Cancel deletion") && rendered.html.contains(">Cancel deletion</a>")
+    );
 
     // A repeat request (a thief's, say) neither voids the link nor sends another email.
     let (status, again) = schedule().await;

@@ -155,9 +155,11 @@ impl Accounts {
         .fetch_one(&mut *tx)
         .await?;
         let token = URL_SAFE_NO_PAD.encode(token);
+        // The button's link; without an account URL there is no page to send the person to, so
+        // the email has no button and the token is not sent at all.
         let link = match &self.account_url {
             Some(url) => format!("{url}/cancel-deletion#{token}"),
-            None => token,
+            None => String::new(),
         };
         // One email per schedule, queued in the same transaction: it exists only if the schedule
         // does.

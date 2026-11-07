@@ -97,6 +97,11 @@ async fn main() -> ExitCode {
     init_tracing();
     let config = match Config::from_env() {
         Ok(config) => config,
+        Err(err) if err.is_operator_message() => {
+            // Written for the operator: printed as it is, to stderr, with exit status 1.
+            eprintln!("{err}");
+            return ExitCode::FAILURE;
+        }
         Err(err) => {
             tracing::error!(error = %err, "configuration");
             return ExitCode::from(2);
@@ -111,7 +116,12 @@ async fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
-            tracing::error!(error = %message, "stopped");
+            // A start-up error written for the operator is printed as it is, to stderr.
+            if message.starts_with(orbyn_worker::OPERATOR_ERROR) {
+                eprintln!("{message}");
+            } else {
+                tracing::error!(error = %message, "stopped");
+            }
             ExitCode::FAILURE
         }
     }
@@ -194,18 +204,25 @@ fn mailer(config: &Config) -> Result<orbyn_worker::Mailer, String> {
     match (&config.smtp_url, &config.mail_from) {
         (Some(url), Some(from)) => {
             if secrets.is_none() {
-                return Err("ORBYN_SMTP_URL needs ORBYN_AUTH_SETUP: the worker opens queued messages with it".to_owned());
+                return Err(format!(
+                    "{}the worker has ORBYN_SMTP_URL but no ORBYN_AUTH_SETUP\n  The worker needs ORBYN_AUTH_SETUP to open queued messages. Set it to\n  the same value the server uses.",
+                    orbyn_worker::OPERATOR_ERROR
+                ));
             }
             let sender = orbyn_worker::Smtp::new(url, from, config.smtp_ca_file.as_deref())?;
+            // Warnings written for the operator go to stderr as they are; the worker goes on.
+            for warning in sender.ca_warnings() {
+                eprintln!("{warning}");
+            }
             Ok(orbyn_worker::Mailer {
                 secrets,
                 sender: std::sync::Arc::new(sender),
             })
         }
-        _ if !config.mail_log_only => Err(
-            "the worker needs ORBYN_SMTP_URL and ORBYN_MAIL_FROM to send email (ORBYN_MAIL=log only for development, which sends nothing)"
-                .to_owned(),
-        ),
+        _ if !config.mail_log_only => Err(format!(
+            "{}the worker has no ORBYN_SMTP_URL, so it can't send mail\n  Set ORBYN_SMTP_URL. For development only, set ORBYN_MAIL=log to skip\n  sending: the log notes each email that wasn't sent, without its\n  contents.",
+            orbyn_worker::OPERATOR_ERROR
+        )),
         _ => {
             tracing::warn!("ORBYN_MAIL=log: email is logged as not sent, and nothing is sent");
             Ok(orbyn_worker::Mailer {
@@ -322,7 +339,7 @@ mod tests {
         // SMTP without the setup that opens queued messages is refused, naming the setting.
         let error = mailer(&config(&[
             ("ORBYN_SMTP_URL", "smtps://mail.example.com"),
-            ("ORBYN_MAIL_FROM", "no-reply@example.com"),
+            ("ORBYN_MAIL_FROM", "hello@example.com"),
         ]))
         .expect_err("refused");
         assert!(
@@ -333,7 +350,7 @@ mod tests {
         let ok = config(&[
             ("ORBYN_AUTH_SETUP", setup.as_str()),
             ("ORBYN_SMTP_URL", "smtps://mail.example.com"),
-            ("ORBYN_MAIL_FROM", "no-reply@example.com"),
+            ("ORBYN_MAIL_FROM", "hello@example.com"),
         ]);
         assert!(mailer(&ok).is_ok());
         let bad = config(&[
@@ -354,10 +371,30 @@ mod tests {
         let bad = config(&[
             ("ORBYN_AUTH_SETUP", setup.as_str()),
             ("ORBYN_SMTP_URL", "smtps://mail.example.com"),
-            ("ORBYN_MAIL_FROM", "no-reply@example.com"),
+            ("ORBYN_MAIL_FROM", "hello@example.com"),
             ("ORBYN_SMTP_CA_FILE", "/nonexistent/orbyn-ca.pem"),
         ]);
         let error = mailer(&bad).expect_err("refused");
         assert!(error.contains("ORBYN_SMTP_CA_FILE"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn the_worker_start_up_messages_are_as_designed() {
+        // No SMTP at all.
+        assert_eq!(
+            mailer(&config(&[])).expect_err("refused"),
+            "error: the worker has no ORBYN_SMTP_URL, so it can't send mail\n  Set ORBYN_SMTP_URL. For development only, set ORBYN_MAIL=log to skip\n  sending: the log notes each email that wasn't sent, without its\n  contents."
+        );
+        // SMTP without the setup that opens queued messages.
+        let error = mailer(&config(&[
+            ("ORBYN_SMTP_URL", "smtps://mail.example.com"),
+            ("ORBYN_MAIL_FROM", "hello@example.com"),
+        ]))
+        .expect_err("refused");
+        assert_eq!(
+            error,
+            "error: the worker has ORBYN_SMTP_URL but no ORBYN_AUTH_SETUP\n  The worker needs ORBYN_AUTH_SETUP to open queued messages. Set it to\n  the same value the server uses."
+        );
+        assert!(error.lines().skip(1).all(|l| l.len() <= 72));
     }
 }
