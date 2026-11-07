@@ -2559,6 +2559,13 @@ fn other_devices_check_the_approval_signature_with_the_endorsement_hash_from_the
     let mut other = honest.clone();
     other.devices[1].approval_endorsement_hash = Some(b64(&[3; 32]));
     assert!(!trusts_b(&other), "nor with another hash");
+    // A hash the server made malformed is not "no hash": the device is not trusted. Not base64,
+    // the wrong length either way, and empty.
+    for bad in ["!!not base64!!", &b64(&[3; 31]), &b64(&[3; 33]), ""] {
+        let mut malformed = honest.clone();
+        malformed.devices[1].approval_endorsement_hash = Some(bad.to_owned());
+        assert!(!trusts_b(&malformed), "a malformed hash {bad:?}");
+    }
 }
 
 /// An honest server and a lost phone: b (trusted by a) signed Advanced, a had not fetched it, and
