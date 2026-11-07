@@ -57,10 +57,24 @@ Identities are logged by **email**, the identity people share with, as key-trans
   - The VRF key is stored wrapped under the HSM key-encryption key. It is not an HSM operation, because HSMs do not offer VRFs. A leak of it exposes only which emails have entries, not keys or contents.
 - **Accounts without a service key.** The identity map is independent of the service key and of the protection level. Advanced accounts use it the same way.
 - **Self-hosting.** Self-hosts without a key service have no log, so they cannot share.
-- **Submitting.** A device submits a statement with `POST /v1/identity/statements`. The key service checks both signatures and the chain before appending. For a reset, it also checks that the referenced recovery-finish entry exists for that account.
-- **Lookup.** `GET /v1/identity/{email}` is answered by the key service's public API, not the record server. It returns the VRF output and proof, the head statement with its chain, and a cosigned lookup proof.
+- **Proving the email.** The key service appends a **first statement** for an email only after proving the submitter controls it.
+  - It sends its own six-digit code to that email, through its own mail path, not the record server's.
+  - The device submits the code with the statement.
+  - The code follows engine#30's rules: one active code per email, mail caps per address, and guess caps per code and per IP prefix.
+- **One chain per email.** A first statement for an email that already has a chain is refused. The only way to replace it is a reset for the same account (see *Recovery*).
+- **Changing an email** is a signed **move**: a statement under the old email naming the new one, plus a first statement under the new email, proven like any first statement. Both are logged, and contacts follow the move.
+- **Deleting an account** logs a tombstone under its email, signed by the account key. A later first statement for that email needs the email proven again.
+- **Fresh first statements wait.** Contacts do not seal to a first statement until a cosigned head has included it for 24 hours. A brand-new identity therefore gives its email's owner a day to see it, if they already have an Orbyn account on another server view.
+- **Submitting.** A device submits a statement with `POST /v1/identity/statements`. The key service checks both signatures and the chain, the email proof for a first statement, and the recovery-finish link for a reset, before appending.
+- **Lookup is not public.** `GET /v1/identity/{email}` is answered by the key service, but only with a **lookup capability**.
+  - The record server issues a capability only for an **accepted invitation**, bound to the inviter's account, the zone and the email digest, and for an account's **own email**, to its own sessions.
+  - It is signed by the record server with a key the key service pins, and it expires after 10 minutes.
+  - There is no lookup for an email the caller has not invited and had accepted, so the identity map is never an "is this email registered" oracle.
+  - Lookups are limited per session and per address, and the answers for a missing entry and a present one have the same shape and timing (a non-membership proof).
+  - Both servers still learn whether an email has an entry when a lookup is made, and the metadata section says so.
+- **The answer** is the VRF output and proof, the head statement with its chain, and a cosigned lookup proof. Clients verify the VRF proof per RFC 9381, against a VRF public key pinned and versioned in client configuration like the identity keys.
 - **Before sealing.** Before Maya's device seals anything to Sam, it requires:
-  - the email Maya typed, looked up by her own device;
+  - the email Maya typed, looked up by her own device with the capability for Sam's accepted invitation;
   - a lookup proof no older than 24 hours;
   - a chain that verifies;
   - a head no older than the one she pinned for that email.
@@ -118,7 +132,11 @@ The zone key alone cannot tell who wrote a record, because every member, viewers
 A device accepts a version only if all of these hold:
 - its signature verifies against the author's pinned account key;
 - the author has a role that may write in the participant statement bound by the zone key the version is sealed under;
-- it is sealed under the zone's current key. Once a device has accepted a rotation away from a key, it refuses **any newly arriving version sealed under that key**, whatever its version number, because version numbers are assigned by the server and are not signed.
+- it is sealed under the zone's current key, or it is history proven by a rotation, as below.
+
+**Rotations seal history.** An owner's rotation away from a key commits to a Merkle root over every version accepted under that key: (record id, version, hash of the ciphertext and of the wrapped record key). This is the per-zone signed version log that architecture.md lists as open, built here for shared zones.
+- A device that already holds the zone refuses any newly arriving version under a retired key, whatever its version number, because version numbers are server-assigned and unsigned.
+- A device that is **bootstrapping**, a new member or a new device, accepts an old-key version only with an inclusion proof against the root its rotation commits to. History is therefore readable, but nothing can be added to it after the rotation.
 
 A demoted or removed member therefore cannot write, even with old keys and a cooperating server: a new version under the old key is refused, and they hold nothing under the new key. A member who wrote offline under the old key seals the write again under the new key before uploading it.
 
@@ -190,7 +208,7 @@ The threat model gains:
 - which account wrote each version, from the signatures;
 - invitation timing, under keyed, expiring email digests;
 - the owner's device ids in cross-account notices;
-- identity lookups: the key service sees which emails a device looks up, and when.
+- identity lookups: the key service sees which emails a device looks up, and when, and both servers learn whether an email has an entry when an accepted invitation's lookup is made.
 
 Contents stay sealed.
 
