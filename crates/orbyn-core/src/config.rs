@@ -7,6 +7,17 @@ use std::time::Duration;
 /// Days tombstones and deleted zones are kept by default.
 pub const DEFAULT_PURGE_DAYS: u64 = 30;
 
+/// Who may sign up (`ORBYN_SIGNUP`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SignupMode {
+    /// Sign-up needs an invite code (the default).
+    #[default]
+    Invite,
+    /// Anyone may sign up. Not for use until the sign-up address probing (#42) and the account
+    /// existence signal (#66) are fixed.
+    Open,
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub database_url: String,
@@ -50,6 +61,8 @@ pub struct Config {
     /// addition to the web roots and never instead of them. For a private relay or a test mail
     /// server. TLS is still required. Needs `smtp_url`.
     pub smtp_ca_file: Option<String>,
+    /// `ORBYN_SIGNUP=invite|open`; `invite` unless set.
+    pub signup: SignupMode,
 }
 
 impl ConfigError {
@@ -76,6 +89,7 @@ impl std::fmt::Debug for Config {
             .field("mail_from", &self.mail_from)
             .field("account_url", &self.account_url)
             .field("smtp_ca_file", &self.smtp_ca_file)
+            .field("signup", &self.signup)
             .finish()
     }
 }
@@ -106,6 +120,8 @@ pub enum ConfigError {
     InvalidMailMode,
     #[error("ORBYN_ACCOUNT_URL must be an https:// address (http:// only for localhost)")]
     InvalidAccountUrl,
+    #[error("ORBYN_SIGNUP can only be `invite` or `open`")]
+    InvalidSignup,
 }
 
 impl Config {
@@ -198,6 +214,11 @@ impl Config {
                 return Err(ConfigError::InvalidAccountUrl);
             }
         }
+        let signup = match optional("ORBYN_SIGNUP").as_deref() {
+            None | Some("invite") => SignupMode::Invite,
+            Some("open") => SignupMode::Open,
+            Some(_) => return Err(ConfigError::InvalidSignup),
+        };
         Ok(Self {
             database_url,
             bind,
@@ -213,6 +234,7 @@ impl Config {
             mail_from,
             account_url,
             smtp_ca_file,
+            signup,
         })
     }
 }

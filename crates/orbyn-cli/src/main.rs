@@ -1,6 +1,8 @@
 //! `orbyn`: one binary for every server role, chosen by subcommand, so one Docker
 //! image runs them all.
 
+mod invite;
+
 use clap::{Parser, Subcommand};
 use orbyn_core::{Config, Database};
 use std::process::ExitCode;
@@ -31,6 +33,13 @@ enum Command {
     /// The key service (Standard protection).
     #[command(subcommand)]
     Keyservice(Keyservice),
+    /// Manages invite codes for the beta.
+    #[command(disable_help_flag = true)]
+    Invite {
+        /// `create`, `list` or `revoke`, and their options.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Exit 0 if the API at ADDRESS answers /health, for container health checks.
     Health {
         #[arg(default_value = "127.0.0.1:8080")]
@@ -111,6 +120,7 @@ async fn main() -> ExitCode {
         Command::Serve => serve(config).await,
         Command::Worker => worker(config).await,
         Command::Migrate => migrate(config).await,
+        Command::Invite { args } => return invite_command(config, &args).await,
         Command::Health { .. } | Command::AuthSetup | Command::Keyservice(_) => Ok(()),
     };
     match result {
@@ -127,6 +137,45 @@ async fn main() -> ExitCode {
     }
 }
 
+/// `orbyn invite ...`: stdout and exit status 0, or stderr and exit status 1.
+async fn invite_command(config: Config, args: &[String]) -> ExitCode {
+    // Help needs no database.
+    let needs_db = matches!(
+        args.first().map(String::as_str),
+        Some("create" | "list" | "revoke")
+    ) && !args.iter().any(|a| a == "-h" || a == "--help");
+    let outcome = if needs_db {
+        match Database::connect_with_pool(&config.database_url, 2).await {
+            Ok(db) => invite::run(db.pool(), args).await,
+            Err(error) => Err(error.to_string()),
+        }
+    } else {
+        // Nothing to ask the database: a lazy pool that is never used.
+        match Database::connect_lazy_with_pool(&config.database_url, 2) {
+            Ok(db) => invite::run(db.pool(), args).await,
+            Err(error) => Err(error.to_string()),
+        }
+    };
+    match outcome {
+        Ok(text) => {
+            print!("{}", with_newline(text));
+            ExitCode::SUCCESS
+        }
+        Err(text) => {
+            eprint!("{}", with_newline(text));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The text with exactly one newline at its end.
+fn with_newline(mut text: String) -> String {
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text
+}
+
 async fn serve(config: Config) -> Result<(), String> {
     let db = Database::connect_lazy_with_pool(&config.database_url, config.database_pool_size)
         .map_err(|e| e.to_string())?;
@@ -135,7 +184,8 @@ async fn serve(config: Config) -> Result<(), String> {
         Some(setup) => {
             let secrets = orbyn_core::accounts::AuthSecrets::from_encoded(setup)
                 .map_err(|e| e.to_string())?;
-            let mut accounts = orbyn_core::Accounts::new(db.pool().clone(), secrets);
+            let mut accounts =
+                orbyn_core::Accounts::new(db.pool().clone(), secrets).with_signup(config.signup);
             if let Some(url) = &config.account_url {
                 accounts = accounts.with_account_url(url);
             }

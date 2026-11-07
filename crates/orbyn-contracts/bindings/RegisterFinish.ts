@@ -12,4 +12,10 @@ registration_upload: string, device: NewDevice,
 /**
  * The device's signature over the `orbyn/device-register/v1` message.
  */
-device_signature: string, };
+device_signature: string, 
+/**
+ * The invite code, when the server asks for one (`ORBYN_SIGNUP=invite`, the default). Any
+ * case, with or without dashes and spaces. An unknown, expired, used or revoked code, and a
+ * missing one, are the same answer: 400 `invite_invalid`. Ignored when sign-up is open.
+ */
+invite?: string, };

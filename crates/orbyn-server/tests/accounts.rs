@@ -87,6 +87,15 @@ async fn build_server(limits: Limits, pinned: bool) -> Server {
 }
 
 async fn build_server_full(limits: Limits, pinned: bool, trace: Option<Trace>) -> Server {
+    build_server_mode(limits, pinned, trace, orbyn_core::SignupMode::Open).await
+}
+
+async fn build_server_mode(
+    limits: Limits,
+    pinned: bool,
+    trace: Option<Trace>,
+    signup: orbyn_core::SignupMode,
+) -> Server {
     PIN.store(0, Ordering::SeqCst);
     if pinned {
         let step = totp::STEP_SECS;
@@ -99,7 +108,8 @@ async fn build_server_full(limits: Limits, pinned: bool, trace: Option<Trace>) -
     let secrets = AuthSecrets::from_encoded(setup).expect("setup");
     let mut accounts = Accounts::new(db.pool().clone(), secrets)
         .with_limits(limits)
-        .with_account_url(ACCOUNT_URL);
+        .with_account_url(ACCOUNT_URL)
+        .with_signup(signup);
     if pinned {
         let at = PIN.load(Ordering::SeqCst);
         accounts = accounts.with_clock(move || at);
@@ -5731,7 +5741,10 @@ async fn an_unused_account_is_deleted_by_its_link_and_the_address_signs_up_again
     assert!(server.account_exists(&email).await);
 
     let (status, body) = server.confirm_unused(&tokens[0]).await;
-    assert_eq!((status, body), (StatusCode::NO_CONTENT, Value::Null));
+    assert_eq!(
+        (status, body),
+        (StatusCode::OK, json!({"invite_released": false}))
+    );
     assert!(!server.account_exists(&email).await);
     // Single use.
     let (status, body) = server.confirm_unused(&tokens[0]).await;
@@ -6230,10 +6243,7 @@ async fn the_limits_hold() {
         server.confirm_unused(&wrong).await.0,
         StatusCode::TOO_MANY_REQUESTS
     );
-    assert_eq!(
-        server.confirm_unused(&tokens[0]).await.0,
-        StatusCode::NO_CONTENT
-    );
+    assert_eq!(server.confirm_unused(&tokens[0]).await.0, StatusCode::OK);
 }
 
 // ---- The deleted-account tombstone ----
@@ -6316,10 +6326,7 @@ async fn both_deletion_paths_leave_a_tombstone_and_the_status_tells_only_of_dele
     server.decide_requests(status_limits()).await;
     let token = server.unused_tokens(&unused_email).await.remove(0);
     let before = server.tombstones().await;
-    assert_eq!(
-        server.confirm_unused(&token).await.0,
-        StatusCode::NO_CONTENT
-    );
+    assert_eq!(server.confirm_unused(&token).await.0, StatusCode::OK);
     assert_eq!(
         server.tombstones().await,
         before + 1,
@@ -6811,7 +6818,7 @@ async fn a_token_goes_with_its_device_its_account_and_ninety_days() {
     server.ask_unused(&email).await;
     server.decide_requests(push_limits()).await;
     let link = server.unused_tokens(&email).await.remove(0);
-    assert_eq!(server.confirm_unused(&link).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(server.confirm_unused(&link).await.0, StatusCode::OK);
     assert_eq!(server.push_rows(account).await, 0);
 
     // Housekeeping: 90 days without a refresh is pruned (with its subscription), 89 is not.
@@ -7496,4 +7503,851 @@ async fn the_housekeeping_prunes_old_push_deliveries_and_keeps_recent_ones() {
             .await
             .expect("left");
     assert_eq!(left, vec![(recent,)], "8 days goes, 6 days stays");
+}
+
+// ---- Invites (docs/architecture.md, "Invites") ----
+
+use orbyn_core::SignupMode;
+use orbyn_core::accounts::invites;
+
+/// Limits for tests that make many failed invite attempts from one address.
+fn invite_limits() -> Limits {
+    Limits {
+        invite_invalid_per_address: Limit::new(100_000, Duration::from_secs(3600)),
+        register_per_ip: Limit::new(100_000, Duration::from_secs(3600)),
+        login_per_ip: Limit::new(100_000, Duration::from_secs(3600)),
+        email_verify_fail_per_ip: Limit::new(100_000, Duration::from_secs(3600)),
+        ..unused_limits()
+    }
+}
+
+async fn invite_server(limits: Limits) -> Server {
+    build_server_mode(limits, false, None, SignupMode::Invite).await
+}
+
+async fn invite_server_traced(limits: Limits) -> (Server, Trace) {
+    let trace = Trace::default();
+    (
+        build_server_mode(limits, false, Some(trace.clone()), SignupMode::Invite).await,
+        trace,
+    )
+}
+
+impl Server {
+    /// A new invite, with its code.
+    async fn new_invite(&self) -> invites::Created {
+        invites::create(self.db.pool(), 1, 14, "test")
+            .await
+            .expect("invite")
+            .remove(0)
+    }
+
+    /// The second sign-up step with an invite code (or none).
+    async fn finish_invited(
+        &self,
+        email: &str,
+        upload: &[u8],
+        keys: &DeviceKeys,
+        invite: Option<&str>,
+    ) -> (StatusCode, Value) {
+        let normalized = auth::normalize_email(email).expect("email");
+        let signature = keys.sign(
+            auth::DEVICE_REGISTER_CONTEXT,
+            &auth::register_message(&normalized, upload, &keys.public()),
+        );
+        let mut body = json!({
+            "email": email,
+            "registration_upload": b64(upload),
+            "device": device_json("Laptop", &keys.public()),
+            "device_signature": b64(&signature),
+        });
+        if let Some(invite) = invite {
+            body["invite"] = json!(invite);
+        }
+        self.call(
+            Method::POST,
+            "/v1/accounts/register/finish",
+            None,
+            Some(body),
+        )
+        .await
+    }
+
+    async fn check_invite_code(&self, invite: &str) -> (StatusCode, Value) {
+        self.call(
+            Method::POST,
+            "/v1/invites/check",
+            None,
+            Some(json!({"invite": invite})),
+        )
+        .await
+    }
+
+    /// Signs up with an invite and verifies it: the account's session, or the refusal.
+    async fn register_invited(
+        &self,
+        email: &str,
+        keys: &DeviceKeys,
+        invite: &str,
+    ) -> (StatusCode, Value) {
+        let upload = self.registration_upload(email, b"correct horse").await;
+        let (status, pending) = self
+            .finish_invited(email, &upload, keys, Some(invite))
+            .await;
+        if status != StatusCode::CREATED {
+            return (status, pending);
+        }
+        let code = self.code_for(email).await;
+        self.verify(&pending["signup_id"], &code).await
+    }
+
+    async fn invite_row(&self, short_id: &str) -> (bool, bool, bool, bool) {
+        orbyn_core::sqlx::query_as(
+            "SELECT used_at IS NOT NULL, used_by_account IS NOT NULL, revoked_at IS NOT NULL,
+                    released_at IS NOT NULL FROM invites WHERE short_id = $1",
+        )
+        .bind(short_id)
+        .fetch_one(self.db.pool())
+        .await
+        .expect("invite row")
+    }
+}
+
+#[test]
+fn the_signup_mode_is_invite_unless_the_environment_says_open() {
+    use orbyn_core::Config;
+    let from = |signup: Option<&str>| {
+        Config::from_lookup(|name| match name {
+            "DATABASE_URL" => Some("postgres://x@localhost/x".into()),
+            "ORBYN_SIGNUP" => signup.map(str::to_owned),
+            _ => None,
+        })
+    };
+    assert_eq!(from(None).expect("config").signup, SignupMode::Invite);
+    assert_eq!(
+        from(Some("invite")).expect("config").signup,
+        SignupMode::Invite
+    );
+    assert_eq!(from(Some("open")).expect("config").signup, SignupMode::Open);
+    assert_eq!(
+        from(Some(" ")).expect("blank is unset").signup,
+        SignupMode::Invite
+    );
+    for bad in ["Open", "closed", "true", "1"] {
+        assert_eq!(
+            from(Some(bad)).err(),
+            Some(orbyn_core::config::ConfigError::InvalidSignup),
+            "{bad}"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn an_invite_is_needed_to_sign_up_and_is_used_up_when_the_account_is_made() {
+    let _turn = TURN.lock().await;
+    let server = invite_server(invite_limits()).await;
+    let invite = server.new_invite().await;
+    let email = email();
+    let keys = DeviceKeys::generate().expect("keys");
+    let upload = server.registration_upload(&email, b"correct horse").await;
+
+    // No code, or a wrong one: the one refusal.
+    for code in [None, Some("K7QM-2XWH-9QXA-LC2D"), Some("nonsense")] {
+        let (status, body) = server.finish_invited(&email, &upload, &keys, code).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{code:?}");
+        assert_eq!(body["code"], "invite_invalid", "{body}");
+    }
+    assert_eq!(accounts_with(&server, &email).await, 0);
+
+    // The code, in any case, with spaces and dashes or none: sign-up goes on, and spends nothing.
+    let loose = invite.code.to_lowercase().replace('-', " ");
+    let (status, pending) = server
+        .finish_invited(&email, &upload, &keys, Some(&loose))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{pending}");
+    assert_eq!(
+        server.invite_row(&invite.id).await,
+        (false, false, false, false)
+    );
+    let recorded: Option<Uuid> =
+        orbyn_core::sqlx::query_scalar("SELECT invite_id FROM pending_signups WHERE id = $1")
+            .bind(uuid_of(&pending["signup_id"]))
+            .fetch_one(server.db.pool())
+            .await
+            .expect("row");
+    assert!(recorded.is_some(), "the pending sign-up records its invite");
+
+    // The right email code makes the account and uses the invite up, in the same step.
+    let code = server.code_for(&email).await;
+    let (status, session) = server.verify(&pending["signup_id"], &code).await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let account = uuid_of(&session["account_id"]);
+    assert_eq!(
+        server.invite_row(&invite.id).await,
+        (true, true, false, false)
+    );
+    let by: Option<Uuid> =
+        orbyn_core::sqlx::query_scalar("SELECT used_by_account FROM invites WHERE short_id = $1")
+            .bind(&invite.id)
+            .fetch_one(server.db.pool())
+            .await
+            .expect("by");
+    assert_eq!(by, Some(account));
+
+    // Used: the same answer as for a code that never existed, at both steps.
+    let other = DeviceKeys::generate().expect("keys");
+    let (status, body) = server
+        .register_invited(&self::email(), &other, &invite.code)
+        .await;
+    assert_eq!(
+        (status, body["code"].clone()),
+        (StatusCode::BAD_REQUEST, json!("invite_invalid"))
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn unknown_expired_used_and_revoked_codes_get_one_answer_at_the_check_and_at_the_finish() {
+    let _turn = TURN.lock().await;
+    let (server, trace) = invite_server_traced(invite_limits()).await;
+    let unknown = invites::new_code().expect("code");
+    let expired = server.new_invite().await;
+    orbyn_core::sqlx::query(
+        "UPDATE invites SET expires_at = now() - interval '1 second' WHERE short_id = $1",
+    )
+    .bind(&expired.id)
+    .execute(server.db.pool())
+    .await
+    .expect("expire");
+    let revoked = server.new_invite().await;
+    assert!(
+        invites::revoke(server.db.pool(), &revoked.id)
+            .await
+            .expect("revoke")
+    );
+    let used = server.new_invite().await;
+    let (status, _) = server
+        .register_invited(&email(), &DeviceKeys::generate().expect("keys"), &used.code)
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    // Over the wire and by the steps taken: the four, and a malformed code, are alike.
+    let kinds = [
+        ("unknown", unknown),
+        ("expired", expired.code),
+        ("revoked", revoked.code),
+        ("used", used.code),
+        ("malformed", "not a code".to_owned()),
+    ];
+    let mut answers = Vec::new();
+    let mut steps = Vec::new();
+    for (name, code) in &kinds {
+        trace.lock().expect("lock").clear();
+        let (status, headers, body) = server
+            .raw(
+                server.ip,
+                Method::POST,
+                "/v1/invites/check",
+                Some(json!({"invite": code})),
+            )
+            .await;
+        steps.push(trace.lock().expect("lock").clone());
+        answers.push((
+            *name,
+            status,
+            headers
+                .into_iter()
+                .filter(|(k, _)| k != "date")
+                .collect::<Vec<_>>(),
+            body,
+        ));
+    }
+    for (name, status, headers, body) in &answers {
+        assert_eq!(*status, StatusCode::BAD_REQUEST, "{name}");
+        assert_eq!(
+            (headers, body),
+            (&answers[0].2, &answers[0].3),
+            "{name} differs from {}",
+            answers[0].0
+        );
+    }
+    let refusal: Value = serde_json::from_slice(&answers[0].3).expect("json");
+    assert_eq!(refusal["code"], "invite_invalid");
+    assert_eq!(refusal["message"], "this invite code can't be used");
+    assert!(
+        steps.iter().all(|s| *s == steps[0]),
+        "the steps differ: {steps:?}"
+    );
+    assert_eq!(
+        steps[0],
+        vec!["invite-limit", "invite-lookup", "invite-cap"]
+    );
+    // And at the finish.
+    let email = email();
+    let keys = DeviceKeys::generate().expect("keys");
+    let upload = server.registration_upload(&email, b"correct horse").await;
+    let mut finish = Vec::new();
+    for (name, code) in &kinds {
+        trace.lock().expect("lock").clear();
+        let (status, headers, body) = {
+            let normalized = auth::normalize_email(&email).expect("email");
+            let signature = keys.sign(
+                auth::DEVICE_REGISTER_CONTEXT,
+                &auth::register_message(&normalized, &upload, &keys.public()),
+            );
+            server
+                .raw(
+                    server.ip,
+                    Method::POST,
+                    "/v1/accounts/register/finish",
+                    Some(json!({
+                        "email": email,
+                        "registration_upload": b64(&upload),
+                        "device": device_json("Laptop", &keys.public()),
+                        "device_signature": b64(&signature),
+                        "invite": code,
+                    })),
+                )
+                .await
+        };
+        let taken = trace.lock().expect("lock").clone();
+        assert_eq!(taken, steps[0], "{name}: the finish takes the same steps");
+        finish.push((
+            *name,
+            status,
+            headers
+                .into_iter()
+                .filter(|(k, _)| k != "date")
+                .collect::<Vec<_>>(),
+            body,
+        ));
+    }
+    for (name, status, headers, body) in &finish {
+        assert_eq!(*status, StatusCode::BAD_REQUEST, "{name}");
+        assert_eq!((headers, body), (&finish[0].2, &finish[0].3), "{name}");
+    }
+    // The check and the finish refuse with the same body.
+    assert_eq!(finish[0].3, answers[0].3);
+    assert_eq!(accounts_with(&server, &email).await, 0);
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn the_check_spends_nothing_and_only_failures_count_against_the_limit() {
+    let _turn = TURN.lock().await;
+    let mut limits = invite_limits();
+    limits.invite_invalid_per_address = Limit::new(3, Duration::from_secs(3600));
+    let server = invite_server(limits).await;
+    let invite = server.new_invite().await;
+    // A good code any number of times: 204, and nothing is used or recorded.
+    for _ in 0..10 {
+        let (status, body) = server.check_invite_code(&invite.code).await;
+        assert_eq!((status, body), (StatusCode::NO_CONTENT, Value::Null));
+    }
+    assert_eq!(
+        server.invite_row(&invite.id).await,
+        (false, false, false, false)
+    );
+    let pending: i64 = orbyn_core::sqlx::query_scalar(
+        "SELECT count(*) FROM pending_signups WHERE invite_id IS NOT NULL",
+    )
+    .fetch_one(server.db.pool())
+    .await
+    .expect("count");
+    assert_eq!(pending, 0);
+    // Failures count: three are answered, the fourth is 429, and then even a good code is.
+    for _ in 0..3 {
+        let (status, body) = server.check_invite_code("nonsense").await;
+        assert_eq!(
+            (status, body["code"].clone()),
+            (StatusCode::BAD_REQUEST, json!("invite_invalid"))
+        );
+    }
+    let (status, body) = server.check_invite_code("nonsense").await;
+    assert_eq!(
+        (status, body["code"].clone()),
+        (StatusCode::TOO_MANY_REQUESTS, json!("too_many_attempts"))
+    );
+    let (status, body) = server.check_invite_code(&invite.code).await;
+    assert_eq!(
+        (status, body["code"].clone()),
+        (StatusCode::TOO_MANY_REQUESTS, json!("too_many_attempts"))
+    );
+    // Another address has its own count.
+    let (status, _) = server
+        .call_from(
+            random_ip(),
+            Method::POST,
+            "/v1/invites/check",
+            None,
+            Some(json!({"invite": invite.code})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_decoy_never_uses_up_an_invite_and_looks_like_a_real_sign_up() {
+    let _turn = TURN.lock().await;
+    let server = invite_server(invite_limits()).await;
+    let first = server.new_invite().await;
+    let email = email();
+    let keys = DeviceKeys::generate().expect("keys");
+    let (status, _) = server.register_invited(&email, &keys, &first.code).await;
+    assert_eq!(status, StatusCode::CREATED);
+    // A valid invite with an address that already has an account: a decoy of the same shape.
+    let second = server.new_invite().await;
+    let upload = server
+        .registration_upload(&email, b"another password")
+        .await;
+    let other_keys = DeviceKeys::generate().expect("keys");
+    let (status, decoy) = server
+        .finish_invited(&email, &upload, &other_keys, Some(&second.code))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{decoy}");
+    assert_eq!(decoy.as_object().expect("object").len(), 1);
+    let (is_decoy, invite_id): (bool, Option<Uuid>) =
+        orbyn_core::sqlx::query_as("SELECT decoy, invite_id FROM pending_signups WHERE id = $1")
+            .bind(uuid_of(&decoy["signup_id"]))
+            .fetch_one(server.db.pool())
+            .await
+            .expect("row");
+    assert!(is_decoy);
+    assert!(
+        invite_id.is_some(),
+        "a decoy records the invite too, so it takes the same steps"
+    );
+    // Whatever code is tried, it fails as it always did, and the invite is not touched.
+    let (status, body) = server.verify(&decoy["signup_id"], "123456").await;
+    assert_eq!(
+        (status, body["code"].clone()),
+        (StatusCode::BAD_REQUEST, json!("invalid_email_code"))
+    );
+    assert_eq!(
+        server.invite_row(&second.id).await,
+        (false, false, false, false)
+    );
+    // And it still works for a person who does not have an account.
+    let (status, _) = server
+        .register_invited(
+            &self::email(),
+            &DeviceKeys::generate().expect("keys"),
+            &second.code,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(
+        server.invite_row(&second.id).await,
+        (true, true, false, false)
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn two_sign_ups_racing_for_one_invite_make_one_account() {
+    let _turn = TURN.lock().await;
+    let server = invite_server(invite_limits()).await;
+    let invite = server.new_invite().await;
+    // Both finish while the invite is unused, so both have a code to verify.
+    let mut pending = Vec::new();
+    for _ in 0..2 {
+        let email = email();
+        let keys = DeviceKeys::generate().expect("keys");
+        let upload = server.registration_upload(&email, b"correct horse").await;
+        let (status, body) = server
+            .finish_invited(&email, &upload, &keys, Some(&invite.code))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let code = server.code_for(&email).await;
+        pending.push((email, body["signup_id"].clone(), code));
+    }
+    let (a, b) = tokio::join!(
+        server.verify(&pending[0].1, &pending[0].2),
+        server.verify(&pending[1].1, &pending[1].2),
+    );
+    let statuses = [a.0, b.0];
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|s| **s == StatusCode::CREATED)
+            .count(),
+        1,
+        "{a:?} {b:?}"
+    );
+    let loser = if a.0 == StatusCode::CREATED { &b } else { &a };
+    assert_eq!(
+        (loser.0, loser.1["code"].clone()),
+        (StatusCode::BAD_REQUEST, json!("invite_invalid"))
+    );
+    let made =
+        accounts_with(&server, &pending[0].0).await + accounts_with(&server, &pending[1].0).await;
+    assert_eq!(made, 1, "one account, not two");
+    assert_eq!(
+        server.invite_row(&invite.id).await,
+        (true, true, false, false)
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn revoking_or_expiring_an_invite_is_refused_at_the_finish_and_at_the_verify() {
+    let _turn = TURN.lock().await;
+    let server = invite_server(invite_limits()).await;
+    for how in ["revoke", "expire"] {
+        let invite = server.new_invite().await;
+        let email = email();
+        let keys = DeviceKeys::generate().expect("keys");
+        let upload = server.registration_upload(&email, b"correct horse").await;
+        // Good at the finish...
+        let (status, pending) = server
+            .finish_invited(&email, &upload, &keys, Some(&invite.code))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{how}: {pending}");
+        let code = server.code_for(&email).await;
+        // ...then taken away before the account is made.
+        if how == "revoke" {
+            assert!(
+                invites::revoke(server.db.pool(), &invite.id)
+                    .await
+                    .expect("revoke")
+            );
+        } else {
+            orbyn_core::sqlx::query(
+                "UPDATE invites SET expires_at = now() - interval '1 second' WHERE short_id = $1",
+            )
+            .bind(&invite.id)
+            .execute(server.db.pool())
+            .await
+            .expect("expire");
+        }
+        let (status, body) = server.verify(&pending["signup_id"], &code).await;
+        assert_eq!(
+            (status, body["code"].clone()),
+            (StatusCode::BAD_REQUEST, json!("invite_invalid")),
+            "{how}"
+        );
+        assert_eq!(accounts_with(&server, &email).await, 0, "{how}: no account");
+        // And the finish refuses it too, from the start.
+        let again = server
+            .finish_invited(&self::email(), &upload, &keys, Some(&invite.code))
+            .await;
+        assert_eq!(
+            (again.0, again.1["code"].clone()),
+            (StatusCode::BAD_REQUEST, json!("invite_invalid")),
+            "{how}"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn an_invite_has_at_most_five_live_sign_ups_waiting() {
+    let _turn = TURN.lock().await;
+    let server = invite_server(invite_limits()).await;
+    let invite = server.new_invite().await;
+    for i in 0..5 {
+        let email = email();
+        let keys = DeviceKeys::generate().expect("keys");
+        let upload = server.registration_upload(&email, b"correct horse").await;
+        let (status, body) = server
+            .finish_invited(&email, &upload, &keys, Some(&invite.code))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "sign-up {i}: {body}");
+    }
+    // The sixth is refused as any bad code is, at the check and at the finish.
+    let (status, body) = server.check_invite_code(&invite.code).await;
+    assert_eq!(
+        (status, body["code"].clone()),
+        (StatusCode::BAD_REQUEST, json!("invite_invalid"))
+    );
+    let email = email();
+    let keys = DeviceKeys::generate().expect("keys");
+    let upload = server.registration_upload(&email, b"correct horse").await;
+    let (status, body) = server
+        .finish_invited(&email, &upload, &keys, Some(&invite.code))
+        .await;
+    assert_eq!(
+        (status, body["code"].clone()),
+        (StatusCode::BAD_REQUEST, json!("invite_invalid"))
+    );
+    // Waiting sign-ups that expire make room again.
+    orbyn_core::sqlx::query("UPDATE pending_signups SET expires_at = now() - interval '1 second' WHERE invite_id IS NOT NULL")
+        .execute(server.db.pool())
+        .await
+        .expect("expire");
+    let (status, _) = server.check_invite_code(&invite.code).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn when_sign_up_is_open_the_invite_is_ignored_and_the_check_says_yes() {
+    let _turn = TURN.lock().await;
+    let server = server_with(invite_limits()).await;
+    let email = email();
+    let keys = DeviceKeys::generate().expect("keys");
+    let upload = server.registration_upload(&email, b"correct horse").await;
+    let (status, pending) = server.finish_invited(&email, &upload, &keys, None).await;
+    assert_eq!(status, StatusCode::CREATED, "{pending}");
+    let recorded: Option<Uuid> =
+        orbyn_core::sqlx::query_scalar("SELECT invite_id FROM pending_signups WHERE id = $1")
+            .bind(uuid_of(&pending["signup_id"]))
+            .fetch_one(server.db.pool())
+            .await
+            .expect("row");
+    assert_eq!(recorded, None);
+    let code = server.code_for(&email).await;
+    let (status, _) = server.verify(&pending["signup_id"], &code).await;
+    assert_eq!(status, StatusCode::CREATED);
+    // A code nobody made is neither needed nor looked at.
+    let (status, _) = server.check_invite_code("nonsense").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = server
+        .register_invited(
+            &self::email(),
+            &DeviceKeys::generate().expect("keys"),
+            "anything at all",
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_pending_sign_up_made_before_invites_were_required_makes_no_account_now() {
+    let _turn = TURN.lock().await;
+    // Started while sign-up was open: no invite recorded.
+    let open = server_with(invite_limits()).await;
+    let email = email();
+    let keys = DeviceKeys::generate().expect("keys");
+    let (status, pending) = open.register_raw(&email, b"correct horse", &keys).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let code = open.code_for(&email).await;
+    // The server is switched to invite-only before the code comes back.
+    let invite_only = invite_server(invite_limits()).await;
+    let (status, body) = invite_only.verify(&pending["signup_id"], &code).await;
+    assert_eq!(
+        (status, body["code"].clone()),
+        (StatusCode::BAD_REQUEST, json!("invite_invalid"))
+    );
+    assert_eq!(accounts_with(&invite_only, &email).await, 0);
+}
+
+/// Every text column of every table, searched for `needle` (case-insensitively): the rows that hold it.
+async fn rows_holding(server: &Server, needle: &str) -> Vec<String> {
+    let tables: Vec<String> = orbyn_core::sqlx::query_scalar(
+        "SELECT tablename FROM pg_tables WHERE schemaname = 'public'",
+    )
+    .fetch_all(server.db.pool())
+    .await
+    .expect("tables");
+    let mut found = Vec::new();
+    for table in tables {
+        let sql = format!("SELECT count(*) FROM \"{table}\" t WHERE t::text ILIKE $1");
+        let n: i64 = orbyn_core::sqlx::query_scalar(orbyn_core::sqlx::AssertSqlSafe(sql))
+            .bind(format!("%{needle}%"))
+            .fetch_one(server.db.pool())
+            .await
+            .expect("count");
+        if n > 0 {
+            found.push(table);
+        }
+    }
+    found
+}
+
+#[derive(Clone, Default)]
+struct LogSink(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogSink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("lock").extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogSink {
+    type Writer = LogSink;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn the_code_is_in_no_table_no_log_and_no_audit_record() {
+    let _turn = TURN.lock().await;
+    let sink = LogSink::default();
+    let _logs = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_max_level(tracing::Level::TRACE)
+            .finish(),
+    );
+    let server = invite_server(invite_limits()).await;
+    let invite = server.new_invite().await;
+    let plain = invites::normalise(&invite.code).expect("normalises");
+    // Every way a code is sent: checked, refused, used, and again after it is used.
+    assert_eq!(
+        server.check_invite_code(&invite.code).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let (status, _) = server
+        .register_invited(
+            &email(),
+            &DeviceKeys::generate().expect("keys"),
+            &invite.code,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = server.check_invite_code(&invite.code).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    for form in [
+        invite.code.clone(),
+        plain.clone(),
+        invite.code.to_lowercase(),
+        plain.to_lowercase(),
+    ] {
+        assert_eq!(
+            rows_holding(&server, &form).await,
+            Vec::<String>::new(),
+            "{form}"
+        );
+        let logged = String::from_utf8_lossy(&sink.0.lock().expect("lock")).to_lowercase();
+        assert!(
+            !logged.contains(&form.to_lowercase()),
+            "the code is in the logs"
+        );
+    }
+    // What is stored is the digest, which is there.
+    let digest = invites::digest(&plain);
+    let stored: i64 =
+        orbyn_core::sqlx::query_scalar("SELECT count(*) FROM invites WHERE code_digest = $1")
+            .bind(digest.as_slice())
+            .fetch_one(server.db.pool())
+            .await
+            .expect("count");
+    assert_eq!(stored, 1);
+    // The audit table has no invite in it at all.
+    let audited: i64 = orbyn_core::sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log WHERE action ILIKE '%invite%'",
+    )
+    .fetch_one(server.db.pool())
+    .await
+    .expect("count");
+    assert_eq!(audited, 0);
+}
+
+/// An invited account, then its deletion through the unused-account link. Returns the answer.
+async fn delete_unused_account(server: &Server, email: &str) -> (StatusCode, Value) {
+    let (status, _) = server.ask_unused(email).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    server.decide_requests(invite_limits()).await;
+    let token = server
+        .unused_tokens(email)
+        .await
+        .pop()
+        .expect("a link was sent");
+    server.confirm_unused(&token).await
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn deleting_an_unused_account_gives_its_invite_back_once_and_keeps_its_expiry() {
+    let _turn = TURN.lock().await;
+    let server = invite_server(invite_limits()).await;
+    let invite = server.new_invite().await;
+    let expiry: String =
+        orbyn_core::sqlx::query_scalar("SELECT expires_at::text FROM invites WHERE short_id = $1")
+            .bind(&invite.id)
+            .fetch_one(server.db.pool())
+            .await
+            .expect("expiry");
+    let email = email();
+    let (status, _) = server
+        .register_invited(&email, &DeviceKeys::generate().expect("keys"), &invite.code)
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(
+        server.invite_row(&invite.id).await,
+        (true, true, false, false)
+    );
+
+    // The deletion answers that it released the invite, and the invite is as it was, marked.
+    let (status, body) = delete_unused_account(&server, &email).await;
+    assert_eq!(
+        (status, body),
+        (StatusCode::OK, json!({"invite_released": true}))
+    );
+    assert_eq!(
+        server.invite_row(&invite.id).await,
+        (false, false, false, true)
+    );
+    let after: String =
+        orbyn_core::sqlx::query_scalar("SELECT expires_at::text FROM invites WHERE short_id = $1")
+            .bind(&invite.id)
+            .fetch_one(server.db.pool())
+            .await
+            .expect("expiry");
+    assert_eq!(after, expiry, "the original expiry is kept");
+
+    // It can be used again, by someone else...
+    let again = self::email();
+    let (status, _) = server
+        .register_invited(&again, &DeviceKeys::generate().expect("keys"), &invite.code)
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(
+        server.invite_row(&invite.id).await,
+        (true, true, false, true)
+    );
+    // ...and that account's deletion does not release it a second time.
+    let (status, body) = delete_unused_account(&server, &again).await;
+    assert_eq!(
+        (status, body),
+        (StatusCode::OK, json!({"invite_released": false}))
+    );
+    let (used, _, _, released) = server.invite_row(&invite.id).await;
+    assert!(used && released, "still used, never released again");
+    let (status, body) = server.check_invite_code(&invite.code).await;
+    assert_eq!(
+        (status, body["code"].clone()),
+        (StatusCode::BAD_REQUEST, json!("invite_invalid"))
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn an_account_made_without_an_invite_releases_nothing_and_no_other_deletion_does() {
+    let _turn = TURN.lock().await;
+    let server = invite_server(invite_limits()).await;
+    // An account made while sign-up was open has no invite to give back.
+    let open = server_with(invite_limits()).await;
+    let (email, _, _) = unused_account(&open).await;
+    let (status, body) = delete_unused_account(&open, &email).await;
+    assert_eq!(
+        (status, body),
+        (StatusCode::OK, json!({"invite_released": false}))
+    );
+    // An invited account removed any other way keeps its invite used: the link is cleared and
+    // nothing is released.
+    let invite = server.new_invite().await;
+    let email = self::email();
+    let (status, session) = server
+        .register_invited(&email, &DeviceKeys::generate().expect("keys"), &invite.code)
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    orbyn_core::sqlx::query("DELETE FROM accounts WHERE id = $1")
+        .bind(uuid_of(&session["account_id"]))
+        .execute(server.db.pool())
+        .await
+        .expect("delete");
+    assert_eq!(
+        server.invite_row(&invite.id).await,
+        (true, false, false, false)
+    );
 }

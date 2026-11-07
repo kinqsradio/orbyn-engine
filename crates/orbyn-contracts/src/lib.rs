@@ -98,6 +98,23 @@ pub struct RegisterFinish {
     pub device: NewDevice,
     /// The device's signature over the `orbyn/device-register/v1` message.
     pub device_signature: String,
+    /// The invite code, when the server asks for one (`ORBYN_SIGNUP=invite`, the default). Any
+    /// case, with or without dashes and spaces. An unknown, expired, used or revoked code, and a
+    /// missing one, are the same answer: 400 `invite_invalid`. Ignored when sign-up is open.
+    #[serde(default)]
+    #[ts(optional)]
+    pub invite: Option<String>,
+}
+
+/// `POST /v1/invites/check`: whether an invite code could be used to sign up now, before the
+/// person goes on. No session. Answers 204, or the same 400 `invite_invalid` as `register/finish`
+/// for any code that cannot be used; 10 of those an hour per client address, then 429
+/// `too_many_attempts`. It spends nothing and records nothing: `email/verify` is what uses an
+/// invite up.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct InviteCheck {
+    pub invite: String,
 }
 
 /// `POST /v1/sessions/login/start`.
@@ -331,13 +348,25 @@ pub struct DeleteUnusedRequest {
 /// `POST /v1/accounts/delete-unused/confirm`: the token from the link in that email. No sign-in;
 /// it deletes the account at once if it is still unused and does nothing else. The planner's page
 /// opens from the link and posts the token only when its button is pressed (a mail scanner that
-/// opens the link changes nothing). Answer 204; 400 `invalid_delete_unused_token` for any wrong,
-/// used, voided or expired token; 409 `delete_unused_not_possible` when the account holds keys or
-/// stored data now (nothing is deleted).
+/// opens the link changes nothing). Answer 200 [`DeleteUnusedConfirmed`]; 400
+/// `invalid_delete_unused_token` for any wrong, used, voided or expired token; 409
+/// `delete_unused_not_possible` when the account holds keys or stored data now (nothing is
+/// deleted).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct DeleteUnusedConfirm {
     pub token: String,
+}
+
+/// The answer to `POST /v1/accounts/delete-unused/confirm`. Only the holder of the deletion token
+/// sees it, so it leaks nothing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct DeleteUnusedConfirmed {
+    /// True only when this deletion gave an invite back: the account was made from an invite that
+    /// had not been released before. False for an account made without one, and for one whose
+    /// invite was already released.
+    pub invite_released: bool,
 }
 
 /// `POST /v1/accounts/status`: has this account been deleted? No session (the device's session
