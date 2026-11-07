@@ -1,8 +1,8 @@
 //! `orbyn invite create|list|revoke`: the operator's side of the invite-only beta. There is no
 //! HTTP route for any of it. A code is printed once, when it is made, and is in no log, no table
 //! and no audit record (only its digest is stored). Everything this prints is the designed text,
-//! Account Designs v54 (orbyn-designs#56; frames `inv-help`, `inv-create`, `inv-list`,
-//! `inv-revoke`), word for word.
+//! Account Designs v58 (orbyn-designs#67; frames `inv-help`, `inv-create`, `inv-list`,
+//! `inv-revoke`, `inv-usage-errors`, `inv-db-error`), word for word.
 
 use chrono::{DateTime, Datelike, Utc};
 use orbyn_core::accounts::invites::{
@@ -33,7 +33,7 @@ Usage: orbyn invite create [OPTIONS]
 Options:
   --count <N>          How many invites to create (at most 100)
   --expires-days <D>  Days until they expire (at most 90)
-  --label <TEXT>      A short note to find them later. It can’t contain @
+  --label <TEXT>      A short note to find them later. Up to 100 characters; it can’t contain @
   -h, --help          Print help
 ";
 
@@ -47,7 +47,7 @@ fn error(what: &str, hint: &str) -> String {
 }
 
 /// A count that is not a whole number from 1 to 100: zero, a word, or too many, one message
-/// (Account Designs v57, frame `inv-usage-errors`).
+/// (Account Designs v58, frame `inv-usage-errors`).
 pub fn count_invalid() -> String {
     error(
         "--count must be a whole number from 1 to 100",
@@ -77,6 +77,36 @@ pub fn unknown_command(command: &str) -> String {
     )
 }
 
+pub fn unknown_option(option: &str) -> String {
+    error(
+        &format!("unknown option '{option}'"),
+        "Run orbyn invite --help to see the options.",
+    )
+}
+
+pub fn label_needs_value() -> String {
+    error(
+        "--label needs a value",
+        "Give a short note, for example --label batch-1.",
+    )
+}
+
+pub fn unexpected_argument(argument: &str) -> String {
+    error(
+        &format!("unexpected argument '{argument}'"),
+        "Run orbyn invite --help to see how to use it.",
+    )
+}
+
+/// An argument nothing wants: an option that does not exist, or a word with no place.
+fn stray(argument: &str) -> String {
+    if argument.starts_with('-') {
+        unknown_option(argument.split_once('=').map_or(argument, |(name, _)| name))
+    } else {
+        unexpected_argument(argument)
+    }
+}
+
 pub fn revoke_needs_id() -> String {
     error(
         "revoke needs an invite id",
@@ -104,8 +134,7 @@ pub fn label_has_at() -> String {
     )
 }
 
-/// A label of over 100 characters. **Plain text, not designed yet** (TODO-design): the designer
-/// has not written it, and it must not read as the at-sign refusal.
+/// A label of over 100 characters (frame `inv-create`); not the at-sign refusal.
 pub fn label_too_long() -> String {
     error(
         &format!("--label must be {} characters or fewer", invites::MAX_LABEL),
@@ -230,9 +259,8 @@ fn parse_create(args: &[String]) -> Result<Command, String> {
             Some((name, value)) => (name, Some(value.to_owned())),
             None => (arg.as_str(), None),
         };
-        // An option that is not one of these has no designed text yet: the command's help.
         if !["--count", "--expires-days", "--label"].contains(&name) {
-            return Err(CREATE_HELP.to_owned());
+            return Err(stray(arg));
         }
         let value = inline.or_else(|| rest.next().cloned());
         match (name, value) {
@@ -245,7 +273,7 @@ fn parse_create(args: &[String]) -> Result<Command, String> {
             }
             ("--expires-days", None) => return Err(days_invalid()),
             ("--label", Some(v)) => options.label = v,
-            _ => return Err(CREATE_HELP.to_owned()),
+            _ => return Err(label_needs_value()),
         }
     }
     if invites::label_has_at(&options.label) {
@@ -258,8 +286,7 @@ fn parse_create(args: &[String]) -> Result<Command, String> {
 }
 
 /// Reads `orbyn invite <args>`. `Err` is for stderr, with exit status 1: the designed message for
-/// each thing a person can get wrong, and, for the few the design has no text for yet (an unknown
-/// option, a label with no value, extra arguments), the help of the command that was meant.
+/// each thing a person can get wrong.
 pub fn parse(args: &[String]) -> Result<Command, String> {
     let wants_help = |a: &String| a == "-h" || a == "--help";
     match args.first().map(String::as_str) {
@@ -271,12 +298,16 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         })),
         Some("create") => parse_create(&args[1..]),
         Some("list") if args[1..].iter().any(wants_help) => Ok(Command::Help(HELP.to_owned())),
-        Some("list") => Ok(Command::List),
+        Some("list") => match args.get(1) {
+            None => Ok(Command::List),
+            Some(extra) => Err(stray(extra)),
+        },
         Some("revoke") => match args.get(1) {
             None => Err(revoke_needs_id()),
             Some(id) if wants_help(id) => Ok(Command::Help(HELP.to_owned())),
+            Some(id) if id.starts_with('-') => Err(stray(id)),
             Some(id) if args.len() == 2 => Ok(Command::Revoke(id.trim().to_owned())),
-            Some(_) => Err(HELP.to_owned()),
+            Some(_) => Err(stray(&args[2])),
         },
         Some(other) => Err(unknown_command(other)),
     }
@@ -363,7 +394,7 @@ mod tests {
         // The design shows both in one block, the command's first.
         assert_eq!(
             format!("{HELP}\n{CREATE_HELP}"),
-            "Manages invite codes for the beta.\n\nUsage: orbyn invite <COMMAND>\n\nCommands:\n  create  Create invite codes\n  list    List invites and their status\n  revoke  Revoke an invite\n  help    Print this message or the help of a command\n\nOptions:\n  -h, --help  Print help\n\nUsage: orbyn invite create [OPTIONS]\n\nOptions:\n  --count <N>          How many invites to create (at most 100)\n  --expires-days <D>  Days until they expire (at most 90)\n  --label <TEXT>      A short note to find them later. It can’t contain @\n  -h, --help          Print help\n"
+            "Manages invite codes for the beta.\n\nUsage: orbyn invite <COMMAND>\n\nCommands:\n  create  Create invite codes\n  list    List invites and their status\n  revoke  Revoke an invite\n  help    Print this message or the help of a command\n\nOptions:\n  -h, --help  Print help\n\nUsage: orbyn invite create [OPTIONS]\n\nOptions:\n  --count <N>          How many invites to create (at most 100)\n  --expires-days <D>  Days until they expire (at most 90)\n  --label <TEXT>      A short note to find them later. Up to 100 characters; it can’t contain @\n  -h, --help          Print help\n"
         );
     }
 
@@ -418,6 +449,10 @@ mod tests {
         assert_eq!(
             label_has_at(),
             "error: --label can’t contain @\n  Use a short note that doesn’t name a person, such as a batch name."
+        );
+        assert_eq!(
+            label_too_long(),
+            "error: --label must be 100 characters or fewer\n  Use a shorter note."
         );
         assert_eq!(revoked("7f3a"), "Revoked invite 7f3a.");
         assert_eq!(
@@ -497,16 +532,6 @@ mod tests {
         );
         assert_eq!(refused(&["--bogus"]), Some(unknown_command("--bogus")));
         assert_eq!(refused(&["revoke"]), Some(revoke_needs_id()));
-        // What the design has no text for yet prints the help of the command meant.
-        assert_eq!(
-            refused(&["create", "--bogus", "1"]),
-            Some(CREATE_HELP.to_owned())
-        );
-        assert_eq!(
-            refused(&["create", "--label"]),
-            Some(CREATE_HELP.to_owned())
-        );
-        assert_eq!(refused(&["revoke", "7f3a", "extra"]), Some(HELP.to_owned()));
         // Help, asked for, is not an error.
         for (parts, want) in [
             (&["--help"][..], HELP),
@@ -518,6 +543,45 @@ mod tests {
         ] {
             assert!(
                 matches!(parse(&args(parts)), Ok(Command::Help(text)) if text == want),
+                "{parts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stray_option_a_label_without_a_value_and_an_extra_argument_are_designed_too() {
+        assert_eq!(
+            unknown_option("--frob"),
+            "error: unknown option '--frob'\n  Run orbyn invite --help to see the options."
+        );
+        assert_eq!(
+            label_needs_value(),
+            "error: --label needs a value\n  Give a short note, for example --label batch-1."
+        );
+        assert_eq!(
+            unexpected_argument("extra"),
+            "error: unexpected argument 'extra'\n  Run orbyn invite --help to see how to use it."
+        );
+        // An unknown option, wherever it is and with or without a value.
+        for parts in [
+            &["create", "--frob"][..],
+            &["create", "--frob=1"],
+            &["create", "--count", "2", "--frob", "x"],
+            &["list", "--frob"],
+            &["revoke", "--frob"],
+        ] {
+            assert_eq!(refused(parts), Some(unknown_option("--frob")), "{parts:?}");
+        }
+        assert_eq!(refused(&["create", "--label"]), Some(label_needs_value()));
+        for parts in [
+            &["create", "extra"][..],
+            &["create", "--count", "2", "extra"],
+            &["list", "extra"],
+            &["revoke", "7f3a", "extra"],
+        ] {
+            assert_eq!(
+                refused(parts),
+                Some(unexpected_argument("extra")),
                 "{parts:?}"
             );
         }
