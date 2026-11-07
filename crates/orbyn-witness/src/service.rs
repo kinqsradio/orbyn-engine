@@ -14,33 +14,67 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
-use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::json;
+use tokio::sync::Semaphore;
 
 use crate::wire::{self, Newest};
 use crate::{Clock, CosignError, Reason, StateStore, Witness, messages};
 
-/// Reads of the newest cosignature per address per hour.
+/// Reads of the newest cosignature per address block per hour.
 pub const NEWEST_PER_HOUR: usize = 60;
 const WINDOW: Duration = Duration::from_secs(3600);
+/// Address blocks the read limiter remembers at most; beyond it the oldest are dropped.
+const MAX_TRACKED: usize = 10_000;
+/// Cosign requests checked at once. A witness checks one at a time under its state's lock, so more
+/// would only queue: the rest are told to come back (503 `busy`).
+const MAX_COSIGNS: usize = 4;
+/// How long a cosign request may take to arrive and be checked, and a read to be answered.
+const COSIGN_TIMEOUT: Duration = Duration::from_secs(60);
+const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The witness behind its two routes.
+/// The address block a read is counted against: an IPv4 /24 or an IPv6 /64, so one network cannot
+/// spread its reads over its addresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Block {
+    V4([u8; 3]),
+    V6([u8; 8]),
+}
+
+impl Block {
+    fn of(ip: IpAddr) -> Self {
+        let ip = match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+            v4 => v4,
+        };
+        match ip {
+            IpAddr::V4(v4) => {
+                let o = v4.octets();
+                Self::V4([o[0], o[1], o[2]])
+            }
+            IpAddr::V6(v6) => {
+                let o = v6.octets();
+                Self::V6([o[0], o[1], o[2], o[3], o[4], o[5], o[6], o[7]])
+            }
+        }
+    }
+}
+
+/// The witness behind its two routes. The newest head is read from the witness's own saved state.
 pub struct Service<S: StateStore, C: Clock> {
     witness: Witness<S, C>,
-    newest: Mutex<Option<Newest>>,
-    /// Where the newest head is kept across restarts (derived data, so no `fsync`).
-    persist: Option<PathBuf>,
-    reads: Mutex<HashMap<IpAddr, VecDeque<Instant>>>,
+    reads: Mutex<HashMap<Block, VecDeque<Instant>>>,
     newest_per_hour: usize,
+    cosigns: Semaphore,
 }
 
 impl<S, C> Service<S, C>
@@ -48,24 +82,12 @@ where
     S: StateStore + Send + Sync + 'static,
     C: Clock + Send + Sync + 'static,
 {
-    /// `persist` is a file for the newest head. What it holds is used only when its cosignature
-    /// verifies under this witness's key and is of the head the witness's state ends on.
-    pub fn new(witness: Witness<S, C>, persist: Option<PathBuf>, newest_per_hour: usize) -> Self {
-        let kept = persist
-            .as_ref()
-            .and_then(|path| std::fs::read(path).ok())
-            .and_then(|bytes| wire::decode_newest(&bytes).ok())
-            .filter(|newest| {
-                newest.cosignature.head_hash == witness.state().head_hash
-                    && newest.head.hash() == newest.cosignature.head_hash
-                    && newest.cosignature.verify(&witness.public())
-            });
+    pub fn new(witness: Witness<S, C>, newest_per_hour: usize) -> Self {
         Self {
             witness,
-            newest: Mutex::new(kept),
-            persist,
             reads: Mutex::new(HashMap::new()),
             newest_per_hour,
+            cosigns: Semaphore::new(MAX_COSIGNS),
         }
     }
 
@@ -73,56 +95,46 @@ where
         &self.witness
     }
 
-    /// The newest cosigned head held, if any.
+    /// The newest cosigned head, from the saved state: the head, the log key's signature and this
+    /// witness's own newest cosignature of it.
     pub fn newest(&self) -> Option<Newest> {
-        self.newest
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        let (signed, cosignature) = self.witness.newest()?;
+        Some(Newest {
+            head: signed.head,
+            log_signature: signed.log_signature,
+            cosignature,
+        })
     }
 
-    fn keep(&self, newest: Newest) {
-        if let Some(path) = &self.persist {
-            let tmp = path.with_extension("tmp");
-            let bytes = wire::encode_newest(&newest);
-            if std::fs::write(&tmp, bytes)
-                .and_then(|()| std::fs::rename(&tmp, path))
-                .is_err()
-            {
-                tracing::warn!("the newest head could not be kept for a restart");
-            }
-        }
-        *self.newest.lock().unwrap_or_else(PoisonError::into_inner) = Some(newest);
-    }
-
-    /// The witness's own schedule: signs the head it last cosigned again, with its time now, and
-    /// keeps that as the newest cosignature. `false` when there is no head yet.
+    /// The witness's own schedule: signs the head it last cosigned again, with its time now.
+    /// `false` when there is no head yet.
     pub fn recosign(&self) -> bool {
-        let Some(mut newest) = self.newest() else {
-            return false;
-        };
-        match self.witness.recosign_latest() {
-            Some(cosignature) if cosignature.head_hash == newest.head.hash() => {
-                newest.cosignature = cosignature;
-                self.keep(newest);
-                true
-            }
-            _ => false,
-        }
+        self.witness.recosign_latest().is_some()
     }
 
     fn allow_read(&self, ip: IpAddr) -> bool {
         let now = Instant::now();
+        let block = Block::of(ip);
         let mut reads = self.reads.lock().unwrap_or_else(PoisonError::into_inner);
-        // A table that only ever grows would be a leak: drop addresses with nothing in the window.
-        if reads.len() > 10_000 {
+        if reads.len() >= MAX_TRACKED && !reads.contains_key(&block) {
+            // Full: forget blocks with nothing in the window, then, if that is not enough, the one
+            // read from longest ago.
             reads.retain(|_, times| {
                 times
                     .back()
                     .is_some_and(|t| now.duration_since(*t) < WINDOW)
             });
+            if reads.len() >= MAX_TRACKED {
+                let oldest = reads
+                    .iter()
+                    .min_by_key(|(_, times)| times.back().copied())
+                    .map(|(block, _)| *block);
+                if let Some(oldest) = oldest {
+                    reads.remove(&oldest);
+                }
+            }
         }
-        let times = reads.entry(ip).or_default();
+        let times = reads.entry(block).or_default();
         while times
             .front()
             .is_some_and(|t| now.duration_since(*t) >= WINDOW)
@@ -136,13 +148,37 @@ where
         true
     }
 
-    /// The two routes, for `into_make_service_with_connect_info::<SocketAddr>()`.
+    /// The two routes, for `into_make_service_with_connect_info::<SocketAddr>()`. A cosign
+    /// request may be at most [`wire::MAX_REQUEST_BYTES`] and take at most a minute to arrive and
+    /// be checked.
     pub fn router(self: Arc<Self>) -> Router {
-        Router::new()
+        let cosign_route = Router::new()
             .route("/v1/cosign", post(cosign::<S, C>))
-            .route("/v1/cosignature", get(newest::<S, C>))
             .layer(DefaultBodyLimit::max(wire::MAX_REQUEST_BYTES))
+            .layer(middleware::from_fn(|req: Request, next: Next| async move {
+                within(COSIGN_TIMEOUT, req, next).await
+            }));
+        let read_route = Router::new()
+            .route("/v1/cosignature", get(newest::<S, C>))
+            .layer(middleware::from_fn(|req: Request, next: Next| async move {
+                within(READ_TIMEOUT, req, next).await
+            }));
+        Router::new()
+            .merge(cosign_route)
+            .merge(read_route)
             .with_state(self)
+    }
+}
+
+/// Runs the rest of the request for at most `limit`, then answers 408.
+async fn within(limit: Duration, req: Request, next: Next) -> Response {
+    match tokio::time::timeout(limit, next.run(req)).await {
+        Ok(response) => response,
+        Err(_) => refused(
+            StatusCode::REQUEST_TIMEOUT,
+            "timeout",
+            "the request took too long",
+        ),
     }
 }
 
@@ -164,6 +200,13 @@ where
     S: StateStore + Send + Sync + 'static,
     C: Clock + Send + Sync + 'static,
 {
+    let Ok(_permit) = service.cosigns.try_acquire() else {
+        return refused(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "busy",
+            "the witness is busy; try again",
+        );
+    };
     let request = match wire::decode_request(&body) {
         Ok(request) => request,
         Err(_) => {
@@ -191,13 +234,7 @@ where
     match result {
         Ok(cosignature) => {
             tracing::info!("{}", messages::cosigned(request.head.size));
-            let answer = cosignature.encode().to_vec();
-            service.keep(Newest {
-                head: request.head,
-                log_signature: request.log_signature,
-                cosignature,
-            });
-            octets(answer, StatusCode::OK)
+            octets(cosignature.encode().to_vec(), StatusCode::OK)
         }
         Err(CosignError::Refused(refusal)) => {
             tracing::warn!("{}", messages::refused(refusal.reason.code()));
@@ -248,5 +285,51 @@ where
             "no_head",
             "no head has been cosigned yet",
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::test_witness;
+
+    fn service(per_hour: usize) -> Service<Arc<crate::MemoryStore>, crate::testing::TestClock> {
+        let (witness, _, _) = test_witness(1, vec![(1, [3; 32])], 0).expect("witness");
+        Service::new(witness, per_hour)
+    }
+
+    #[test]
+    fn reads_count_by_address_block_not_by_address() {
+        let s = service(2);
+        let v4 = |d: u8| IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, d));
+        // One /24 shares two reads however its addresses vary.
+        assert!(s.allow_read(v4(1)) && s.allow_read(v4(200)));
+        assert!(!s.allow_read(v4(77)));
+        // Another /24 has its own.
+        assert!(s.allow_read(IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 3, 1))));
+        // An IPv6 /64 is one block.
+        let v6 = |tail: u16| {
+            IpAddr::V6(std::net::Ipv6Addr::new(
+                0x2001, 0xdb8, 0, 1, tail, 0, 0, tail,
+            ))
+        };
+        assert!(s.allow_read(v6(1)) && s.allow_read(v6(9999)));
+        assert!(!s.allow_read(v6(42)));
+        assert!(s.allow_read(IpAddr::V6(std::net::Ipv6Addr::new(
+            0x2001, 0xdb8, 0, 2, 0, 0, 0, 1
+        ))));
+        // An IPv4-mapped address is counted as the IPv4 one.
+        let mapped = IpAddr::V6(std::net::Ipv4Addr::new(192, 0, 2, 5).to_ipv6_mapped());
+        assert!(!s.allow_read(mapped), "the same block as 192.0.2.0/24");
+    }
+
+    #[test]
+    fn the_limiter_remembers_a_bounded_number_of_blocks() {
+        let s = service(1);
+        for n in 0..(MAX_TRACKED as u32 + 500) {
+            let ip = IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + (n << 8)));
+            assert!(s.allow_read(ip));
+        }
+        assert!(s.reads.lock().expect("lock").len() <= MAX_TRACKED);
     }
 }

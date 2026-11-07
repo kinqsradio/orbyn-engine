@@ -7,7 +7,7 @@
 //! the witness holds).
 //!
 //! ```text
-//! request  = 0x01 ‖ head (165) ‖ log signature (64) ‖ n_proof u16 ‖ n_proof × hash (32)
+//! request  = 0x01 ‖ intermediate (0 or 1) ‖ head (165) ‖ log signature (64) ‖ n_proof u16 ‖ n_proof × hash (32)
 //!            ‖ n_entries u16 ‖ n_entries × (entry_len u32 ‖ entry ‖ chain_len u64 ‖ path_len u32 ‖ path)
 //! newest   = 0x01 ‖ head (165) ‖ log signature (64) ‖ cosignature (104)
 //! ```
@@ -20,9 +20,11 @@ use crate::{CosignEntry, CosignRequest, Held, MAX_ENTRIES, Reason, Refusal};
 const VERSION: u8 = 1;
 /// The longest consistency proof a request may carry: two to the 64 leaves is as deep as a tree gets.
 const MAX_PROOF_HASHES: usize = 128;
-const HEAD_LEN: usize = 17 + 8 + 32 * 3 + 8 + 32 + 4;
-/// The largest request body the service reads: 1000 entries of at most 64 KiB and their paths.
-pub const MAX_REQUEST_BYTES: usize = 80 * 1024 * 1024;
+use crate::state::HEAD_LEN;
+/// The largest request body the service reads: 16 MiB, which is 1000 entries averaging about
+/// 16 KiB with their map paths. (An entry may be up to 64 KiB, so the key service ends a head's
+/// stretch at 1000 entries **or** this many bytes, whichever comes first.)
+pub const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 
 /// A request that does not decode, or cannot be encoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -60,7 +62,7 @@ pub fn encode_request(request: &CosignRequest) -> Result<Vec<u8>, WireError> {
     if request.entries.len() > MAX_ENTRIES || request.consistency_proof.len() > MAX_PROOF_HASHES {
         return Err(WireError);
     }
-    let mut out = vec![VERSION];
+    let mut out = vec![VERSION, u8::from(request.intermediate)];
     out.extend_from_slice(&request.head.encode());
     out.extend_from_slice(&request.log_signature);
     out.extend_from_slice(&(request.consistency_proof.len() as u16).to_be_bytes());
@@ -86,6 +88,11 @@ pub fn decode_request(bytes: &[u8]) -> Result<CosignRequest, WireError> {
     if r.array::<1>()? != [VERSION] {
         return Err(WireError);
     }
+    let intermediate = match r.array::<1>()? {
+        [0] => false,
+        [1] => true,
+        _ => return Err(WireError),
+    };
     let head = UnsignedHead::decode(r.take(HEAD_LEN)?).ok_or(WireError)?;
     let log_signature = r.array::<64>()?;
     let proof_len = r.u16()?;
@@ -119,6 +126,7 @@ pub fn decode_request(bytes: &[u8]) -> Result<CosignRequest, WireError> {
         log_signature,
         consistency_proof,
         entries,
+        intermediate,
     })
 }
 

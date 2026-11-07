@@ -138,6 +138,7 @@ impl Svc {
             head,
             consistency_proof: proof,
             entries,
+            intermediate: false,
         }
     }
 }

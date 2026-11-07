@@ -4,11 +4,11 @@
 use std::sync::Arc;
 
 use ed25519_dalek::{Signer, SigningKey};
-use orbyn_translog::{Entry, MapId};
+use orbyn_translog::{Entry, MapId, UnsignedHead};
 use orbyn_witness::testing::{TestClock, TestWitness, test_witness};
 use orbyn_witness::{
     Config, CosignError, CosignRequest, FileStore, MemoryStore, PinnedHead, Reason, StartError,
-    State, StateStore, Witness, cosign_message,
+    State, StateStore, StoreError, Witness, cosign_message,
 };
 
 mod common;
@@ -478,10 +478,8 @@ fn the_state_survives_a_restart_and_a_missing_state_refuses_to_start() {
         clock,
         &svc.entries,
         &PinnedHead {
-            size: 9,
-            log_root: [0; 32],
-            head_hash: [0; 32],
-            head_time_ms: 0,
+            head: svc.head(9.min(svc.entries.len()), [0; 32], T0),
+            log_signature: [0; 64],
         },
     );
     assert!(matches!(replay, Err(StartError::AlreadyStarted)));
@@ -522,11 +520,20 @@ fn the_file_store_round_trips_replaces_atomically_and_notices_damage() {
     store.save(&state).expect("save");
     assert_eq!(store.load(), Ok(Some(state.clone())));
     // A second save replaces it; no temporary file is left behind.
-    let mut later = state.clone();
-    later.head_time_ms += 1;
+    svc.fill(2);
+    w.cosign(&svc.request(6, 8, state.head_hash, T0 + 1))
+        .expect("cosign again");
+    let later = mem.saved().expect("later state");
+    assert_ne!(later, state);
     store.save(&later).expect("save again");
-    assert_eq!(store.load(), Ok(Some(later)));
+    assert_eq!(store.load(), Ok(Some(later.clone())));
     assert!(!path.with_extension("tmp").exists());
+    // A state whose head is not the head it describes is refused too.
+    let mut lying = later.clone();
+    lying.head_time_ms += 1;
+    store.save(&lying).expect("save");
+    assert_eq!(store.load(), Err(StoreError::Corrupt));
+    store.save(&later).expect("restore");
     // A flipped byte, a truncation and a frontier that does not give the root are all refused.
     let bytes = std::fs::read(&path).expect("read");
     for damaged in [
@@ -561,16 +568,14 @@ fn the_file_store_round_trips_replaces_atomically_and_notices_damage() {
 }
 
 #[test]
-fn a_witness_started_by_replay_computes_its_own_map_roots() {
+fn a_witness_started_by_replay_computes_its_own_map_roots_and_checks_the_whole_signed_head() {
     let public = log_key().verifying_key().to_bytes();
     let mut svc = Svc::new();
     svc.fill(13);
     let head = svc.head(13, [4; 32], T0);
     let pinned = PinnedHead {
-        size: 13,
-        log_root: head.log_root,
-        head_hash: head.hash(),
-        head_time_ms: head.time_ms,
+        log_signature: Svc::sign(&head),
+        head: head.clone(),
     };
     let start = |entries: &[Entry], pinned: &PinnedHead| {
         Witness::bootstrap_replay(
@@ -583,51 +588,183 @@ fn a_witness_started_by_replay_computes_its_own_map_roots() {
         )
     };
     let w = start(&svc.entries, &pinned).expect("replay");
-    // The roots are the witness's own, equal to what the honest service computes.
+    // The roots, the hash and the time are the head's, checked, and the head is kept whole.
     let state = w.state();
     assert_eq!(
         (state.service_map_root, state.identity_map_root),
         (head.service_map_root, head.identity_map_root)
     );
-    assert_eq!(state.size, 13);
+    assert_eq!(
+        (state.size, state.head_hash, state.head_time_ms),
+        (13, head.hash(), T0)
+    );
+    assert_eq!(state.head.as_ref().map(|h| &h.head), Some(&head));
     // And it goes on: the next head, built on the pinned one, is cosigned.
     svc.fill(3);
     w.cosign(&svc.request(13, 16, head.hash(), T0 + 1))
         .expect("continues");
-    // A wrong pinned log root, a wrong size, a missing entry and a broken chain are refused.
-    let wrong_root = PinnedHead {
-        log_root: [1; 32],
+
+    let cause = |result: Result<_, StartError>| match result {
+        Err(StartError::Replay(cause)) => cause,
+        Err(other) => panic!("{other:?}"),
+        Ok(_) => panic!("started"),
+    };
+    use orbyn_witness::ReplayCause;
+    // A head the log key did not sign, signed by another key, or for an unknown key version.
+    let unsigned = PinnedHead {
+        log_signature: [0; 64],
         ..pinned.clone()
     };
-    assert!(matches!(
-        start(&svc.entries[..13], &wrong_root),
-        Err(StartError::Replay(_))
-    ));
-    let wrong_size = PinnedHead {
-        size: 12,
+    assert_eq!(
+        cause(start(&svc.entries[..13], &unsigned)),
+        ReplayCause::Signature
+    );
+    let other_key = PinnedHead {
+        log_signature: SigningKey::from_bytes(&[9; 32])
+            .sign(&head.encode())
+            .to_bytes(),
         ..pinned.clone()
     };
-    assert!(matches!(
-        start(&svc.entries[..13], &wrong_size),
-        Err(StartError::Replay(_))
-    ));
-    assert!(matches!(
-        start(&svc.entries[..12], &pinned),
-        Err(StartError::Replay(_))
-    ));
+    assert_eq!(
+        cause(start(&svc.entries[..13], &other_key)),
+        ReplayCause::Signature
+    );
+    // A made-up head hash cannot be pinned: the hash is the head's own, so a head that was not
+    // signed (a fake at some size) is refused, and one that was signed must match the log.
+    let mut fake = head.clone();
+    fake.prev_head_hash = [0xee; 32];
+    let fake_pin = PinnedHead {
+        log_signature: [7; 64],
+        head: fake,
+    };
+    assert_eq!(
+        cause(start(&svc.entries[..13], &fake_pin)),
+        ReplayCause::Signature
+    );
+    // Signed, but the wrong size, root or map root: each is its own cause.
+    let signed = |h: UnsignedHead| PinnedHead {
+        log_signature: Svc::sign(&h),
+        head: h,
+    };
+    let mut wrong_size = head.clone();
+    wrong_size.size = 12;
+    assert_eq!(
+        cause(start(&svc.entries[..13], &signed(wrong_size))),
+        ReplayCause::Size
+    );
+    let mut wrong_root = head.clone();
+    wrong_root.log_root = [1; 32];
+    assert_eq!(
+        cause(start(&svc.entries[..13], &signed(wrong_root))),
+        ReplayCause::LogRoot
+    );
+    let mut wrong_service = head.clone();
+    wrong_service.service_map_root = [2; 32];
+    assert_eq!(
+        cause(start(&svc.entries[..13], &signed(wrong_service))),
+        ReplayCause::MapRoots
+    );
+    let mut wrong_identity = head.clone();
+    wrong_identity.identity_map_root = [3; 32];
+    assert_eq!(
+        cause(start(&svc.entries[..13], &signed(wrong_identity))),
+        ReplayCause::MapRoots
+    );
+    // A missing entry and a broken chain.
+    assert_eq!(cause(start(&svc.entries[..12], &pinned)), ReplayCause::Size);
     let mut broken = svc.entries[..13].to_vec();
     broken[9].prev = [9; 32];
-    assert!(matches!(
-        start(&broken, &pinned),
-        Err(StartError::Replay(_))
-    ));
-    // The pin has no map root to get wrong: a witness cannot be given one.
-    let _fields = PinnedHead {
-        size: 0,
-        log_root: [0; 32],
-        head_hash: [0; 32],
-        head_time_ms: 0,
-    };
+    assert_eq!(cause(start(&broken, &pinned)), ReplayCause::Chain);
+}
+
+#[test]
+fn a_head_the_witness_never_checked_is_not_cosigned_by_asking_for_it_again() {
+    // The reviewer's probe: a replay that pins a head hash it never checked, at a size the log does
+    // not have, could be cosigned by asking for that head again. Now there is nothing to ask for:
+    // a made-up head cannot be pinned, and the same head asked again must match the state.
+    let (w, _, _) = witness();
+    let mut svc = Svc::new();
+    svc.fill(10);
+    let request = svc.request(0, 10, [0; 32], T0);
+    w.cosign(&request).expect("first");
+    // The same head again: cosigned again with a new time, state unchanged.
+    let before = w.state();
+    w.cosign(&request).expect("again");
+    assert_eq!(w.state(), before);
+    // Same size and hash claimed with other roots is not "the same head": it is a fork.
+    let mut other = request.clone();
+    other.head.log_root = [9; 32];
+    other.log_signature = Svc::sign(&other.head);
+    let refusal = refused(w.cosign(&other));
+    assert_eq!(refusal.reason, Reason::Fork);
+}
+
+#[test]
+fn a_fork_where_only_one_root_differs_is_refused_whichever_it_is() {
+    let (w, _, _) = witness();
+    let mut svc = Svc::new();
+    svc.fill(10);
+    let request = svc.request(0, 10, [0; 32], T0);
+    w.cosign(&request).expect("first");
+    for change in 0..3 {
+        let mut forked = request.clone();
+        forked.head.time_ms += 1;
+        match change {
+            0 => forked.head.log_root = [9; 32],
+            1 => forked.head.service_map_root = [9; 32],
+            _ => forked.head.identity_map_root = [9; 32],
+        }
+        forked.log_signature = Svc::sign(&forked.head);
+        let refusal = refused(w.cosign(&forked));
+        assert_eq!(refusal.reason, Reason::Fork, "root {change}");
+        let held = refusal.held.expect("evidence");
+        assert_eq!(held.head_hash, request.head.hash());
+    }
+}
+
+#[test]
+fn a_head_on_the_way_may_be_old_but_the_one_that_ends_the_catch_up_must_be_near_the_clock() {
+    let public = log_key().verifying_key().to_bytes();
+    let (w, _, clock) = test_witness(7, vec![(LOG_VERSION, public)], T0).expect("witness");
+    let mut svc = Svc::new();
+    svc.fill(30);
+    // The witness was away for an hour: its clock is an hour on, and the chain's heads are ten
+    // minutes apart.
+    let step = 10 * 60 * 1000;
+    clock.set(T0 + 6 * step);
+    let mut prev = [0; 32];
+    for (i, (from, to)) in [(0, 10), (10, 20), (20, 30)].into_iter().enumerate() {
+        let mut request = svc.request(from, to, prev, T0 + (i as u64 + 4) * step);
+        // The first heads are older than the skew allows, and are refused as the end of a request.
+        let ends = i == 2;
+        request.intermediate = !ends;
+        if i < 2 {
+            let mut as_final = request.clone();
+            as_final.intermediate = false;
+            assert_eq!(
+                refused(w.cosign(&as_final)).reason,
+                Reason::ClockSkew,
+                "head {i}"
+            );
+        }
+        w.cosign(&request).expect("on the way or at the end");
+        prev = request.head.hash();
+    }
+    assert_eq!(w.state().size, 30);
+
+    // An intermediate head is never ahead of the clock by more than the skew, and never goes back
+    // in time, and the end of a request is held to the clock on both sides.
+    let (w, _, clock) = test_witness(8, vec![(LOG_VERSION, public)], T0).expect("witness");
+    let mut ahead = svc.request(0, 10, [0; 32], T0 + 10 * 60 * 1000);
+    ahead.intermediate = true;
+    assert_eq!(refused(w.cosign(&ahead)).reason, Reason::ClockSkew);
+    let mut first = svc.request(0, 10, [0; 32], T0);
+    first.intermediate = true;
+    w.cosign(&first).expect("first");
+    clock.set(T0 + 3 * 60 * 1000);
+    let mut back = svc.request(10, 20, first.head.hash(), T0 - 1);
+    back.intermediate = true;
+    assert_eq!(refused(w.cosign(&back)).reason, Reason::Rollback);
 }
 
 /// The key service's signer and the witness agree: a head signed through `KeyService::sign_head`

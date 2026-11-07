@@ -27,7 +27,7 @@ pub mod messages;
 pub mod service;
 pub mod wire;
 
-pub use state::{FileStore, MemoryStore, State, StateStore, StoreError};
+pub use state::{FileStore, HEAD_LEN, MemoryStore, SignedHead, State, StateStore, StoreError};
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -122,6 +122,12 @@ pub enum ReplayCause {
     /// The entries give another log root than the pinned one.
     #[error("its root is not the pinned root")]
     LogRoot,
+    /// The pinned head is not signed by a pinned log key.
+    #[error("the pinned head is not signed by a pinned log key")]
+    Signature,
+    /// The recomputed map roots are not the pinned head's.
+    #[error("its map roots are not the pinned head's")]
+    MapRoots,
     /// An entry cannot be encoded: the file is damaged.
     #[error("an entry is damaged")]
     Entries,
@@ -179,16 +185,21 @@ pub struct CosignRequest {
     pub consistency_proof: Vec<Hash>,
     /// The entries since the witness's last size, in order: exactly `head.size - last size`.
     pub entries: Vec<CosignEntry>,
+    /// A head on the way to a later one (a witness catching up through the key service's chain of
+    /// heads): its time must not be before the last head's and not ahead of this witness's clock
+    /// by more than the skew, but it may be older, since the witness was away. The head that ends
+    /// the catch-up (`false`) must be within the skew of the clock either way.
+    pub intermediate: bool,
 }
 
-/// A head the operator pins to start a witness by replay: a size, a log root, a hash and a time.
-/// **Never a map root**: those are recomputed.
+/// The head the operator pins to start a witness by replay: **the whole signed head**, as the key
+/// service published it. The replay checks the log signature, the size, the log root and both map
+/// roots it recomputes against it, and takes the hash and the time from it; nothing in it is
+/// trusted unchecked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PinnedHead {
-    pub size: u64,
-    pub log_root: Hash,
-    pub head_hash: Hash,
-    pub head_time_ms: u64,
+    pub head: UnsignedHead,
+    pub log_signature: [u8; 64],
 }
 
 /// What a witness is set up with.
@@ -217,6 +228,8 @@ pub struct Witness<S: StateStore, C: Clock> {
     store: S,
     clock: C,
     state: Mutex<State>,
+    /// This witness's own newest cosignature, set under the state's lock.
+    cosigned: Mutex<Option<Cosignature>>,
 }
 
 fn slot(map: MapId) -> usize {
@@ -237,6 +250,7 @@ impl<S: StateStore, C: Clock> Witness<S, C> {
             store,
             clock,
             state: Mutex::new(state),
+            cosigned: Mutex::new(None),
         })
     }
 
@@ -258,6 +272,7 @@ impl<S: StateStore, C: Clock> Witness<S, C> {
             store,
             clock,
             state: Mutex::new(state),
+            cosigned: Mutex::new(None),
         })
     }
 
@@ -275,7 +290,7 @@ impl<S: StateStore, C: Clock> Witness<S, C> {
         if store.load()?.is_some() {
             return Err(StartError::AlreadyStarted);
         }
-        let state = replay(entries, pinned)?;
+        let state = replay(entries, pinned, &config)?;
         store.save(&state)?;
         Ok(Self {
             key,
@@ -283,6 +298,7 @@ impl<S: StateStore, C: Clock> Witness<S, C> {
             store,
             clock,
             state: Mutex::new(state),
+            cosigned: Mutex::new(None),
         })
     }
 
@@ -316,7 +332,33 @@ impl<S: StateStore, C: Clock> Witness<S, C> {
     /// before the first head.
     pub fn recosign_latest(&self) -> Option<Cosignature> {
         let state = self.lock();
-        (state.head_hash != [0; 32]).then(|| self.sign(state.head_hash, self.clock.now_ms()))
+        let cosignature = (state.head_hash != [0; 32])
+            .then(|| self.sign(state.head_hash, self.clock.now_ms()))?;
+        *self.last_cosignature() = Some(cosignature.clone());
+        Some(cosignature)
+    }
+
+    /// The newest head this witness cosigned, as it is saved: the head, the log key's signature,
+    /// and **this witness's own newest cosignature** of it. Read from the state itself under its
+    /// lock, so it is never a head the saved state does not end on. `None` before the first head.
+    pub fn newest(&self) -> Option<(SignedHead, Cosignature)> {
+        let state = self.lock();
+        let signed = state.head.clone()?;
+        let mut last = self.last_cosignature();
+        // After a restart there is none yet: sign the saved head with the time now.
+        let cosignature = match last.as_ref() {
+            Some(c) if c.head_hash == state.head_hash => c.clone(),
+            _ => {
+                let fresh = self.sign(state.head_hash, self.clock.now_ms());
+                *last = Some(fresh.clone());
+                fresh
+            }
+        };
+        Some((signed, cosignature))
+    }
+
+    fn last_cosignature(&self) -> std::sync::MutexGuard<'_, Option<Cosignature>> {
+        self.cosigned.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Checks a request and, if every check passes, saves the new state **and then** answers with
@@ -347,7 +389,13 @@ impl<S: StateStore, C: Clock> Witness<S, C> {
             )
             .into());
         }
-        if head.time_ms.abs_diff(now) > self.config.max_skew_ms {
+        // The head that ends the request is within the skew of this clock. One on the way to a
+        // later head (a witness catching up) may be older, as it was away, but never ahead of
+        // the clock by more than the skew: a head dated far ahead would leave no later head able
+        // to follow it.
+        let ahead = head.time_ms.saturating_sub(now) > self.config.max_skew_ms;
+        if ahead || (!request.intermediate && head.time_ms.abs_diff(now) > self.config.max_skew_ms)
+        {
             return Err(refuse(
                 Reason::ClockSkew,
                 "the head's time is too far from this witness's clock",
@@ -368,9 +416,17 @@ impl<S: StateStore, C: Clock> Witness<S, C> {
             held: Some(Box::new(held())),
         };
 
-        // The very head already cosigned, asked again (a retry, or a fresh time for freshness).
-        if head.hash() == state.head_hash {
-            return Ok(self.sign(state.head_hash, now));
+        // The very head already cosigned, asked again (a retry, or a fresh time for freshness):
+        // the same size and the same roots as the state, as well as the same hash.
+        if head.hash() == state.head_hash
+            && head.size == state.size
+            && head.log_root == state.log_root
+            && head.service_map_root == state.service_map_root
+            && head.identity_map_root == state.identity_map_root
+        {
+            let cosignature = self.sign(state.head_hash, now);
+            *self.last_cosignature() = Some(cosignature.clone());
+            return Ok(cosignature);
         }
         if head.size < state.size {
             return Err(refuse(Reason::Rollback, "the head is smaller than the last one").into());
@@ -449,11 +505,17 @@ impl<S: StateStore, C: Clock> Witness<S, C> {
         }
         next.head_hash = head.hash();
         next.head_time_ms = head.time_ms;
+        next.head = Some(SignedHead {
+            head: head.clone(),
+            log_signature: request.log_signature,
+        });
 
         // Durable before it is answered.
         self.store.save(&next)?;
         *state = next;
-        Ok(self.sign(head.hash(), now))
+        let cosignature = self.sign(head.hash(), now);
+        *self.last_cosignature() = Some(cosignature.clone());
+        Ok(cosignature)
     }
 }
 
@@ -501,8 +563,17 @@ fn apply(root: &Hash, item: &CosignEntry) -> Result<Hash, Refusal> {
 }
 
 /// Replays a whole log onto empty maps.
-fn replay(entries: &[Entry], pinned: &PinnedHead) -> Result<State, StartError> {
-    if entries.len() as u64 != pinned.size {
+fn replay(entries: &[Entry], pinned: &PinnedHead, config: &Config) -> Result<State, StartError> {
+    let head = &pinned.head;
+    // The pinned head is signed by a pinned log key: nothing in it is taken on trust.
+    config
+        .log_keys
+        .iter()
+        .find(|(version, _)| *version == head.log_key_version)
+        .map(|(_, key)| key)
+        .filter(|key| head.verify(key, &pinned.log_signature))
+        .ok_or(StartError::Replay(ReplayCause::Signature))?;
+    if entries.len() as u64 != head.size {
         return Err(StartError::Replay(ReplayCause::Size));
     }
     let mut maps = [Map::new(), Map::new()];
@@ -521,16 +592,24 @@ fn replay(entries: &[Entry], pinned: &PinnedHead) -> Result<State, StartError> {
         maps[key.0].insert(entry.map_key, map_value(&hash, len + 1));
         accumulator.append(hash);
     }
-    if accumulator.root() != pinned.log_root {
+    if accumulator.root() != head.log_root {
         return Err(StartError::Replay(ReplayCause::LogRoot));
     }
+    // The maps the entries give are the maps the head says, both of them.
+    if maps[0].root() != head.service_map_root || maps[1].root() != head.identity_map_root {
+        return Err(StartError::Replay(ReplayCause::MapRoots));
+    }
     Ok(State {
-        size: pinned.size,
-        log_root: pinned.log_root,
-        service_map_root: maps[0].root(),
-        identity_map_root: maps[1].root(),
-        head_hash: pinned.head_hash,
-        head_time_ms: pinned.head_time_ms,
+        size: head.size,
+        log_root: head.log_root,
+        service_map_root: head.service_map_root,
+        identity_map_root: head.identity_map_root,
+        head_hash: head.hash(),
+        head_time_ms: head.time_ms,
         frontier: accumulator.frontier().to_vec(),
+        head: Some(SignedHead {
+            head: head.clone(),
+            log_signature: pinned.log_signature,
+        }),
     })
 }

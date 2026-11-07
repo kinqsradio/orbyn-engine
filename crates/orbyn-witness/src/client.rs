@@ -87,10 +87,7 @@ impl WitnessClient {
             .map_err(|_| ClientError::Unavailable)?;
         match response.status().as_u16() {
             200 => {
-                let bytes = response
-                    .bytes()
-                    .await
-                    .map_err(|_| ClientError::Unavailable)?;
+                let bytes = read_limited(response).await?;
                 let newest = wire::decode_newest(&bytes).map_err(|_| ClientError::Invalid)?;
                 if newest.head.hash() != newest.cosignature.head_hash
                     || !newest.cosignature.verify(&self.public)
@@ -117,10 +114,7 @@ impl WitnessClient {
             .await
             .map_err(|_| ClientError::Unavailable)?;
         let status = response.status().as_u16();
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|_| ClientError::Unavailable)?;
+        let bytes = read_limited(response).await?;
         if status == 200 {
             let cosignature = Cosignature::decode(&bytes).ok_or(ClientError::Invalid)?;
             if cosignature.head_hash != request.head.hash() || !cosignature.verify(&self.public) {
@@ -138,11 +132,43 @@ impl WitnessClient {
     }
 }
 
-/// A threshold at or below half of the pinned witnesses (or of none): two disjoint minorities
-/// could then each cosign a different head.
+/// A set of pinned witnesses that cannot be used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("the threshold must be more than half of the pinned witnesses")]
-pub struct ThresholdError;
+pub enum PinError {
+    /// A threshold at or below half of the pinned witnesses (or of none): two disjoint minorities
+    /// could then each cosign a different head.
+    #[error("the threshold must be more than half of the pinned witnesses")]
+    Threshold,
+    /// One key pinned twice would count as two witnesses.
+    #[error("a witness key is pinned more than once")]
+    DuplicateKeys,
+}
+
+/// The most a witness's answer may be: far above its largest real answer, so a witness cannot make
+/// the client read without end.
+const MAX_ANSWER: usize = 16 * 1024;
+
+/// Reads the whole body, or fails when it is longer than [`MAX_ANSWER`].
+async fn read_limited(mut response: reqwest::Response) -> Result<Vec<u8>, ClientError> {
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_ANSWER as u64)
+    {
+        return Err(ClientError::Invalid);
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| ClientError::Unavailable)?
+    {
+        if body.len() + chunk.len() > MAX_ANSWER {
+            return Err(ClientError::Invalid);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
 
 /// What one run came to.
 #[derive(Debug)]
@@ -163,10 +189,15 @@ pub struct Cosigner {
 }
 
 impl Cosigner {
-    /// Refuses a threshold at or below half of the witnesses.
-    pub fn new(witnesses: Vec<WitnessClient>, threshold: usize) -> Result<Self, ThresholdError> {
+    /// Refuses a threshold at or below half of the witnesses, and a key pinned twice.
+    pub fn new(witnesses: Vec<WitnessClient>, threshold: usize) -> Result<Self, PinError> {
         if !threshold_ok(threshold, witnesses.len()) {
-            return Err(ThresholdError);
+            return Err(PinError::Threshold);
+        }
+        let mut keys: Vec<[u8; 32]> = witnesses.iter().map(WitnessClient::public).collect();
+        keys.sort_unstable();
+        if keys.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(PinError::DuplicateKeys);
         }
         Ok(Self {
             witnesses,
@@ -220,12 +251,15 @@ async fn catch_up(
             log_signature: newest.log_signature,
             consistency_proof: Vec::new(),
             entries: Vec::new(),
+            intermediate: false,
         };
         return witness.cosign(&again).await;
     }
     let mut after = newest.map(|newest| newest.head);
     loop {
-        let request = source.next(after.as_ref()).await?;
+        let mut request = source.next(after.as_ref()).await?;
+        // Only the head that ends the catch-up is held to the clock.
+        request.intermediate = request.head.hash() != target.hash();
         let cosignature = witness.cosign(&request).await?;
         if request.head.hash() == target.hash() {
             return Ok(cosignature);

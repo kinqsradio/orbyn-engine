@@ -9,12 +9,23 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use orbyn_translog::Hash;
 use orbyn_translog::map::map_empty_root;
 use orbyn_translog::merkle::{Accumulator, empty_root};
+use orbyn_translog::{Hash, UnsignedHead};
 use sha2::{Digest, Sha256};
 
-const MAGIC: &[u8] = b"orbyn/witness-state/v1";
+const MAGIC: &[u8] = b"orbyn/witness-state/v2";
+
+/// The bytes of an encoded head.
+pub const HEAD_LEN: usize = 165;
+
+/// A head with the log key's signature on it, kept whole so the newest head can be served from the
+/// state itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedHead {
+    pub head: UnsignedHead,
+    pub log_signature: [u8; 64],
+}
 
 /// The last head a witness cosigned.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +38,8 @@ pub struct State {
     pub head_time_ms: u64,
     /// The roots of the complete subtrees of the log at `size`, largest first.
     pub frontier: Vec<Hash>,
+    /// The head the rest describes, with its log signature: `None` only at the empty start.
+    pub head: Option<SignedHead>,
 }
 
 impl State {
@@ -41,6 +54,7 @@ impl State {
             head_hash: [0; 32],
             head_time_ms: 0,
             frontier: Vec::new(),
+            head: None,
         }
     }
 
@@ -61,6 +75,14 @@ impl State {
         out.push(self.frontier.len() as u8);
         for node in &self.frontier {
             out.extend_from_slice(node);
+        }
+        match &self.head {
+            None => out.push(0),
+            Some(signed) => {
+                out.push(1);
+                out.extend_from_slice(&signed.head.encode());
+                out.extend_from_slice(&signed.log_signature);
+            }
         }
         let sum = Sha256::digest(&out);
         out.extend_from_slice(&sum);
@@ -94,6 +116,23 @@ impl State {
             frontier.push(*h);
             rest = r;
         }
+        let (flag, rest) = rest.split_first().ok_or_else(bad)?;
+        let (head, rest) = match flag {
+            0 => (None, rest),
+            1 => {
+                let (head, rest) = rest.split_at_checked(HEAD_LEN).ok_or_else(bad)?;
+                let (signature, rest) = rest.split_first_chunk::<64>().ok_or_else(bad)?;
+                let head = UnsignedHead::decode(head).ok_or_else(bad)?;
+                (
+                    Some(SignedHead {
+                        head,
+                        log_signature: *signature,
+                    }),
+                    rest,
+                )
+            }
+            _ => return Err(bad()),
+        };
         if !rest.is_empty() {
             return Err(bad());
         }
@@ -105,7 +144,28 @@ impl State {
             head_hash: hashes[3],
             head_time_ms: u64::from_be_bytes(*time),
             frontier,
+            head,
         };
+        // The head the state keeps is the head it describes, field for field.
+        match &state.head {
+            None => {
+                if state.size != 0 || state.head_hash != [0; 32] || state.head_time_ms != 0 {
+                    return Err(bad());
+                }
+            }
+            Some(signed) => {
+                let h = &signed.head;
+                if h.size != state.size
+                    || h.log_root != state.log_root
+                    || h.service_map_root != state.service_map_root
+                    || h.identity_map_root != state.identity_map_root
+                    || h.hash() != state.head_hash
+                    || h.time_ms != state.head_time_ms
+                {
+                    return Err(bad());
+                }
+            }
+        }
         let acc =
             Accumulator::from_frontier(state.size, state.frontier.clone()).map_err(|_| bad())?;
         if acc.root() != state.log_root {

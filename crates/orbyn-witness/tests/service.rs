@@ -32,12 +32,12 @@ impl Drop for Served {
     }
 }
 
-async fn serve(seed: u8, newest_per_hour: usize, persist: Option<std::path::PathBuf>) -> Served {
+async fn serve(seed: u8, newest_per_hour: usize) -> Served {
     let public = log_key().verifying_key().to_bytes();
     let (witness, _store, clock): (TestWitness, _, _) =
         test_witness(seed, vec![(LOG_VERSION, public)], T0).expect("witness");
     let witness_public = witness.public();
-    let service = Arc::new(Service::new(witness, persist, newest_per_hour));
+    let service = Arc::new(Service::new(witness, newest_per_hour));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -71,7 +71,12 @@ struct Chain {
 }
 
 impl Chain {
+    /// Heads ten minutes apart, as the key service makes them.
     fn new(total: usize, step: usize, time_ms: u64) -> Self {
+        Self::spaced(total, step, time_ms, 10 * 60 * 1000)
+    }
+
+    fn spaced(total: usize, step: usize, time_ms: u64, gap_ms: u64) -> Self {
         let mut svc = Svc::new();
         svc.fill(total);
         let mut heads: Vec<UnsignedHead> = Vec::new();
@@ -79,7 +84,7 @@ impl Chain {
         while size < total {
             size = (size + step).min(total);
             let prev = heads.last().map_or([0; 32], UnsignedHead::hash);
-            heads.push(svc.head(size, prev, time_ms + heads.len() as u64));
+            heads.push(svc.head(size, prev, time_ms + heads.len() as u64 * gap_ms));
         }
         Self {
             svc,
@@ -144,7 +149,7 @@ async fn post_raw(served: &Served, body: Vec<u8>) -> (u16, Vec<u8>) {
 
 #[tokio::test]
 async fn a_cosign_over_http_answers_the_cosignature_and_the_newest_head_follows() {
-    let witness = serve(1, 60, None).await;
+    let witness = serve(1, 60).await;
     let client = client(&witness);
     assert_eq!(client.newest().await.expect("newest"), None, "no head yet");
 
@@ -175,7 +180,7 @@ async fn a_cosign_over_http_answers_the_cosignature_and_the_newest_head_follows(
 
 #[tokio::test]
 async fn refusals_travel_as_reason_codes_and_a_fork_shows_the_head_held() {
-    let witness = serve(2, 60, None).await;
+    let witness = serve(2, 60).await;
     let client = client(&witness);
     let chain = Chain::new(20, 10, T0);
     client
@@ -224,7 +229,7 @@ async fn refusals_travel_as_reason_codes_and_a_fork_shows_the_head_held() {
 
 #[tokio::test]
 async fn the_witness_cosigns_the_newest_head_again_on_its_own_schedule() {
-    let witness = serve(3, 60, None).await;
+    let witness = serve(3, 60).await;
     let client = client(&witness);
     assert!(!witness.service.recosign(), "nothing to sign before a head");
     let chain = Chain::new(10, 10, T0);
@@ -244,7 +249,7 @@ async fn the_witness_cosigns_the_newest_head_again_on_its_own_schedule() {
 
 #[tokio::test]
 async fn reading_the_newest_head_is_limited_per_address() {
-    let witness = serve(4, 3, None).await;
+    let witness = serve(4, 3).await;
     for _ in 0..3 {
         let status = reqwest::get(format!("{}/v1/cosignature", witness.url))
             .await
@@ -269,31 +274,51 @@ fn temp_dir(name: &str) -> std::path::PathBuf {
     dir
 }
 
-#[tokio::test]
-async fn a_kept_head_the_witness_does_not_end_on_or_a_damaged_file_is_never_served() {
-    let dir = temp_dir("newest");
-    let file = dir.join("newest");
+#[test]
+fn the_newest_head_is_read_from_the_saved_state_and_survives_a_restart() {
+    use orbyn_witness::{Config, FileStore, SystemClock, Witness};
+    let dir = temp_dir("state");
     let public = log_key().verifying_key().to_bytes();
-    let chain = Chain::new(10, 10, T0);
-    let request = chain.svc.request(0, 10, [0; 32], T0);
+    let key = || ed25519_dalek::SigningKey::from_bytes(&[5; 32]);
+    let config = || Config::new(vec![(LOG_VERSION, public)]);
+    let now = now_ms();
+    let chain = Chain::spaced(10, 10, now, 1000);
+    let request = chain.svc.request(0, 10, [0; 32], now);
 
-    // The service itself writes the file when it cosigns.
-    let served = serve(5, 60, Some(file.clone())).await;
-    client(&served).cosign(&request).await.expect("cosigned");
-    assert!(file.exists());
-
-    // Another witness, with no head of its own, is handed that file: it is not its head, so it is
-    // dropped. (The positive case, a restart on the same state, is the binary test below.)
-    let (stranger, _, _) = test_witness(6, vec![(LOG_VERSION, public)], T0).expect("witness");
+    let witness = Witness::bootstrap_empty(
+        key(),
+        config(),
+        FileStore::new(dir.join("state")),
+        SystemClock,
+    )
+    .expect("witness");
+    assert!(witness.newest().is_none(), "no head yet");
+    witness.cosign(&request).expect("cosigned");
+    let (signed, cosignature) = witness.newest().expect("newest");
     assert_eq!(
-        Service::new(stranger, Some(file.clone()), 60).newest(),
-        None
+        (&signed.head, signed.log_signature),
+        (&request.head, request.log_signature)
     );
+    assert_eq!(cosignature.head_hash, request.head.hash());
+    drop(witness);
 
-    // Damage is ignored too.
-    std::fs::write(&file, b"damaged").expect("write");
-    let (fresh, _, _) = test_witness(5, vec![(LOG_VERSION, public)], T0).expect("witness");
-    assert_eq!(Service::new(fresh, Some(file), 60).newest(), None);
+    // After a restart the head and its log signature come from the saved state, and the witness
+    // signs it again with the time then. There is no separate file to go stale.
+    let again = Witness::open(
+        key(),
+        config(),
+        FileStore::new(dir.join("state")),
+        SystemClock,
+    )
+    .expect("reopened");
+    let (signed, cosignature) = again.newest().expect("newest after a restart");
+    assert_eq!(
+        (&signed.head, signed.log_signature),
+        (&request.head, request.log_signature)
+    );
+    assert_eq!(cosignature.head_hash, request.head.hash());
+    assert!(cosignature.verify(&again.public()));
+    assert!(!dir.join("newest").exists());
     std::fs::remove_dir_all(dir).expect("clean");
 }
 
@@ -327,14 +352,19 @@ fn a_threshold_at_or_below_half_is_refused() {
 #[tokio::test]
 async fn a_long_log_is_cosigned_in_chunks_of_at_most_a_thousand_entries() {
     let witnesses = [
-        serve(11, 60, None).await,
-        serve(12, 60, None).await,
-        serve(13, 60, None).await,
+        serve(11, 60).await,
+        serve(12, 60).await,
+        serve(13, 60).await,
     ];
     let cosigner = Cosigner::new(witnesses.iter().map(client).collect(), 2).expect("threshold");
     // 2500 entries: heads at 1000, 2000 and 2500.
     let chain = Chain::new(2500, 1000, T0);
     let target = chain.head(2).clone();
+    // The witnesses' clocks are at the newest head's time; the first two heads are older than the
+    // skew allows and are cosigned on the way.
+    for w in &witnesses {
+        w.clock.set(target.time_ms);
+    }
     let outcome = cosigner.cosign(&chain, &target).await;
     assert!(outcome.enough, "{:?}", outcome.failures);
     assert_eq!(outcome.cosignatures.len(), 3);
@@ -352,7 +382,7 @@ async fn a_long_log_is_cosigned_in_chunks_of_at_most_a_thousand_entries() {
     sizes.sort_unstable();
     assert_eq!(sizes, [500, 500, 500, 1000, 1000, 1000, 1000, 1000, 1000]);
     // Past the limit the witness itself refuses: 1001 entries is a bad request.
-    let served_fresh = serve(14, 60, None).await;
+    let served_fresh = serve(14, 60).await;
     let too_many = chain.svc.request(0, 1001, [0; 32], T0);
     // The client will not even send it, and the witness would not read one: a count past the limit
     // is a bad request.
@@ -372,9 +402,9 @@ async fn a_long_log_is_cosigned_in_chunks_of_at_most_a_thousand_entries() {
 #[tokio::test]
 async fn a_lagging_witness_catches_up_alone_while_the_others_answer_at_once() {
     let witnesses = [
-        serve(21, 60, None).await,
-        serve(22, 60, None).await,
-        serve(23, 60, None).await,
+        serve(21, 60).await,
+        serve(22, 60).await,
+        serve(23, 60).await,
     ];
     let cosigner = Cosigner::new(witnesses.iter().map(client).collect(), 2).expect("threshold");
     let chain = Chain::new(2500, 1000, T0);
@@ -384,12 +414,18 @@ async fn a_lagging_witness_catches_up_alone_while_the_others_answer_at_once() {
     // Witness 3 goes away for two heads; the other two follow the log.
     let down =
         Cosigner::new(vec![client(&witnesses[0]), client(&witnesses[1])], 2).expect("two of two");
+    for w in &witnesses[..2] {
+        w.clock.set(chain.head(1).time_ms);
+    }
     let outcome = down.cosign(&chain, chain.head(1)).await;
     assert!(outcome.enough);
     assert_eq!(witnesses[2].service.witness().state().size, 1000);
     let before = chain.requests().len();
     // It is back: the target is the last head. The two current witnesses take one request each,
     // the lagging one takes two (its two missing heads), and all three cosign.
+    for w in &witnesses {
+        w.clock.set(chain.head(2).time_ms);
+    }
     let outcome = cosigner.cosign(&chain, chain.head(2)).await;
     assert!(
         outcome.enough && outcome.cosignatures.len() == 3,
@@ -405,9 +441,9 @@ async fn a_lagging_witness_catches_up_alone_while_the_others_answer_at_once() {
 async fn with_three_witnesses_and_a_threshold_of_two_one_down_still_gives_a_head_and_two_down_does_not()
  {
     let witnesses = [
-        serve(31, 60, None).await,
-        serve(32, 60, None).await,
-        serve(33, 60, None).await,
+        serve(31, 60).await,
+        serve(32, 60).await,
+        serve(33, 60).await,
     ];
     let dead = |n: u8| {
         WitnessClient::new("http://127.0.0.1:1", [n; 32], Duration::from_secs(2)).expect("client")
@@ -434,7 +470,7 @@ async fn with_three_witnesses_and_a_threshold_of_two_one_down_still_gives_a_head
 
 #[tokio::test]
 async fn an_answer_that_does_not_verify_under_the_pinned_key_counts_for_nothing() {
-    let witness = serve(41, 60, None).await;
+    let witness = serve(41, 60).await;
     // Pinned under another key than the witness's own.
     let wrong = WitnessClient::new(&witness.url, [5; 32], Duration::from_secs(5)).expect("client");
     let chain = Chain::new(10, 10, T0);
@@ -553,7 +589,8 @@ async fn the_real_binary_cosigns_over_localhost_and_keeps_its_state_across_a_res
     let client = WitnessClient::new(&url, public, Duration::from_secs(30)).expect("client");
     assert_eq!(client.newest().await.expect("newest"), None);
     // Heads timed now, because the real binary uses the real clock.
-    let chain = Chain::new(2100, 1000, now_ms());
+    // Heads a minute apart and ending a minute ago: the real clock is the binary's.
+    let chain = Chain::spaced(2100, 1000, now_ms() - 3 * 60 * 1000, 60 * 1000);
     let cosigner = Cosigner::new(vec![client.clone()], 1).expect("threshold");
     let outcome = cosigner.cosign(&chain, chain.head(2)).await;
     assert!(outcome.enough, "{:?}", outcome.failures);
@@ -666,10 +703,7 @@ fn the_binary_says_what_the_designs_say_for_help_and_for_each_start_up_error() {
         "--newest-per-hour",
         "--bootstrap-empty",
         "--bootstrap-replay",
-        "--pin-size",
-        "--pin-log-root",
-        "--pin-head-hash",
-        "--pin-head-time-ms",
+        "--pin-head",
     ] {
         assert!(messages::HELP.contains(flag), "{flag}");
     }
@@ -724,30 +758,16 @@ fn the_binary_says_what_the_designs_say_for_help_and_for_each_start_up_error() {
         format!("{}\n", messages::both_bootstraps())
     );
     assert_eq!(
-        stderr_of(&run_with(
-            &dir,
-            &["--bootstrap-replay", "x", "--pin-size", "1"]
-        )),
-        format!("{}\n", messages::replay_needs_pins())
+        stderr_of(&run_with(&dir, &["--bootstrap-replay", "x"])),
+        format!("{}\n", messages::replay_needs_pin())
     );
     // A pin that is present but not hex is a value the witness can't read, naming the option.
     assert_eq!(
         stderr_of(&run_with(
             &dir,
-            &[
-                "--bootstrap-replay",
-                "x",
-                "--pin-size",
-                "1",
-                "--pin-log-root",
-                "zz",
-                "--pin-head-hash",
-                "00",
-                "--pin-head-time-ms",
-                "1"
-            ]
+            &["--bootstrap-replay", "x", "--pin-head", "zz"]
         )),
-        format!("{}\n", messages::bad_value("--pin-log-root"))
+        format!("{}\n", messages::bad_value("--pin-head"))
     );
     // A log key it can't read, and none at all.
     let output = binary()
@@ -784,38 +804,50 @@ fn the_binary_says_what_the_designs_say_for_help_and_for_each_start_up_error() {
     let entries = dir.join("entries");
     std::fs::write(&entries, &file).expect("write");
     let head = svc.head(6, [0; 32], now_ms());
-    let pins = |size: &str, root: &str| -> Vec<String> {
-        [
-            "--bootstrap-replay",
-            entries.to_str().expect("path"),
-            "--pin-size",
-            size,
-            "--pin-log-root",
-            root,
-            "--pin-head-hash",
-            &hex(&head.hash()),
-            "--pin-head-time-ms",
-            &head.time_ms.to_string(),
-        ]
-        .map(String::from)
-        .to_vec()
+    // The signed head, as the key service publishes it: the head's bytes, then the log signature.
+    let pin_hex = |head: &orbyn_translog::UnsignedHead, signature: [u8; 64]| {
+        let mut bytes = head.encode();
+        bytes.extend_from_slice(&signature);
+        hex(&bytes)
     };
-    let run_pins = |size: &str, root: &str| {
-        let flags = pins(size, root);
-        let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
-        run_with(&dir, &flags)
+    let run_pin = |pin: &str| {
+        run_with(
+            &dir,
+            &[
+                "--bootstrap-replay",
+                entries.to_str().expect("path"),
+                "--pin-head",
+                pin,
+            ],
+        )
     };
+    let signed = |head: &orbyn_translog::UnsignedHead| pin_hex(head, Svc::sign(head));
+    let mut wrong_size = head.clone();
+    wrong_size.size = 7;
     assert_eq!(
-        stderr_of(&run_pins("7", &hex(&head.log_root))),
-        format!("{}\n", messages::replay_mismatch("size", "--pin-size"))
+        stderr_of(&run_pin(&signed(&wrong_size))),
+        format!("{}\n", messages::replay_mismatch("size"))
     );
+    let mut wrong_root = head.clone();
+    wrong_root.log_root = [9; 32];
     assert_eq!(
-        stderr_of(&run_pins("6", &hex(&[9; 32]))),
-        format!("{}\n", messages::replay_mismatch("root", "--pin-log-root"))
+        stderr_of(&run_pin(&signed(&wrong_root))),
+        format!("{}\n", messages::replay_mismatch("root"))
+    );
+    let mut wrong_maps = head.clone();
+    wrong_maps.identity_map_root = [9; 32];
+    assert_eq!(
+        stderr_of(&run_pin(&signed(&wrong_maps))),
+        format!("{}\n", messages::replay_mismatch("map roots"))
+    );
+    // A head the log key did not sign.
+    assert_eq!(
+        stderr_of(&run_pin(&pin_hex(&head, [0; 64]))),
+        format!("{}\n", messages::pin_not_signed())
     );
     std::fs::write(&entries, b"\0\0\0\x09short").expect("write");
     assert_eq!(
-        stderr_of(&run_pins("6", &hex(&head.log_root))),
+        stderr_of(&run_pin(&signed(&head))),
         format!("{}\n", messages::entries_file_unreadable())
     );
 
@@ -895,10 +927,6 @@ fn the_binary_says_what_the_designs_say_for_help_and_for_each_start_up_error() {
         "error: an entry in the entries file does not continue its account's history\n  Check the file you gave to --bootstrap-replay: it must hold the log's entries in order."
     );
     assert!(messages::HELP.contains("\n  --newest-per-hour <COUNT>  Most reads of the newest cosignature per address per hour [default: 60]\n"));
-    assert!(
-        messages::HELP
-            .contains("\n  --pin-head-time-ms <MS>    Time of that head, in milliseconds\n")
-    );
     assert!(!messages::HELP.contains("head hash is not"));
 
     // A key file that can't be written: the directory is not there.
@@ -925,7 +953,7 @@ fn the_binary_says_what_the_designs_say_for_help_and_for_each_start_up_error() {
     }
     std::fs::write(&entries, &file).expect("write");
     assert_eq!(
-        stderr_of(&run_pins("6", &hex(&head.log_root))),
+        stderr_of(&run_pin(&signed(&head))),
         format!("{}\n", messages::chain_broken())
     );
 
@@ -961,4 +989,113 @@ fn the_binary_says_what_the_designs_say_for_help_and_for_each_start_up_error() {
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).expect("chmod");
     }
     std::fs::remove_dir_all(dir).expect("clean");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_key_file_others_can_read_is_refused_and_a_new_one_is_not() {
+    use orbyn_witness::messages;
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir("keyperm");
+    let key = dir.join("key");
+    let made = binary()
+        .arg("keygen")
+        .arg("--out")
+        .arg(&key)
+        .output()
+        .expect("keygen");
+    assert!(made.status.success());
+    // keygen makes it readable by its owner only.
+    let mode = std::fs::metadata(&key).expect("meta").permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+    let log_keys = format!(
+        "{LOG_VERSION}:{}",
+        hex(&log_key().verifying_key().to_bytes())
+    );
+    let run = || {
+        binary()
+            .arg("--state-dir")
+            .arg(dir.join("state"))
+            .arg("--key-file")
+            .arg(&key)
+            .args(["--log-keys", &log_keys])
+            .output()
+            .expect("run")
+    };
+    for loose in [0o640, 0o604, 0o644, 0o660] {
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(loose)).expect("chmod");
+        let output = run();
+        assert_eq!(output.status.code(), Some(1), "{loose:o}");
+        assert_eq!(
+            String::from_utf8(output.stderr).expect("utf8"),
+            format!("{}\n", messages::key_file_readable_by_others(&key)),
+            "{loose:o}"
+        );
+    }
+    std::fs::remove_dir_all(dir).expect("clean");
+}
+
+#[test]
+fn a_key_pinned_twice_is_refused_by_the_cosigner() {
+    use orbyn_witness::client::PinError;
+    let at = |url: &str, key: u8| {
+        WitnessClient::new(url, [key; 32], Duration::from_secs(1)).expect("client")
+    };
+    // [A, A, B], threshold 2: A counted twice would make two.
+    let result = Cosigner::new(
+        vec![
+            at("http://127.0.0.1:1", 1),
+            at("http://127.0.0.1:2", 1),
+            at("http://127.0.0.1:3", 2),
+        ],
+        2,
+    );
+    assert_eq!(result.err(), Some(PinError::DuplicateKeys));
+    assert!(
+        Cosigner::new(
+            vec![
+                at("http://127.0.0.1:1", 1),
+                at("http://127.0.0.1:2", 2),
+                at("http://127.0.0.1:3", 3)
+            ],
+            2
+        )
+        .is_ok()
+    );
+    assert_eq!(
+        Cosigner::new(
+            vec![
+                at("http://127.0.0.1:1", 1),
+                at("http://127.0.0.1:2", 2),
+                at("http://127.0.0.1:3", 3)
+            ],
+            1
+        )
+        .err(),
+        Some(PinError::Threshold)
+    );
+}
+
+#[tokio::test]
+async fn an_answer_without_end_is_not_read_past_the_limit_and_a_huge_request_is_refused() {
+    // A witness that answers with far more than any real answer: the client gives up, and says so.
+    let app = axum::Router::new().route(
+        "/v1/cosignature",
+        axum::routing::get(|| async { vec![0u8; 1024 * 1024] }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("addr"));
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let client = WitnessClient::new(&url, [1; 32], Duration::from_secs(10)).expect("client");
+    assert_eq!(client.newest().await, Err(ClientError::Invalid));
+    task.abort();
+
+    // A request body over the limit is refused with 413 before it is read.
+    let witness = serve(51, 60).await;
+    let (status, _) = post_raw(&witness, vec![0u8; wire::MAX_REQUEST_BYTES + 1024]).await;
+    assert_eq!(status, 413);
 }

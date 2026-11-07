@@ -21,10 +21,7 @@ Options:
   --newest-per-hour <COUNT>  Most reads of the newest cosignature per address per hour [default: 60]
   --bootstrap-empty          First start with an empty log
   --bootstrap-replay <FILE>  First start by replaying the entries in FILE
-  --pin-size <COUNT>         Size the replayed log must have
-  --pin-log-root <HEX>       Root the replayed log must have
-  --pin-head-hash <HEX>      Hash of the head the replayed log must end at
-  --pin-head-time-ms <MS>    Time of that head, in milliseconds
+  --pin-head <HEX>           The signed head the replayed log must match (head, then its signature, in hex)
   -h, --help                 Print help
 ";
 
@@ -56,16 +53,29 @@ pub fn both_bootstraps() -> String {
     )
 }
 
-pub fn replay_needs_pins() -> String {
+pub fn replay_needs_pin() -> String {
     format!(
-        "{ERROR}--bootstrap-replay needs all four pins\n  Give --pin-size, --pin-log-root, --pin-head-hash and --pin-head-time-ms."
+        "{ERROR}--bootstrap-replay needs --pin-head\n  Give the signed head the replayed log must match."
     )
 }
 
-/// `pin` is the option the replay did not match: `--pin-size` or `--pin-log-root`.
-pub fn replay_mismatch(cause: &str, pin: &str) -> String {
+/// `cause` is what did not match the pinned head: its size, root or map roots.
+pub fn replay_mismatch(cause: &str) -> String {
     format!(
-        "{ERROR}the replayed log is not the pinned head (its {cause} is not {pin})\n  Check that the entries file and the four pins describe the same head."
+        "{ERROR}the replayed log is not the pinned head (its {cause} is not the pinned head's)\n  Check that the entries file and --pin-head describe the same head."
+    )
+}
+
+pub fn pin_not_signed() -> String {
+    format!(
+        "{ERROR}the pinned head is not signed by a pinned log key\n  Check --pin-head and --log-keys."
+    )
+}
+
+pub fn key_file_readable_by_others(path: &Path) -> String {
+    format!(
+        "{ERROR}the key file can be read by other users ({})\n  Make it readable by its owner only, for example with chmod 600.",
+        path.display()
     )
 }
 

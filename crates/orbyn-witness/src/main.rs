@@ -12,13 +12,14 @@ use std::time::Duration;
 
 use clap::{Args, Parser};
 use ed25519_dalek::SigningKey;
-use orbyn_translog::Entry;
+use orbyn_translog::{Entry, UnsignedHead};
 use orbyn_witness::service::{NEWEST_PER_HOUR, Service};
 use orbyn_witness::wire::{hex, unhex};
 use orbyn_witness::{
     Config, FileStore, PinnedHead, ReplayCause, StartError, StoreError, SystemClock, Witness,
     messages,
 };
+use zeroize::{Zeroize, Zeroizing};
 
 // The help text is the designed text (`messages::HELP`), printed before the arguments are read,
 // so clap's own help is switched off. `keygen` is told apart by the first argument, so the run
@@ -57,13 +58,7 @@ struct RunArgs {
     #[arg(long)]
     bootstrap_replay: Option<PathBuf>,
     #[arg(long)]
-    pin_size: Option<u64>,
-    #[arg(long)]
-    pin_log_root: Option<String>,
-    #[arg(long)]
-    pin_head_hash: Option<String>,
-    #[arg(long)]
-    pin_head_time_ms: Option<u64>,
+    pin_head: Option<String>,
 }
 
 #[derive(Args)]
@@ -129,7 +124,9 @@ fn keygen(args: &KeygenArgs) -> Result<(), String> {
             unwritten()
         }
     })?;
-    writeln!(file, "{}", hex(&seed)).map_err(|_| unwritten())?;
+    let seed_hex = Zeroizing::new(hex(&seed));
+    seed.zeroize();
+    writeln!(file, "{}", seed_hex.as_str()).map_err(|_| unwritten())?;
     file.sync_all().map_err(|_| unwritten())?;
     println!(
         "{}",
@@ -140,8 +137,17 @@ fn keygen(args: &KeygenArgs) -> Result<(), String> {
 
 fn read_key(path: &Path) -> Result<SigningKey, String> {
     let unreadable = || messages::key_file_unreadable(path);
-    let text = std::fs::read_to_string(path).map_err(|_| unreadable())?;
-    let seed: [u8; 32] = unhex(text.trim()).ok_or_else(unreadable)?;
+    // A key file that others can read is not a secret: refused, not used.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(path).map_err(|_| unreadable())?;
+        if meta.mode() & 0o077 != 0 {
+            return Err(messages::key_file_readable_by_others(path));
+        }
+    }
+    let text = Zeroizing::new(std::fs::read_to_string(path).map_err(|_| unreadable())?);
+    let seed: Zeroizing<[u8; 32]> = Zeroizing::new(unhex(text.trim()).ok_or_else(unreadable)?);
     Ok(SigningKey::from_bytes(&seed))
 }
 
@@ -179,14 +185,35 @@ fn read_entries(path: &Path) -> Result<Vec<Entry>, String> {
     Ok(entries)
 }
 
+/// The signed head as the key service publishes it, in hex: the head's bytes, then the log key's
+/// signature over them.
+fn parse_pin_head(text: &str) -> Result<PinnedHead, String> {
+    let bad = || messages::bad_value("--pin-head");
+    let bytes = (text.len() % 2 == 0 && text.is_ascii())
+        .then(|| {
+            (0..text.len() / 2)
+                .map(|i| u8::from_str_radix(&text[i * 2..i * 2 + 2], 16).ok())
+                .collect::<Option<Vec<u8>>>()
+        })
+        .flatten()
+        .ok_or_else(bad)?;
+    let (head, signature) = bytes
+        .split_at_checked(orbyn_witness::HEAD_LEN)
+        .ok_or_else(bad)?;
+    Ok(PinnedHead {
+        head: UnsignedHead::decode(head).ok_or_else(bad)?,
+        log_signature: signature.try_into().map_err(|_| bad())?,
+    })
+}
+
 fn start_error(error: StartError, state_dir: &Path) -> String {
     match error {
         StartError::NeedsBootstrap => messages::needs_bootstrap(),
         StartError::AlreadyStarted => messages::already_started(),
-        StartError::Replay(ReplayCause::Size) => messages::replay_mismatch("size", "--pin-size"),
-        StartError::Replay(ReplayCause::LogRoot) => {
-            messages::replay_mismatch("root", "--pin-log-root")
-        }
+        StartError::Replay(ReplayCause::Signature) => messages::pin_not_signed(),
+        StartError::Replay(ReplayCause::Size) => messages::replay_mismatch("size"),
+        StartError::Replay(ReplayCause::LogRoot) => messages::replay_mismatch("root"),
+        StartError::Replay(ReplayCause::MapRoots) => messages::replay_mismatch("map roots"),
         StartError::Replay(ReplayCause::Entries) => messages::entries_file_unreadable(),
         StartError::Replay(ReplayCause::Chain) => messages::chain_broken(),
         // The state could not be written, or could not be read back (a checksum that fails).
@@ -214,20 +241,10 @@ async fn run(args: RunArgs) -> Result<(), String> {
         (true, Some(_)) => return Err(messages::both_bootstraps()),
         (true, None) => Witness::bootstrap_empty(key, config, store, clock).map_err(start)?,
         (false, Some(path)) => {
-            let (Some(size), Some(root), Some(head), Some(time)) = (
-                args.pin_size,
-                args.pin_log_root.as_deref(),
-                args.pin_head_hash.as_deref(),
-                args.pin_head_time_ms,
-            ) else {
-                return Err(messages::replay_needs_pins());
+            let Some(text) = args.pin_head.as_deref() else {
+                return Err(messages::replay_needs_pin());
             };
-            let pinned = PinnedHead {
-                size,
-                log_root: unhex(root).ok_or_else(|| messages::bad_value("--pin-log-root"))?,
-                head_hash: unhex(head).ok_or_else(|| messages::bad_value("--pin-head-hash"))?,
-                head_time_ms: time,
-            };
+            let pinned = parse_pin_head(text)?;
             let entries = read_entries(path)?;
             Witness::bootstrap_replay(key, config, store, clock, &entries, &pinned)
                 .map_err(start)?
@@ -235,11 +252,7 @@ async fn run(args: RunArgs) -> Result<(), String> {
         (false, None) => Witness::open(key, config, store, clock).map_err(start)?,
     };
 
-    let service = Arc::new(Service::new(
-        witness,
-        Some(args.state_dir.join("newest")),
-        args.newest_per_hour,
-    ));
+    let service = Arc::new(Service::new(witness, args.newest_per_hour));
     // The witness's own schedule: the newest head, cosigned again with its time now.
     let schedule = service.clone();
     let every = Duration::from_secs(args.recosign_secs.max(1));

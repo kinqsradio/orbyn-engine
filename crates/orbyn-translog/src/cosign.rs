@@ -90,6 +90,12 @@ pub fn cosigned_enough(
     if !threshold_ok(threshold, pinned.len()) {
         return false;
     }
+    // A key pinned twice would count as two witnesses.
+    let mut keys = pinned.to_vec();
+    keys.sort_unstable();
+    if keys.windows(2).any(|pair| pair[0] == pair[1]) {
+        return false;
+    }
     let signed = pinned
         .iter()
         .filter(|witness| {
@@ -190,6 +196,24 @@ mod tests {
                 "{threshold} of {witnesses}"
             );
         }
+    }
+
+    #[test]
+    fn a_key_pinned_twice_never_counts_twice() {
+        let head = [5; 32];
+        let (a, b) = (public(1), public(2));
+        // Pinned [A, A, B], threshold 2: A's one cosignature must not count as two.
+        let one = cosign(1, head, 10);
+        assert!(!cosigned_enough(
+            &head,
+            &[a, a, b],
+            std::slice::from_ref(&one),
+            2
+        ));
+        // Not even with every witness that exists having signed: duplicate pins are refused whole.
+        let all = [one, cosign(2, head, 11)];
+        assert!(!cosigned_enough(&head, &[a, a, b], &all, 2));
+        assert!(cosigned_enough(&head, &[a, b], &all, 2));
     }
 
     #[test]
