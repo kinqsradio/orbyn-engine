@@ -6442,7 +6442,9 @@ async fn tombstones_are_pruned_after_four_hundred_days_and_not_before() {
     let (mut old_key, mut young_key) = (old.clone(), young.clone());
     old_key.push(rand32()[0]);
     young_key.push(rand32()[0]);
-    for (key, days) in [(&old_key, 401), (&young_key, 399)] {
+    let mut edge_key = vec![3u8; 31];
+    edge_key.push(rand32()[0]);
+    for (key, days) in [(&old_key, 401), (&edge_key, 400), (&young_key, 399)] {
         orbyn_core::sqlx::query(
             "INSERT INTO account_tombstones (subject, deleted_at)
              VALUES ($1, (now() AT TIME ZONE 'utc')::date - $2::int)
@@ -6460,14 +6462,85 @@ async fn tombstones_are_pruned_after_four_hundred_days_and_not_before() {
     let left: Vec<Vec<u8>> = orbyn_core::sqlx::query_scalar(
         "SELECT subject FROM account_tombstones WHERE subject = ANY($1)",
     )
-    .bind(vec![old_key.clone(), young_key.clone()])
+    .bind(vec![old_key.clone(), edge_key.clone(), young_key.clone()])
     .fetch_all(server.db.pool())
     .await
     .expect("left");
-    assert_eq!(left, vec![young_key.clone()]);
-    orbyn_core::sqlx::query("DELETE FROM account_tombstones WHERE subject = $1")
-        .bind(&young_key)
+    let mut expected = vec![edge_key.clone(), young_key.clone()];
+    let mut left = left;
+    expected.sort();
+    left.sort();
+    assert_eq!(left, expected, "401 days goes; exactly 400 days stays");
+    orbyn_core::sqlx::query("DELETE FROM account_tombstones WHERE subject = ANY($1)")
+        .bind(vec![edge_key.clone(), young_key.clone()])
         .execute(server.db.pool())
         .await
         .expect("clean");
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_failed_deletion_leaves_no_tombstone() {
+    let _turn = TURN.lock().await;
+    let server = server_with(status_limits()).await;
+    let (_, _, session) = unused_account(&server).await;
+    let account = uuid_of(&session["account_id"]);
+    server.make_due(account).await;
+    let pool = server.db.pool();
+    // Make the deletion fail after the tombstone is written: its last audit row is refused while a
+    // marker exists. Only this test makes the marker, and deletions take TURN.
+    orbyn_core::sqlx::query(
+        "CREATE OR REPLACE FUNCTION fail_erase_marker() RETURNS trigger AS $$
+         BEGIN
+             IF EXISTS (SELECT 1 FROM auth_attempts WHERE action = 'fail-erase-marker') THEN
+                 RAISE EXCEPTION 'the deletion fails here';
+             END IF;
+             RETURN NEW;
+         END; $$ LANGUAGE plpgsql",
+    )
+    .execute(pool)
+    .await
+    .expect("function");
+    orbyn_core::sqlx::query(
+        "CREATE TRIGGER fail_erase BEFORE INSERT ON audit_log
+         FOR EACH ROW WHEN (NEW.action = 'account.deleted') EXECUTE FUNCTION fail_erase_marker()",
+    )
+    .execute(pool)
+    .await
+    .expect("trigger");
+    orbyn_core::sqlx::query(
+        "INSERT INTO auth_attempts (action, subject) VALUES ('fail-erase-marker', decode(repeat('00', 32), 'hex'))",
+    )
+    .execute(pool)
+    .await
+    .expect("marker");
+    let before = server.tombstones().await;
+    let failed = server.worker().delete_if_due(account).await;
+    // Whatever happens, take the trap down first.
+    orbyn_core::sqlx::query("DELETE FROM auth_attempts WHERE action = 'fail-erase-marker'")
+        .execute(pool)
+        .await
+        .expect("marker gone");
+    orbyn_core::sqlx::query("DROP TRIGGER fail_erase ON audit_log")
+        .execute(pool)
+        .await
+        .expect("trigger gone");
+    assert!(failed.is_err(), "the deletion fails");
+    assert_eq!(server.tombstones().await, before, "no tombstone");
+    let exists: bool = orbyn_core::sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM accounts WHERE id = $1)",
+    )
+    .bind(account)
+    .fetch_one(pool)
+    .await
+    .expect("exists");
+    assert!(exists, "the account is still there");
+    assert_eq!(
+        server.status_raw(&account.to_string()).await.0,
+        StatusCode::NOT_FOUND,
+        "a live account is not shown as deleted"
+    );
+    // And it deletes, with its tombstone, once the trap is gone.
+    assert!(server.worker().delete_if_due(account).await.expect("worker"));
+    assert_eq!(server.tombstones().await, before + 1);
 }
