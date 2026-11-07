@@ -1,21 +1,106 @@
 name: CI
 
+# Time budget: a pull request should turn green within 5 minutes. A run over it is a defect to fix at its slowest
+# step, not drift to accept.
+#
+# Pull requests run one lane: Rust on Linux with Postgres. macOS and Windows run on main, nightly, on manual runs,
+# and on a pull request that touches Cargo manifests, the toolchain pin, `crates/orbyn-cli/` (the only platform code)
+# or the workflows. The Docker image and the security audit run on main, nightly, manual runs, and a pull request
+# that can change them. Main and nightly run every lane, so an advisory published against a dependency the pull
+# request did not change is caught there, not on the pull request.
 on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: "29 3 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+# A new push to a pull request cancels its older run. Main, nightly and manual runs group by
+# commit, so a nightly never replaces a queued push-to-main run or the reverse.
 concurrency:
   group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # Linux runs everything, including the Postgres tests against a service container.
+  # Decides which lanes a pull request can affect. A required job never skips as a whole (a skipped matrix job reports
+  # under its unexpanded name): its heavy steps skip instead, and the job reports success at once. Pushes to main, nightly
+  # and manual runs, and any path this does not recognise, run everything.
+  changes:
+    name: Changes
+    runs-on: ubuntu-24.04
+    outputs:
+      rust: ${{ steps.scope.outputs.rust }}
+      platform: ${{ steps.scope.outputs.platform }}
+      docker: ${{ steps.scope.outputs.docker }}
+      audit: ${{ steps.scope.outputs.audit }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - id: scope
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          all() { printf 'rust=true\nplatform=true\ndocker=true\naudit=true\n' >> "$GITHUB_OUTPUT"; echo "Running every lane: $1"; }
+          if [ "$EVENT" != "pull_request" ]; then all "not a pull request"; exit 0; fi
+          # --no-renames lists both paths of a move, so moving code into docs still counts.
+          if ! files=$(git diff --no-renames --name-only "$BASE"...HEAD); then all "could not compare with the base"; exit 0; fi
+          docs='^(docs/|[^/]+\.md$|\.github/ISSUE_TEMPLATE/|\.github/pull_request_template\.md$|\.github/(CODEOWNERS|dependabot\.yml)$|\.gitignore$|\.env\.example$)'
+          # What the Rust tests build or read. Docker files do not.
+          rust='^(crates/|migrations/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|\.cargo/|\.github/workflows/)'
+          # Where a platform can matter: the manifests and the toolchain decide what builds, `orbyn-cli` holds the
+          # only platform-specific code (`cfg(windows)`, `cfg(unix)`), and a build script could branch too.
+          platform='^(Cargo\.(toml|lock)$|rust-toolchain\.toml$|\.cargo/|crates/[^/]+/(Cargo\.toml|build\.rs)$|crates/orbyn-cli/|\.github/workflows/)'
+          # The image builds every crate except the WebAssembly one, with the migrations.
+          docker='^(docker/|compose\.yaml$|\.dockerignore$|migrations/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|\.cargo/|\.github/workflows/)'
+          audit='^(Cargo\.(toml|lock)$|crates/[^/]+/Cargo\.toml$|\.cargo/audit\.toml$|\.github/workflows/)'
+          # scripts/ holds the title checker, which the title workflow runs.
+          known="$rust|$docker|^scripts/"
+          code=$(printf '%s\n' "$files" | grep -Ev "$docs" | grep -v '^$' || true)
+          unknown=$(printf '%s\n' "$code" | grep -Ev "$known" | grep -v '^$' || true)
+          if [ -n "$unknown" ]; then all "unrecognised paths: ${unknown//$'\n'/ }"; exit 0; fi
+          has() { printf '%s\n' "$code" | grep -Eq "$1" && echo true || echo false; }
+          r=$(has "$rust"); p=$(has "$platform"); a=$(has "$audit")
+          d=$(has "$docker")
+          # The image also holds every crate but the WebAssembly one.
+          if [ "$d" = false ] && printf '%s\n' "$code" | grep -E '^crates/' | grep -Evq '^crates/orbyn-wasm/'; then d=true; fi
+          printf 'rust=%s\nplatform=%s\ndocker=%s\naudit=%s\n' "$r" "$p" "$d" "$a" >> "$GITHUB_OUTPUT"
+          echo "rust=$r platform=$p docker=$d audit=$a"
+          printf '%s\n' "$files"
+
+  # Formatting, in seconds, before anything heavy. The heavy jobs wait for it and fail at once when it failed.
+  # The title and the AI usage section are checked by their own workflows, which also run when the pull request is
+  # edited, so fixing a title never needs a push or a full run.
+  lint:
+    name: Cheap checks
+    needs: changes
+    runs-on: ubuntu-24.04
+    env:
+      RUST: ${{ needs.changes.outputs.rust }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - if: env.RUST == 'true'
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          components: rustfmt
+      - if: env.RUST == 'true'
+        run: cargo fmt --all --check
+
+  # The Rust lane: lint, the whole workspace with the Postgres tests against a service container, the web build of the
+  # device crates, and the committed wire types. The one lane a pull request always runs (unless it only touches docs).
   linux:
     name: Rust (Linux, Postgres)
+    needs: [changes, lint]
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     services:
       postgres:
@@ -31,70 +116,153 @@ jobs:
           --health-interval 5s --health-timeout 3s --health-retries 10
     env:
       DATABASE_URL: postgres://orbyn@localhost:5432/orbyn
+      RUN: ${{ needs.changes.outputs.rust }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Cheap checks passed
+        shell: bash
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          LINT: ${{ needs.lint.result }}
+        run: |
+          if [ "$CHANGES" != success ] || [ "$LINT" != success ]; then
+            echo "changes=$CHANGES lint=$LINT"
+            exit 1
+          fi
+      - if: env.RUN != 'true'
+        run: echo "No Rust change in this pull request."
+      - if: env.RUN == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - if: env.RUN == 'true'
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-      - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace -- --include-ignored
+      - if: env.RUN == 'true'
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      # Formatting ran in "Cheap checks".
+      - if: env.RUN == 'true'
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - if: env.RUN == 'true'
+        run: cargo test --workspace -- --include-ignored
       - name: Device crates build for the web
+        if: env.RUN == 'true'
         run: cargo check -p orbyn-crypto -p orbyn-sync -p orbyn-planner -p orbyn-contracts -p orbyn-auth-client -p orbyn-client -p orbyn-wasm --target wasm32-unknown-unknown
       - name: Generated wire types are committed
+        if: env.RUN == 'true'
         run: |
           git add --intent-to-add crates/orbyn-contracts/bindings
           git diff --exit-code --stat -- crates/orbyn-contracts/bindings
 
-  # Device crates run on people's computers, so they are tested on macOS and Windows too.
+  # Device crates run on people's computers, so they are tested on macOS and Windows too: on main, nightly, manual
+  # runs and a pull request where a platform can matter. The only platform-specific code is in `orbyn-cli`.
   desktop:
     name: Rust (${{ matrix.os }})
+    needs: [changes, lint]
+    if: ${{ !cancelled() }}
     runs-on: ${{ matrix.os }}
+    env:
+      RUN: ${{ needs.changes.outputs.platform }}
     strategy:
       fail-fast: false
       matrix:
         os: [macos-15, windows-2022]
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Cheap checks passed
+        shell: bash
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          LINT: ${{ needs.lint.result }}
+        run: |
+          if [ "$CHANGES" != success ] || [ "$LINT" != success ]; then
+            echo "changes=$CHANGES lint=$LINT"
+            exit 1
+          fi
+      - if: env.RUN != 'true'
+        run: echo "No platform change in this pull request."
+      - if: env.RUN == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - if: env.RUN == 'true'
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-      - run: cargo test --workspace
+      - if: env.RUN == 'true'
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - if: env.RUN == 'true'
+        run: cargo test --workspace
 
+  # New advisories appear without any change here, so main and nightly run it; a pull request runs it when it
+  # changes the dependencies.
   audit:
     name: Security audit
+    needs: [changes, lint]
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
+    env:
+      RUN: ${{ needs.changes.outputs.audit }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Cheap checks passed
+        shell: bash
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          LINT: ${{ needs.lint.result }}
+        run: |
+          if [ "$CHANGES" != success ] || [ "$LINT" != success ]; then
+            echo "changes=$CHANGES lint=$LINT"
+            exit 1
+          fi
+      - if: env.RUN != 'true'
+        run: echo "No dependency change in this pull request."
+      - if: env.RUN == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+      - if: env.RUN == 'true'
+        uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
           tool: cargo-audit
-      - run: cargo audit
+      - if: env.RUN == 'true'
+        run: cargo audit
 
+  # The image builds without a layer cache (the Dockerfile's cache mounts do not survive a runner), so it is the slowest
+  # step: a pull request builds it only when it can change the image.
   docker:
     name: Docker image
+    needs: [changes, lint]
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
+    env:
+      RUN: ${{ needs.changes.outputs.docker }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Cheap checks passed
+        shell: bash
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          LINT: ${{ needs.lint.result }}
+        run: |
+          if [ "$CHANGES" != success ] || [ "$LINT" != success ]; then
+            echo "changes=$CHANGES lint=$LINT"
+            exit 1
+          fi
+      - if: env.RUN != 'true'
+        run: echo "Nothing in this pull request can change the image."
+      - if: env.RUN == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: docker build -f docker/Dockerfile -t orbyn-engine:ci .
+      - if: env.RUN == 'true'
+        run: docker build -f docker/Dockerfile -t orbyn-engine:ci .
       - name: The image starts and answers its health check
+        if: env.RUN == 'true'
         run: |
           docker network create orbyn
           docker run -d --name db --network orbyn -e POSTGRES_USER=orbyn -e POSTGRES_HOST_AUTH_METHOD=trust -e POSTGRES_DB=orbyn postgres:17-bookworm@sha256:665dc7b37ac52a17e298511414c21d23ffa4e6a6ef6225b3e5d59c7afb35e994
-          for i in $(seq 1 30); do docker exec db pg_isready -U orbyn -d orbyn && break; sleep 1; done
+          for _ in $(seq 1 30); do docker exec db pg_isready -U orbyn -d orbyn && break; sleep 1; done
           docker run --rm --network orbyn -e DATABASE_URL=postgres://orbyn@db:5432/orbyn orbyn-engine:ci migrate
           docker run -d --name api --network orbyn -p 8080:8080 -e DATABASE_URL=postgres://orbyn@db:5432/orbyn orbyn-engine:ci serve
-          for i in $(seq 1 30); do curl -fsS http://localhost:8080/health && break; sleep 1; done
+          for _ in $(seq 1 30); do curl -fsS http://localhost:8080/health && break; sleep 1; done
           curl -fsS http://localhost:8080/health | grep -q '"database":"ok"'
           docker exec api /usr/local/bin/orbyn health 127.0.0.1:8080
