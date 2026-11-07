@@ -27,7 +27,7 @@ const SECOND_FACTOR_CONTEXT: &str = "orbyn/second-factor-state/v1";
 const MAX_ATTEMPTS: i32 = 5;
 
 /// How far a device's signature may be from the server's clock, in seconds.
-const PROOF_WINDOW_SECS: i64 = 300;
+pub(super) const PROOF_WINDOW_SECS: i64 = 300;
 
 /// What a device signs to change the second factor (see `orbyn_auth_client::totp_manage_message`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,13 +70,13 @@ impl std::fmt::Debug for TotpEnrolment {
 }
 
 /// What was sent as the second factor: exactly one of a code and a recovery code.
-enum Factor<'a> {
+pub(super) enum Factor<'a> {
     Code(&'a str),
     Recovery(&'a str),
 }
 
 impl<'a> Factor<'a> {
-    fn parse(code: Option<&'a str>, recovery_code: Option<&'a str>) -> Result<Self> {
+    pub(super) fn parse(code: Option<&'a str>, recovery_code: Option<&'a str>) -> Result<Self> {
         match (code, recovery_code) {
             (Some(code), None) => Ok(Self::Code(code)),
             (None, Some(recovery)) => Ok(Self::Recovery(recovery)),
@@ -87,7 +87,7 @@ impl<'a> Factor<'a> {
 
 /// How a factor checked out.
 #[derive(PartialEq, Eq)]
-enum Checked {
+pub(super) enum Checked {
     Code,
     Recovery,
     Wrong,
@@ -121,6 +121,7 @@ impl Accounts {
         let mut tx = self.pool.begin().await?;
         self.authorise_manage(&mut tx, session, Manage::Enrol, "", proof)
             .await?;
+        Self::refuse_during_deletion_shared(&mut tx, session.account_id).await?;
         let (email,): (String,) = sqlx::query_as("SELECT email FROM accounts WHERE id = $1")
             .bind(session.account_id)
             .fetch_one(&mut *tx)
@@ -168,6 +169,7 @@ impl Accounts {
         let mut tx = self.pool.begin().await?;
         self.authorise_manage(&mut tx, session, Manage::Confirm, code, proof)
             .await?;
+        Self::refuse_during_deletion_shared(&mut tx, session.account_id).await?;
         let pending: Option<(Vec<u8>, i64)> = sqlx::query_as(
             "SELECT secret, last_step FROM account_totp
              WHERE account_id = $1 AND NOT enabled FOR UPDATE",
@@ -225,6 +227,9 @@ impl Accounts {
         let mut tx = self.pool.begin().await?;
         self.authorise_manage(&mut tx, session, Manage::Disable, "", proof)
             .await?;
+        // The account first, shared: a deletion being scheduled holds it exclusively, so either
+        // this sees the schedule and refuses, or the schedule waits for this to finish.
+        Self::refuse_during_deletion_shared(&mut tx, session.account_id).await?;
         // Locks in the order a sign-in takes them (its state, then the account's TOTP row), so a
         // disable and a second-factor attempt can never wait for each other.
         sqlx::query("SELECT id FROM second_factor_states WHERE account_id = $1 FOR UPDATE")
@@ -414,7 +419,7 @@ impl Accounts {
     /// Checks a code or a recovery code against the account's TOTP, under the account's row lock,
     /// and records what it used: the code's step, or the recovery code. Never says why a wrong
     /// factor is wrong.
-    async fn check_factor(
+    pub(super) async fn check_factor(
         &self,
         tx: &mut Transaction<'_, Postgres>,
         account_id: Uuid,
@@ -506,14 +511,18 @@ impl Accounts {
     }
 
     /// The time codes and signatures are judged against: the system clock unless a test set one.
-    fn now(&self) -> u64 {
+    pub(super) fn now(&self) -> u64 {
         (self.clock.0)()
     }
 
     /// Counts one sign-in code attempt: against the account from this address (10 in 15 minutes)
     /// and against the account from anywhere (30). The narrower is counted first, so an attempt it
     /// refuses never uses up the wider one, and a refused attempt is not recorded.
-    async fn allow_sign_in_attempt(&self, client: &Client, account_id: Uuid) -> Result<()> {
+    pub(super) async fn allow_sign_in_attempt(
+        &self,
+        client: &Client,
+        account_id: Uuid,
+    ) -> Result<()> {
         let pair = self.account_and_address_digest(client, account_id);
         if limits::allow(
             &self.pool,
@@ -538,7 +547,11 @@ impl Accounts {
 
     /// A right code gives its attempt back, to both buckets, so the owner's own sign-ins never
     /// use up what only wrong guesses should.
-    async fn give_back_sign_in_attempt(&self, client: &Client, account_id: Uuid) -> Result<()> {
+    pub(super) async fn give_back_sign_in_attempt(
+        &self,
+        client: &Client,
+        account_id: Uuid,
+    ) -> Result<()> {
         limits::give_back(
             &self.pool,
             "totp-account-ip",
@@ -618,7 +631,7 @@ impl Accounts {
         }
     }
 
-    fn account_digest(&self, account_id: Uuid) -> [u8; 32] {
+    pub(super) fn account_digest(&self, account_id: Uuid) -> [u8; 32] {
         self.secrets.digest("totp-account", account_id.as_bytes())
     }
 }

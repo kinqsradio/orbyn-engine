@@ -708,6 +708,7 @@ impl Accounts {
             .bind(session.account_id)
             .execute(&mut *tx)
             .await?;
+        Self::refuse_during_deletion(&mut tx, session.account_id).await?;
         let remover = self.require_trusted(&mut tx, session).await?;
         let target = self
             .device(&mut tx, session.account_id, device_id)

@@ -15,6 +15,7 @@
 //! Every operation checks its own authorization against the database; a route
 //! only parses and maps.
 
+mod delete;
 mod devices;
 mod email;
 pub mod limits;
@@ -72,6 +73,13 @@ pub enum AccountError {
     /// token alone is not enough.
     #[error("a signature from this device is needed")]
     DeviceProofRequired,
+    /// Deleting an account needs a sign-in from the last ten minutes, so a stolen session cannot
+    /// schedule it.
+    #[error("sign in again to do this")]
+    ReauthenticationRequired,
+    /// A deletion is scheduled: changes that could lock the owner out wait until it is cancelled.
+    #[error("the account is scheduled for deletion; cancel the deletion first")]
+    DeletionScheduled,
     #[error("a second factor is already on for this account")]
     TotpAlreadyEnabled,
     #[error("no second factor is on for this account")]
@@ -79,6 +87,9 @@ pub enum AccountError {
     /// A wrong, expired or closed verification code look alike.
     #[error("the code is wrong or has expired; ask for a new one")]
     InvalidEmailCode,
+    /// A wrong, used, voided or expired cancel link token look alike.
+    #[error("the cancel link is not valid")]
+    InvalidCancelToken,
     #[error("the session is not valid")]
     Unauthorized,
     #[error("only a trusted device can do this")]
@@ -338,6 +349,9 @@ enum AuditAction {
     TotpFailed,
     TotpRecoveryUsed,
     EmailVerified,
+    AccountDeletionScheduled,
+    AccountDeletionCancelled,
+    AccountDeleted,
 }
 
 impl AuditAction {
@@ -358,6 +372,9 @@ impl AuditAction {
             Self::TotpFailed => "totp.failed",
             Self::TotpRecoveryUsed => "totp.recovery_used",
             Self::EmailVerified => "account.email_verified",
+            Self::AccountDeletionScheduled => "account.deletion_scheduled",
+            Self::AccountDeletionCancelled => "account.deletion_cancelled",
+            Self::AccountDeleted => "account.deleted",
         }
     }
 }
@@ -372,6 +389,8 @@ pub struct Accounts {
     /// Where the steps of the email verification paths are recorded, for a test that checks a
     /// real sign-up and a decoy take the same ones. `None` in production.
     trace: Option<Arc<std::sync::Mutex<Vec<&'static str>>>>,
+    /// Where the planner is served, for the cancel link in the deletion email.
+    app_url: Option<String>,
 }
 
 /// The time a TOTP code or a device's signature is judged against, in Unix seconds. The system
@@ -393,7 +412,27 @@ impl Accounts {
             limits: Limits::default(),
             clock: Clock(Arc::new(|| u64::try_from(unix_now_secs()).unwrap_or(0))),
             trace: None,
+            app_url: None,
         }
+    }
+
+    /// The service over secrets that are shared with another part of the process.
+    pub fn with_shared_secrets(pool: PgPool, secrets: Arc<AuthSecrets>) -> Self {
+        Self {
+            pool,
+            secrets,
+            limits: Limits::default(),
+            clock: Clock(Arc::new(|| u64::try_from(unix_now_secs()).unwrap_or(0))),
+            trace: None,
+            app_url: None,
+        }
+    }
+
+    /// The address the planner is served at (`https://app.example.com`); the deletion email's cancel
+    /// link points to `<url>/cancel-deletion#<token>`. Without it the email carries the token alone.
+    pub fn with_app_url(mut self, url: impl Into<String>) -> Self {
+        self.app_url = Some(url.into().trim_end_matches('/').to_owned());
+        self
     }
 
     pub fn with_limits(mut self, limits: Limits) -> Self {
@@ -471,8 +510,14 @@ impl Accounts {
     where
         E: sqlx::PgExecutor<'e>,
     {
+        // The account row is share-locked while the row is written: a deletion in flight holds it
+        // exclusively, so this waits for it and then writes nothing (the account is gone, its
+        // history is scrubbed, and a late row would name it again), and a deletion that comes
+        // later waits for this row and scrubs it with the rest.
         sqlx::query(
-            "INSERT INTO audit_log (account_id, device_id, action, ip_hash) VALUES ($1, $2, $3, $4)",
+            "INSERT INTO audit_log (account_id, device_id, action, ip_hash)
+             SELECT $1, $2, $3, $4 WHERE $1::uuid IS NULL
+                OR EXISTS (SELECT 1 FROM accounts WHERE id = $1 FOR SHARE)",
         )
         .bind(account_id)
         .bind(device_id)
@@ -908,6 +953,73 @@ impl Accounts {
         .await?;
         let (signing, agreement) = row.ok_or(AccountError::DeviceNotTrusted)?;
         public_keys(&signing, &agreement)
+    }
+}
+
+impl Accounts {
+    /// Like [`Accounts::require_trusted`], and keeps the device row share-locked until the
+    /// transaction ends, so the device cannot be removed under a step that relies on it.
+    pub(super) async fn require_trusted_locked(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        session: &Session,
+    ) -> Result<DevicePublic> {
+        let row: Option<(Vec<u8>, Vec<u8>)> = sqlx::query_as(
+            "SELECT signing_key, agreement_key FROM devices
+             WHERE id = $1 AND account_id = $2 AND state = 'trusted' FOR SHARE",
+        )
+        .bind(session.device_id)
+        .bind(session.account_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let (signing, agreement) = row.ok_or(AccountError::DeviceNotTrusted)?;
+        public_keys(&signing, &agreement)
+    }
+
+    /// Takes the account's row lock, the first lock of every deletion step, and says when its
+    /// deletion is scheduled. `None` when the account is gone.
+    pub(super) async fn lock_account(
+        tx: &mut Transaction<'_, Postgres>,
+        account_id: Uuid,
+    ) -> Result<Option<(String, Option<DateTime<Utc>>)>> {
+        Ok(sqlx::query_as(
+            "SELECT email, deletion_scheduled_at FROM accounts WHERE id = $1 FOR UPDATE",
+        )
+        .bind(account_id)
+        .fetch_optional(&mut **tx)
+        .await?)
+    }
+
+    /// Takes the account's row lock shared and refuses while a deletion is scheduled: for the steps
+    /// that must not run during the grace period. A scheduling holds the lock exclusively, so
+    /// either this sees the schedule, or the schedule waits for this step to finish.
+    pub(super) async fn refuse_during_deletion_shared(
+        tx: &mut Transaction<'_, Postgres>,
+        account_id: Uuid,
+    ) -> Result<()> {
+        sqlx::query("SELECT id FROM accounts WHERE id = $1 FOR SHARE")
+            .bind(account_id)
+            .execute(&mut **tx)
+            .await?;
+        Self::refuse_during_deletion(tx, account_id).await
+    }
+
+    /// Refuses with [`AccountError::DeletionScheduled`] when a deletion is scheduled. Call it with
+    /// the account's row lock held, so a scheduling cannot slip in between.
+    pub(super) async fn refuse_during_deletion(
+        tx: &mut Transaction<'_, Postgres>,
+        account_id: Uuid,
+    ) -> Result<()> {
+        let scheduled: Option<bool> = sqlx::query_scalar(
+            "SELECT deletion_scheduled_at IS NOT NULL FROM accounts WHERE id = $1",
+        )
+        .bind(account_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if scheduled == Some(true) {
+            return Err(AccountError::DeletionScheduled);
+        }
+        Ok(())
     }
 }
 

@@ -125,7 +125,11 @@ async fn serve(config: Config) -> Result<(), String> {
         Some(setup) => {
             let secrets = orbyn_core::accounts::AuthSecrets::from_encoded(setup)
                 .map_err(|e| e.to_string())?;
-            state = state.with_accounts(orbyn_core::Accounts::new(db.pool().clone(), secrets));
+            let mut accounts = orbyn_core::Accounts::new(db.pool().clone(), secrets);
+            if let Some(url) = &config.app_url {
+                accounts = accounts.with_app_url(url);
+            }
+            state = state.with_accounts(accounts);
             let hub = orbyn_store::Hub::start(db.pool().clone());
             let mut store = orbyn_store::Store::new(db.pool().clone(), hub);
             let pool_size = db.pool().options().get_max_connections() as usize;

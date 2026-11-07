@@ -132,6 +132,44 @@ fn device_keys_export_import_and_sign_the_auth_messages() -> Result<()> {
             .map_err(|e| e.code),
         Err("invalid_input")
     );
+    // And to delete the account, under a context of its own.
+    let delete = keys.sign_account_delete(account, device_id, 1_800_000_000.0)?;
+    let message = auth::account_delete_message(
+        &uuid_bytes(account)?,
+        &uuid_bytes(device_id)?,
+        1_800_000_000,
+    );
+    let delete: [u8; 64] = delete.as_slice().try_into().expect("64 bytes");
+    assert!(
+        orbyn_crypto::verify(
+            &keys.keys.public(),
+            auth::ACCOUNT_DELETE_CONTEXT,
+            &message,
+            &delete
+        )
+        .is_ok()
+    );
+    assert!(
+        orbyn_crypto::verify(
+            &keys.keys.public(),
+            auth::TOTP_MANAGE_CONTEXT,
+            &message,
+            &delete
+        )
+        .is_err()
+    );
+    // Cancelling a scheduled deletion signs the same message under its own context.
+    let cancel = keys.sign_account_delete_cancel(account, device_id, 1_800_000_000.0)?;
+    let cancel: [u8; 64] = cancel.as_slice().try_into().expect("64 bytes");
+    for (context, ok) in [
+        (auth::ACCOUNT_DELETE_CANCEL_CONTEXT, true),
+        (auth::ACCOUNT_DELETE_CONTEXT, false),
+    ] {
+        assert_eq!(
+            orbyn_crypto::verify(&keys.keys.public(), context, &message, &cancel).is_ok(),
+            ok
+        );
+    }
     let sealed = keys.export(SECRET.to_vec())?;
     // The export is sealed: the secret halves are not in it.
     let raw = keys.keys.to_bytes();

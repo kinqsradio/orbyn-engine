@@ -967,3 +967,103 @@ async fn the_protection_chain_goes_through_the_server_and_a_new_device_refuses_a
     assert_eq!(conflict["code"], "protection_conflict");
     assert_eq!(conflict["head"], value(&back));
 }
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn the_protection_setting_waits_while_the_accounts_deletion_is_scheduled() {
+    let server = Server::start().await;
+    let email = format!("protect-freeze-{}@example.com", Uuid::new_v4());
+    let keys = DeviceKeys::generate().expect("keys");
+    let session = server.sign_up(&email, &keys).await;
+    let mut a = Device {
+        engine: Engine::new(copy(&keys), &session.account_id, &session.device_id).expect("engine"),
+        token: session.token.clone(),
+        id: session.device_id.clone(),
+        now: 1_800_000_000_000,
+    };
+    let schedule = |on: bool| {
+        orbyn_core::sqlx::query(
+            "UPDATE accounts SET deletion_scheduled_at = CASE WHEN $2 THEN now() + interval '7 days' END
+             WHERE email = $1",
+        )
+        .bind(email.to_lowercase())
+        .bind(on)
+        .execute(server.db.pool())
+    };
+    schedule(true).await.expect("schedule");
+    let body = a
+        .engine
+        .sign_protection(wire::ProtectionLevel::Standard, now_secs())
+        .expect("sign");
+    let (status, answer) = server
+        .call(
+            Method::POST,
+            "/v1/keychain/protection",
+            Some(&a.token),
+            Some(value(&body)),
+        )
+        .await;
+    assert_eq!(
+        (status, &answer["code"]),
+        (StatusCode::CONFLICT, &json!("deletion_scheduled"))
+    );
+    schedule(false).await.expect("cancel");
+    let link = set_protection(&server, &mut a, wire::ProtectionLevel::Standard).await;
+    assert_eq!(link.seq, 1, "the refused setting left no link");
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_protection_setting_racing_the_schedule_waits_for_the_account_lock_and_is_refused() {
+    let server = Server::start().await;
+    let email = format!("protect-race-{}@example.com", Uuid::new_v4());
+    let keys = DeviceKeys::generate().expect("keys");
+    let session = server.sign_up(&email, &keys).await;
+    let a = Device {
+        engine: Engine::new(copy(&keys), &session.account_id, &session.device_id).expect("engine"),
+        token: session.token.clone(),
+        id: session.device_id.clone(),
+        now: 1_800_000_000_000,
+    };
+    // A scheduling holds the account's row lock and commits its schedule a moment later.
+    let mut scheduling = server.db.pool().begin().await.expect("tx");
+    orbyn_core::sqlx::query("SELECT id FROM accounts WHERE email = $1 FOR UPDATE")
+        .bind(email.to_lowercase())
+        .execute(&mut *scheduling)
+        .await
+        .expect("lock");
+    let body = a
+        .engine
+        .sign_protection(wire::ProtectionLevel::Standard, now_secs())
+        .expect("sign");
+    let post = server.call(
+        Method::POST,
+        "/v1/keychain/protection",
+        Some(&a.token),
+        Some(value(&body)),
+    );
+    let commit = async {
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        orbyn_core::sqlx::query(
+            "UPDATE accounts SET deletion_scheduled_at = now() + interval '7 days' WHERE email = $1",
+        )
+        .bind(email.to_lowercase())
+        .execute(&mut *scheduling)
+        .await
+        .expect("schedule");
+        scheduling.commit().await.expect("commit");
+    };
+    let ((status, answer), ()) = tokio::join!(post, commit);
+    assert_eq!(
+        (status, &answer["code"]),
+        (StatusCode::CONFLICT, &json!("deletion_scheduled"))
+    );
+    let links: i64 = orbyn_core::sqlx::query_scalar(
+        "SELECT count(*) FROM protection_settings WHERE account_id::text = $1",
+    )
+    .bind(&session.account_id)
+    .fetch_one(server.db.pool())
+    .await
+    .expect("links");
+    assert_eq!(links, 0);
+}

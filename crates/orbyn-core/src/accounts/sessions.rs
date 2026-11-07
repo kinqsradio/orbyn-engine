@@ -121,6 +121,12 @@ impl Accounts {
     /// Signs this session out.
     pub async fn revoke_session(&self, client: &Client, session: &Session) -> Result<()> {
         let mut tx = self.pool.begin().await?;
+        // The account first, like every writer: a deletion in flight holds it and then waits for
+        // the session row, so taking it after the row would deadlock with the deletion.
+        sqlx::query("SELECT id FROM accounts WHERE id = $1 FOR SHARE")
+            .bind(session.account_id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query(
             "UPDATE sessions SET revoked_at = now()
              WHERE id = $1 AND account_id = $2 AND revoked_at IS NULL",
@@ -145,6 +151,7 @@ impl Accounts {
     /// devices only, so a pending device cannot sign the others out.
     pub async fn revoke_all_sessions(&self, client: &Client, session: &Session) -> Result<u64> {
         let mut tx = self.pool.begin().await?;
+        Self::refuse_during_deletion_shared(&mut tx, session.account_id).await?;
         self.require_trusted(&mut tx, session).await?;
         let revoked = sqlx::query(
             "UPDATE sessions SET revoked_at = now() WHERE account_id = $1 AND revoked_at IS NULL",

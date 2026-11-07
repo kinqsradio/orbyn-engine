@@ -55,6 +55,10 @@ pub const DEVICE_APPROVAL_V2_CONTEXT: &str = "orbyn/device-approval/v2";
 pub const TRUSTED_START_CONTEXT: &str = "orbyn/trusted-login-start/v1";
 /// Context for [`totp_manage_message`].
 pub const TOTP_MANAGE_CONTEXT: &str = "orbyn/totp-manage/v1";
+/// Context for [`account_delete_message`].
+pub const ACCOUNT_DELETE_CONTEXT: &str = "orbyn/account-delete/v1";
+/// Context for [`account_delete_message`] when it cancels a scheduled deletion.
+pub const ACCOUNT_DELETE_CANCEL_CONTEXT: &str = "orbyn/account-delete-cancel/v1";
 
 /// Argon2id with 64 MiB, 3 passes and one lane, the same cost as the recovery key.
 pub fn ksf() -> Argon2<'static> {
@@ -279,6 +283,23 @@ pub fn totp_manage_message(
     out.extend_from_slice(device_id);
     push_len_prefixed(&mut out, action.as_bytes());
     push_len_prefixed(&mut out, code.as_bytes());
+    out.extend_from_slice(&signed_at.to_be_bytes());
+    out
+}
+
+/// What a trusted device signs, under [`ACCOUNT_DELETE_CONTEXT`], to schedule the deletion of the
+/// whole account, or under [`ACCOUNT_DELETE_CANCEL_CONTEXT`] to cancel a scheduled one: the account
+/// and device ids and the time in Unix seconds. A bearer token alone does neither; the server
+/// checks this against the device's registered signing key and accepts it for five minutes either
+/// side of its own clock. A scheduling signature is accepted once; the context keeps the two apart.
+pub fn account_delete_message(
+    account_id: &[u8; 16],
+    device_id: &[u8; 16],
+    signed_at: i64,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(40);
+    out.extend_from_slice(account_id);
+    out.extend_from_slice(device_id);
     out.extend_from_slice(&signed_at.to_be_bytes());
     out
 }
@@ -606,6 +627,20 @@ mod totp_manage_tests {
             totp_manage_message(&[1; 16], &[2; 16], "enrol", "x", 0),
             totp_manage_message(&[1; 16], &[2; 16], "enro", "lx", 0)
         );
+    }
+
+    #[test]
+    fn a_delete_message_binds_the_account_the_device_and_the_time() {
+        let base = account_delete_message(&[1; 16], &[2; 16], 1_800_000_000);
+        for other in [
+            account_delete_message(&[9; 16], &[2; 16], 1_800_000_000),
+            account_delete_message(&[1; 16], &[9; 16], 1_800_000_000),
+            account_delete_message(&[1; 16], &[2; 16], 1_800_000_001),
+        ] {
+            assert_ne!(base, other);
+        }
+        assert_ne!(ACCOUNT_DELETE_CONTEXT, TOTP_MANAGE_CONTEXT);
+        assert_ne!(ACCOUNT_DELETE_CONTEXT, ACCOUNT_DELETE_CANCEL_CONTEXT);
     }
 }
 

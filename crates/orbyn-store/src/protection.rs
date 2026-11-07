@@ -200,6 +200,17 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         require_trusted(&mut *tx, session, true).await?;
+        // A change of protection waits while the account's deletion is scheduled, so a stolen
+        // device cannot weaken it during the grace period.
+        let scheduled: Option<bool> = sqlx::query_scalar(
+            "SELECT deletion_scheduled_at IS NOT NULL FROM accounts WHERE id = $1",
+        )
+        .bind(session.account_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if scheduled == Some(true) {
+            return Err(StoreError::DeletionScheduled);
+        }
         let head: Option<Row> = sqlx::query_as(
             "SELECT seq, level, prev, hash, signed_at, signer_device_id, signature
              FROM protection_settings WHERE account_id = $1 ORDER BY seq DESC LIMIT 1",

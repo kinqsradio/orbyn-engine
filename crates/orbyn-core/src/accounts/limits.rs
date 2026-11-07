@@ -63,6 +63,15 @@ pub struct Limits {
     pub email_code_guess_per_code: Limit,
     /// Wrong verification codes from one IP address for any sign-up id, real or not (30 an hour).
     pub email_verify_fail_per_ip: Limit,
+    /// Account deletions by one device: 5 an hour, counted only after its signature checked out.
+    pub account_delete_per_device: Limit,
+    /// New deletion schedules for one account: 3 a day, each sending one email. Asking again while
+    /// one is pending is not a new schedule and is not counted.
+    pub account_delete_schedules_per_account: Limit,
+    /// Wrong cancel-by-mail tokens from one address (an IPv6 /64 counts as one): 10 an hour. A right
+    /// token is never counted and never refused, so someone guessing from another address cannot
+    /// lock the owner out of the link.
+    pub cancel_by_mail_wrong_per_address: Limit,
 }
 
 impl Default for Limits {
@@ -86,6 +95,12 @@ impl Default for Limits {
             email_code_guess_per_prefix: Limit::new(5, Duration::from_secs(30 * MINUTE)),
             email_code_guess_per_code: Limit::new(10, Duration::from_secs(30 * MINUTE)),
             email_verify_fail_per_ip: Limit::new(30, Duration::from_secs(60 * MINUTE)),
+            account_delete_per_device: Limit::new(5, Duration::from_secs(60 * MINUTE)),
+            cancel_by_mail_wrong_per_address: Limit::new(10, Duration::from_secs(60 * MINUTE)),
+            account_delete_schedules_per_account: Limit::new(
+                3,
+                Duration::from_secs(24 * 60 * MINUTE),
+            ),
         }
     }
 }

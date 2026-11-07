@@ -165,6 +165,9 @@ pub enum StoreError {
     DuplicateRecord,
     #[error("only a trusted device can do this")]
     DeviceNotTrusted,
+    /// The account's deletion is scheduled; changes that could lock the owner out wait.
+    #[error("the account is scheduled for deletion; cancel the deletion first")]
+    DeletionScheduled,
     #[error("there is no such zone")]
     ZoneNotFound,
     #[error("the zone was deleted")]
