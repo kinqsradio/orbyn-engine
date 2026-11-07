@@ -1,6 +1,6 @@
 # orbyn-engine architecture
 
-The plan lives in the [Orbyn platform plan](https://claude.ai/artifact/BBhxZSmXRg1DawhLVRbsNc). This file is the contract the code follows. Change it in the same commit as any rule it states.
+The plan lives in the internal Orbyn Platform Plan. This file is the contract the code follows. Change it in the same commit as any rule it states.
 
 ## Rules
 
