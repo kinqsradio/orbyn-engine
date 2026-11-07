@@ -6883,6 +6883,11 @@ impl orbyn_core::push::PushSender for Recording {
     }
 }
 
+/// How many pushes a recording sender was given.
+fn sent_count(sender: &Recording) -> usize {
+    sender.seen.lock().expect("lock").len()
+}
+
 fn zone_job(account: Uuid, zone: Uuid, author: Uuid) -> orbyn_core::jobs::Job {
     orbyn_core::jobs::Job {
         id: Uuid::new_v4(),
@@ -7396,8 +7401,7 @@ async fn only_a_trusted_device_is_woken_even_when_it_keeps_its_token_and_subscri
         let job = zone_job(p.account_id, Uuid::new_v4(), a_id);
         let done = handle_zone_changed(pool, Some(&secrets), &sender, &job).await;
         assert_eq!(done, PushDelivery::Done);
-        let sent = sender.seen.lock().expect("lock").len();
-        sent
+        sent_count(&sender)
     };
     assert_eq!(wake().await, 1, "trusted: woken");
     for state in ["pending", "removed"] {
