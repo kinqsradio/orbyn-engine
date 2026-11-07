@@ -1087,3 +1087,39 @@ fn public_keys(signing: &[u8], agreement: &[u8]) -> Result<DevicePublic> {
         agreement: agreement.try_into().map_err(|_| AccountError::Internal)?,
     })
 }
+
+#[cfg(test)]
+mod signup_default_tests {
+    use super::*;
+    use crate::SignupMode;
+    use std::sync::Arc;
+
+    fn secrets() -> AuthSecrets {
+        AuthSecrets::from_encoded(&AuthSecrets::generate()).expect("secrets")
+    }
+
+    /// A pool that never connects: only the settings of the service are read.
+    fn pool() -> PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://nobody@127.0.0.1:1/none")
+            .expect("a lazy pool")
+    }
+
+    // Sign-up is invite-only unless it is opened on purpose, whichever way the service is built.
+    #[tokio::test]
+    async fn a_service_made_with_new_is_invite_only() {
+        assert_eq!(Accounts::new(pool(), secrets()).signup, SignupMode::Invite);
+    }
+
+    #[tokio::test]
+    async fn a_service_made_with_shared_secrets_is_invite_only() {
+        let service = Accounts::with_shared_secrets(pool(), Arc::new(secrets()));
+        assert_eq!(service.signup, SignupMode::Invite);
+    }
+
+    #[tokio::test]
+    async fn opening_sign_up_is_only_by_asking() {
+        let service = Accounts::new(pool(), secrets()).with_signup(SignupMode::Open);
+        assert_eq!(service.signup, SignupMode::Open);
+    }
+}

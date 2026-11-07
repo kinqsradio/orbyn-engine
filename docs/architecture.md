@@ -218,6 +218,8 @@ Delivery is at least once: a crash or a lost lease runs a job again. Handlers mu
 
 `docker compose up -d` starts Postgres, runs `orbyn migrate`, then `orbyn serve` on `127.0.0.1:8080` and one `orbyn worker`. Sign-in needs `ORBYN_AUTH_SETUP` in the environment, from `orbyn auth-setup`. Sign-up needs an invite code unless `ORBYN_SIGNUP=open` (see Accounts and devices); make codes with `orbyn invite create`. The image is distroless and runs as a non-root user; `orbyn health` is its health check. Logs are JSON in the image and never include request bodies.
 
+**A database that ran the pre-merge invite branch must be recreated.** Migration `0016_invites.sql` was edited after that branch applied it (the label check and the `invites_used_by_account` index), so such a database fails to migrate with `VersionMismatch(16)`. Nothing is deployed, so there is no `0017`; drop and recreate local and staging databases made before #80 merged. CI starts fresh and is unaffected.
+
 **Sizing the database pool.** `ORBYN_DATABASE_POOL_SIZE` (4 to 200, default 10) is how many connections one process may open; on the server one of them is held for good by the live listener. `orbyn serve` and `orbyn worker` are separate processes, each with a pool of that size, and every replica runs both, so the connections the fleet can open are
 
     replicas × (server pool + worker pool)
