@@ -1,0 +1,31 @@
+//! The transparency log's Merkle tree, as pure code with no IO: the RFC 9162 tree, its inclusion and
+//! consistency proofs and their verifiers, and an append-only [`Accumulator`] that keeps a root
+//! from `O(log n)` hashes.
+//!
+//! The proof builders work over a [`Subtrees`] source, so a database that stores subtree hashes can
+//! serve them without loading the leaves; a slice of leaf hashes is the reference source. The
+//! verifiers follow the RFC's iterative algorithms, not the recursive definitions the builders use,
+//! so the two check each other.
+//!
+//! It runs on the key service and on devices (native and WebAssembly): a device verifies with the
+//! very code the key service builds with. What an entry or a head holds is not here yet.
+
+pub mod merkle;
+
+pub use merkle::{
+    Accumulator, Hash, Subtrees, consistency_proof, empty_root, inclusion_proof, leaf_hash,
+    node_hash, tree_root, verify_consistency, verify_inclusion,
+};
+
+/// What went wrong. Never carries log content.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum Error {
+    #[error("the index or size is out of range")]
+    OutOfRange,
+    #[error("the proof does not match the roots")]
+    ProofMismatch,
+    #[error("the proof has the wrong number of hashes")]
+    ProofLength,
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;

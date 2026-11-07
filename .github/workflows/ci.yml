@@ -164,7 +164,7 @@ jobs:
         run: cargo check -p orbyn-keyservice --no-default-features
       - name: Device crates build for the web
         if: env.RUN == 'true'
-        run: cargo check -p orbyn-crypto -p orbyn-sync -p orbyn-planner -p orbyn-contracts -p orbyn-auth-client -p orbyn-client -p orbyn-wasm --target wasm32-unknown-unknown
+        run: cargo check -p orbyn-crypto -p orbyn-sync -p orbyn-planner -p orbyn-contracts -p orbyn-auth-client -p orbyn-client -p orbyn-wasm -p orbyn-translog --target wasm32-unknown-unknown
       - name: Generated wire types are committed
         if: env.RUN == 'true'
         run: |

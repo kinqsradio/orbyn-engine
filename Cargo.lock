@@ -1828,6 +1828,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "orbyn-translog"
+version = "0.1.0"
+dependencies = [
+ "sha2 0.11.1",
+ "thiserror",
+]
+
+[[package]]
 name = "orbyn-wasm"
 version = "0.1.0"
 dependencies = [
