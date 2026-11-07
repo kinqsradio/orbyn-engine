@@ -1057,7 +1057,7 @@ async fn the_runtime_role_must_be_a_plain_role_and_public_cannot_create() {
         .expect("url")
         .parse()
         .expect("url");
-    let other = pool_as(options.database(name), &format!("{name}_other")).await;
+    let other = pool_as(options.clone().database(name), &format!("{name}_other")).await;
     denied(
         sqlx::query("CREATE TABLE sneaky (x int)")
             .execute(&other)
@@ -1066,8 +1066,148 @@ async fn the_runtime_role_must_be_a_plain_role_and_public_cannot_create() {
         &["permission denied"],
     );
     other.close().await;
+    // A role that owns the database (and so, on Postgres 15 and later, schema public, which belongs
+    // to `pg_database_owner`) could drop the log tables itself; so could a member of that role.
+    let (dbo_role, dbo_member, dbo_db) = (
+        format!("{name}_dbowner"),
+        format!("{name}_dbmember"),
+        format!("{name}_ownedby"),
+    );
+    run(admin, format!("CREATE ROLE \"{dbo_role}\" LOGIN"))
+        .await
+        .expect("db owner");
+    run(
+        admin,
+        format!("CREATE ROLE \"{dbo_member}\" LOGIN IN ROLE \"{dbo_role}\""),
+    )
+    .await
+    .expect("db owner member");
+    run(
+        admin,
+        format!("CREATE DATABASE \"{dbo_db}\" OWNER \"{dbo_role}\""),
+    )
+    .await
+    .expect("owned database");
+    let there = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(options.clone().database(&dbo_db))
+        .await
+        .expect("connect as the admin to the owned database");
+    for role in [&dbo_role, &dbo_member] {
+        let result = migrate(&there, role).await;
+        assert!(
+            matches!(result, Err(StoreError::UnsafeRole)),
+            "{role}: {result:?}"
+        );
+    }
+    // Nothing was created in that database by the refused migrations.
+    let tables: i64 =
+        sqlx::query("SELECT count(*) AS n FROM pg_tables WHERE schemaname = 'public'")
+            .fetch_one(&there)
+            .await
+            .expect("count")
+            .get("n");
+    assert_eq!(tables, 0);
+    // The same database is fine for a plain role.
+    migrate(&there, &format!("{name}_other"))
+        .await
+        .expect("a plain role");
+    there.close().await;
+    let _ = run(
+        admin,
+        format!("DROP DATABASE IF EXISTS \"{dbo_db}\" WITH (FORCE)"),
+    )
+    .await;
+    for role in [&dbo_member, &dbo_role] {
+        let _ = run(admin, format!("DROP ROLE IF EXISTS \"{role}\"")).await;
+    }
     for suffix in ["_su", "_member", "_other"] {
         let _ = run(admin, format!("DROP ROLE IF EXISTS \"{name}{suffix}\"")).await;
     }
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "needs ORBYN_KEYSERVICE_DATABASE_URL"]
+async fn a_writer_that_cannot_get_the_lock_gets_a_retryable_error() {
+    let db = TestDb::new().await;
+    let store = db.store().with_timeouts(orbyn_keyservice_server::Timeouts {
+        lock: "200ms".to_owned(),
+        statement: "30s".to_owned(),
+    });
+    // Another session holds the write lock.
+    let mut holder = db.runtime.begin().await.expect("holder");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(0x6f72_6279_6e5f_6b73_i64)
+        .execute(&mut *holder)
+        .await
+        .expect("lock");
+    let started = std::time::Instant::now();
+    let result = store.append(&entry(MapId::Service, 1, [0; 32], 0)).await;
+    assert!(matches!(result, Err(StoreError::Busy)), "{result:?}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "it did not wait for the default"
+    );
+    let result = store.build_head(1, 1, None).await;
+    assert!(matches!(result, Err(StoreError::Busy)), "{result:?}");
+    // Nothing was written, and once the lock is free the same call goes through.
+    holder.rollback().await.expect("release");
+    assert_eq!(store.size().await.expect("size"), 0);
+    store
+        .append(&entry(MapId::Service, 1, [0; 32], 0))
+        .await
+        .expect("append");
+    // A statement past its limit is the same kind of error.
+    let slow = db.store().with_timeouts(orbyn_keyservice_server::Timeouts {
+        lock: "10s".to_owned(),
+        statement: "1ms".to_owned(),
+    });
+    let mut busy = 0;
+    for i in 1..30u64 {
+        if matches!(
+            slow.append(&entry(MapId::Service, 2, [0; 32], i)).await,
+            Err(StoreError::Busy)
+        ) {
+            busy += 1;
+        }
+    }
+    assert!(busy > 0, "a 1 ms statement timeout fired at least once");
+    db.cleanup().await;
+}
+
+/// A head with a full chunk of entries: the time to build and commit it, printed for the record.
+#[tokio::test]
+#[ignore = "needs ORBYN_KEYSERVICE_DATABASE_URL"]
+async fn a_thousand_entry_head_builds_and_commits_in_reasonable_time() {
+    let db = TestDb::new().await;
+    let store = db.store();
+    let mut last: std::collections::HashMap<(u8, u8), Hash> = Default::default();
+    for i in 0..1000u64 {
+        let map = if i % 4 == 0 {
+            MapId::Identity
+        } else {
+            MapId::Service
+        };
+        let key = (i % 200) as u8;
+        let prev = last.get(&(map as u8, key)).copied().unwrap_or([0; 32]);
+        let appended = store
+            .append(&entry(map, key, prev, i))
+            .await
+            .expect("append");
+        last.insert((map as u8, key), appended.entry_hash);
+    }
+    let built = std::time::Instant::now();
+    let head = store.build_head(1, 1, None).await.expect("head");
+    let build = built.elapsed();
+    assert_eq!(head.size, 1000);
+    let committed = std::time::Instant::now();
+    store
+        .commit_head(&head, &[1; 64], b"")
+        .await
+        .expect("commit");
+    let commit = committed.elapsed();
+    eprintln!("1000 entries: build {build:?}, commit {commit:?}");
+    assert!(build + commit < std::time::Duration::from_secs(60));
     db.cleanup().await;
 }

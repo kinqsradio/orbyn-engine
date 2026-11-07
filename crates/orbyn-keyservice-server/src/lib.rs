@@ -37,7 +37,11 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("database error: {0}")]
-    Db(#[from] sqlx::Error),
+    Db(sqlx::Error),
+    /// Another writer holds the lock (`lock_timeout`, 55P03) or a statement ran past its limit
+    /// (`statement_timeout`, 57014). Nothing was written; trying again later is safe.
+    #[error("the store is busy; try again")]
+    Busy,
     #[error("migration error: {0}")]
     Migrate(#[from] sqlx::migrate::MigrateError),
     #[error("the entry does not continue its account's chain")]
@@ -64,10 +68,37 @@ pub enum StoreError {
 
 pub type Result<T, E = StoreError> = std::result::Result<T, E>;
 
+impl From<sqlx::Error> for StoreError {
+    fn from(error: sqlx::Error) -> Self {
+        // 55P03 lock_not_available and 57014 query_canceled (statement timeout) are retryable.
+        let busy = error
+            .as_database_error()
+            .and_then(|e| e.code())
+            .is_some_and(|code| code == "55P03" || code == "57014");
+        if busy { Self::Busy } else { Self::Db(error) }
+    }
+}
+
 /// How long a writer waits for the lock, and how long one statement may run, so a stuck writer
 /// is an error instead of a queue.
 const LOCK_TIMEOUT: &str = "10s";
 const STATEMENT_TIMEOUT: &str = "120s";
+
+/// The timeouts a write transaction sets, as Postgres reads them (`"10s"`, `"250ms"`).
+#[derive(Clone, Debug)]
+pub struct Timeouts {
+    pub lock: String,
+    pub statement: String,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Self {
+            lock: LOCK_TIMEOUT.to_owned(),
+            statement: STATEMENT_TIMEOUT.to_owned(),
+        }
+    }
+}
 
 /// The most entries one head covers unless the caller says otherwise.
 pub const DEFAULT_MAX_ENTRIES: u64 = 1000;
@@ -83,6 +114,7 @@ const WRITE_LOCK: i64 = 0x6f72_6279_6e5f_6b73;
 /// `SET TRANSACTION` has to be the first statement.
 pub(crate) async fn begin_write(
     pool: &PgPool,
+    timeouts: &Timeouts,
 ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
     let mut tx = pool.begin().await?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
@@ -91,8 +123,8 @@ pub(crate) async fn begin_write(
     sqlx::query(
         "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true)",
     )
-    .bind(LOCK_TIMEOUT)
-    .bind(STATEMENT_TIMEOUT)
+    .bind(&timeouts.lock)
+    .bind(&timeouts.statement)
     .execute(&mut *tx)
     .await?;
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
@@ -128,17 +160,26 @@ pub async fn migrate(owner: &PgPool, runtime_role: &str) -> Result<()> {
     if !valid {
         return Err(StoreError::BadRole);
     }
-    // The runtime role must be a plain role: a superuser or the owner (or anyone in the owner's
-    // role) could drop the triggers or write what the grants forbid.
+    // The runtime role must be a plain role: a superuser, the owner, the owner of this database or
+    // of schema public (on Postgres 15 and later `public` belongs to `pg_database_owner`, so the
+    // database's owner owns it), or a member of any of those, could drop the triggers or write what
+    // the grants forbid.
     let row = sqlx::query(
-        "SELECT rolsuper, pg_has_role(rolname, current_user, 'MEMBER') AS owner_member \
+        "SELECT rolsuper, \
+         pg_has_role(rolname, current_user, 'MEMBER') AS owner_member, \
+         pg_has_role(rolname, (SELECT datdba FROM pg_database WHERE datname = current_database()), 'MEMBER') AS database_owner_member, \
+         pg_has_role(rolname, (SELECT nspowner FROM pg_namespace WHERE nspname = 'public'), 'MEMBER') AS schema_owner_member \
          FROM pg_roles WHERE rolname = $1",
     )
     .bind(runtime_role)
     .fetch_optional(owner)
     .await?
     .ok_or(StoreError::UnsafeRole)?;
-    if row.try_get::<bool, _>("rolsuper")? || row.try_get::<bool, _>("owner_member")? {
+    if row.try_get::<bool, _>("rolsuper")?
+        || row.try_get::<bool, _>("owner_member")?
+        || row.try_get::<bool, _>("database_owner_member")?
+        || row.try_get::<bool, _>("schema_owner_member")?
+    {
         return Err(StoreError::UnsafeRole);
     }
     MIGRATOR.run(owner).await?;
@@ -148,7 +189,8 @@ pub async fn migrate(owner: &PgPool, runtime_role: &str) -> Result<()> {
         format!("REVOKE ALL ON ALL TABLES IN SCHEMA public FROM {role}"),
         format!("REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM {role}"),
         format!("REVOKE CREATE ON SCHEMA public FROM {role}"),
-        // Nobody else gets to create objects either (the default before Postgres 15).
+        // Nobody else gets to create objects either (the default before Postgres 15). This changes
+        // the whole database, not just this role, which is why the key service has its own.
         "REVOKE CREATE ON SCHEMA public FROM PUBLIC".to_owned(),
         format!("GRANT USAGE ON SCHEMA public TO {role}"),
         format!(
@@ -173,17 +215,27 @@ pub async fn migrate(owner: &PgPool, runtime_role: &str) -> Result<()> {
 #[derive(Clone, Debug)]
 pub struct Store {
     pool: PgPool,
+    timeouts: Timeouts,
 }
 
 impl Store {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            timeouts: Timeouts::default(),
+        }
+    }
+
+    /// The same store with other lock and statement timeouts for its write transactions.
+    pub fn with_timeouts(mut self, timeouts: Timeouts) -> Self {
+        self.timeouts = timeouts;
+        self
     }
 
     /// Appends an entry: gapless sequence number, its account's chain checked, and the log's
     /// complete subtrees written, in one transaction.
     pub async fn append(&self, entry: &Entry) -> Result<Appended> {
-        let mut tx = begin_write(&self.pool).await?;
+        let mut tx = begin_write(&self.pool, &self.timeouts).await?;
         let appended = LogStore::append(&mut tx, entry).await?;
         tx.commit().await?;
         Ok(appended)
@@ -219,7 +271,7 @@ impl Store {
         log_key_version: u32,
         max_entries: Option<u64>,
     ) -> Result<UnsignedHead> {
-        let mut tx = begin_write(&self.pool).await?;
+        let mut tx = begin_write(&self.pool, &self.timeouts).await?;
         let built = head::build(
             &mut tx,
             time_ms,
@@ -241,7 +293,7 @@ impl Store {
         log_signature: &[u8; 64],
         cosignatures: &[u8],
     ) -> Result<i64> {
-        let mut tx = begin_write(&self.pool).await?;
+        let mut tx = begin_write(&self.pool, &self.timeouts).await?;
         let id = head::commit(&mut tx, head, log_signature, cosignatures).await?;
         tx.commit().await?;
         Ok(id)
