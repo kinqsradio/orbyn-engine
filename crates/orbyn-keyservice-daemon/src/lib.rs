@@ -11,6 +11,8 @@
 //! structured log line; the off-machine sink is its own later change.
 
 pub mod api;
+pub mod cli;
+pub mod messages;
 pub mod tls;
 
 use std::sync::Arc;

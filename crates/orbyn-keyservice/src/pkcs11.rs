@@ -112,7 +112,26 @@ fn public_usage(allowed: &[Use]) -> Vec<Attribute> {
 }
 
 fn failed(err: CkError) -> HsmError {
-    HsmError::Failed(err.to_string())
+    use crate::HsmSetup;
+    // The causes an operator can fix get their own variant; anything else keeps its text, which
+    // never holds the PIN or a key.
+    match &err {
+        CkError::LibraryLoading(_) | CkError::MissingSymbol(_) => HsmError::Setup(HsmSetup::Module),
+        CkError::Pkcs11(rv, _) => match rv {
+            RvError::SlotIdInvalid => HsmError::Setup(HsmSetup::Slot),
+            RvError::PinIncorrect
+            | RvError::PinInvalid
+            | RvError::PinLenRange
+            | RvError::PinExpired
+            | RvError::PinLocked => HsmError::Setup(HsmSetup::Pin),
+            RvError::TokenNotPresent
+            | RvError::TokenNotRecognized
+            | RvError::DeviceError
+            | RvError::DeviceRemoved => HsmError::Setup(HsmSetup::Unreachable),
+            _ => HsmError::Failed(err.to_string()),
+        },
+        _ => HsmError::Failed(err.to_string()),
+    }
 }
 
 /// Where the HSM is: the PKCS#11 module, the slot and the user PIN (a secret).

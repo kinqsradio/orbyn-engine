@@ -20,7 +20,8 @@ use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 pub type Hsm = Spy<MemoryHsm>;
 
 pub struct Db {
-    admin: PgPool,
+    pub admin: PgPool,
+    options: PgConnectOptions,
     name: String,
     owner_role: String,
     runtime_role: String,
@@ -73,12 +74,32 @@ impl Db {
         let runtime = connect(&runtime_role).await.expect("runtime");
         Self {
             admin,
+            options,
             name,
             owner_role,
             runtime_role,
             owner,
             runtime,
         }
+    }
+
+    /// The database as the owner role, in the URL form the settings take.
+    pub fn owner_url(&self) -> String {
+        format!(
+            "postgres://{}@{}:{}/{}",
+            self.owner_role,
+            self.options.get_host(),
+            self.options.get_port(),
+            self.name
+        )
+    }
+
+    pub fn runtime_role(&self) -> &str {
+        &self.runtime_role
+    }
+
+    pub fn owner_role(&self) -> &str {
+        &self.owner_role
     }
 
     pub async fn store(&self) -> Store {

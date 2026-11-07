@@ -12,7 +12,6 @@ path = "src/main.rs"
 
 [dependencies]
 axum.workspace = true
-clap.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 orbyn-crypto.workspace = true

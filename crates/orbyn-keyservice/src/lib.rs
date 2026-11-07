@@ -51,6 +51,23 @@ pub enum HsmError {
     Failed(String),
     #[error("the HSM returned something that is not a valid key")]
     BadKey,
+    /// The HSM could not be used because of how it is set up, which an operator can fix. Told
+    /// apart from [`HsmError::Failed`] so a binary can name the setting at fault.
+    #[error("the HSM cannot be used: {0:?}")]
+    Setup(HsmSetup),
+}
+
+/// What is wrong with the HSM's settings or reachability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HsmSetup {
+    /// The PKCS#11 module cannot be loaded (`ORBYN_HSM_MODULE`).
+    Module,
+    /// The slot does not exist (`ORBYN_HSM_SLOT`).
+    Slot,
+    /// The PIN was not accepted: wrong, malformed, expired or locked (`ORBYN_HSM_PIN`).
+    Pin,
+    /// The module loaded but the token cannot be reached: removed, not present, or failing.
+    Unreachable,
 }
 
 /// What went wrong in the key service.

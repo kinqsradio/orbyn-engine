@@ -158,13 +158,7 @@ pub(crate) fn to_u64(n: i64) -> Result<u64> {
 /// the grants are reset to the same set each time. The roles themselves are made by whoever runs
 /// the database; this function creates neither.
 pub async fn migrate(owner: &PgPool, runtime_role: &str) -> Result<()> {
-    let valid = !runtime_role.is_empty()
-        && runtime_role.len() <= 63
-        && runtime_role.starts_with(|c: char| c.is_ascii_lowercase())
-        && runtime_role
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
-    if !valid {
+    if !valid_role_name(runtime_role) {
         return Err(StoreError::BadRole);
     }
     // The runtime role must be a plain role: a superuser, the owner, the owner of this database or
@@ -246,10 +240,31 @@ const TABLES: [&str; 6] = [
     "rate_events",
 ];
 
-/// Refuses a role that could undo the guards: a superuser or one that can create roles, **or a member
-/// of such a role**, or a member of the owner of this database, of schema `public`, of any of the key service's tables, or of any of its trigger
-/// functions (`ks_*`). Looks at the owners as they are, not at who ran the migration.
-async fn check_plain_role<'e, E>(executor: E, role: &str) -> Result<()>
+/// Why a role may not be the runtime role.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoleProblem {
+    /// There is no such role.
+    Missing,
+    /// It is, or belongs to, a superuser or a role that can create roles.
+    Privileged,
+    /// It belongs to the owner of the database, the schema, the tables or the trigger functions.
+    OwnerMember,
+}
+
+/// Whether `role` is a name `migrate` accepts: lowercase letters, digits and underscores, starting
+/// with a letter, at most 63 long.
+pub fn valid_role_name(role: &str) -> bool {
+    !role.is_empty()
+        && role.len() <= 63
+        && role.starts_with(|c: char| c.is_ascii_lowercase())
+        && role
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// What is wrong with `role` as the runtime role, if anything, judged against the owners as they
+/// are now. The same test [`migrate`] and [`Store::connect`] apply, with the reason kept.
+pub async fn runtime_role_problem<'e, E>(executor: E, role: &str) -> Result<Option<RoleProblem>>
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {
@@ -267,23 +282,40 @@ where
     .bind(role)
     .bind(&TABLES[..])
     .fetch_optional(executor)
-    .await?
-    .ok_or(StoreError::UnsafeRole)?;
+    .await?;
+    let Some(row) = row else {
+        return Ok(Some(RoleProblem::Missing));
+    };
     // `privileged`: the role, or any role it belongs to, is a superuser or can create roles. A
     // member can `SET ROLE` to that role, and a role that creates roles can make itself a member of
     // the one that owns the tables; either way the guards could be dropped.
+    if row.try_get::<bool, _>("privileged")? {
+        return Ok(Some(RoleProblem::Privileged));
+    }
     for column in [
-        "privileged",
         "database_owner",
         "schema_owner",
         "table_owner",
         "function_owner",
     ] {
         if row.try_get::<bool, _>(column)? {
-            return Err(StoreError::UnsafeRole);
+            return Ok(Some(RoleProblem::OwnerMember));
         }
     }
-    Ok(())
+    Ok(None)
+}
+
+/// Refuses a role that could undo the guards: a superuser or one that can create roles, **or a member
+/// of such a role**, or a member of the owner of this database, of schema `public`, of any of the key service's tables, or of any of its trigger
+/// functions (`ks_*`). Looks at the owners as they are, not at who ran the migration.
+async fn check_plain_role<'e, E>(executor: E, role: &str) -> Result<()>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    match runtime_role_problem(executor, role).await? {
+        None => Ok(()),
+        Some(_) => Err(StoreError::UnsafeRole),
+    }
 }
 
 /// The key service's store, on the runtime role's pool.
