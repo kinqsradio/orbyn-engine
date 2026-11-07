@@ -31,6 +31,9 @@ pub struct AuthSecrets {
     state_key: SymmetricKey,
     totp_key: SymmetricKey,
     digest_key: Zeroizing<[u8; 32]>,
+    /// A key of its own for the deleted-account tombstone, so no other digest (audit, token, email,
+    /// address) can stand in for it or be matched to it.
+    tombstone_key: Zeroizing<[u8; 32]>,
 }
 
 impl std::fmt::Debug for AuthSecrets {
@@ -42,6 +45,8 @@ impl std::fmt::Debug for AuthSecrets {
 const STATE_KEY_INFO: &[u8] = b"orbyn/auth-state-key/v1";
 const DIGEST_KEY_INFO: &[u8] = b"orbyn/auth-digest-key/v1";
 const TOTP_KEY_INFO: &[u8] = b"orbyn/totp-seal/v1";
+const TOMBSTONE_KEY_INFO: &[u8] = b"orbyn/account-tombstone-key/v1";
+const TOMBSTONE_LABEL: &[u8] = b"orbyn/account-tombstone/v1";
 const TOTP_SECRET_CONTEXT: &str = "orbyn/totp-secret/v1";
 const MAIL_CONTEXT: &str = "orbyn/mail-job/v1";
 
@@ -64,17 +69,21 @@ impl AuthSecrets {
         let mut state_key = Zeroizing::new([0u8; 32]);
         let mut digest_key = Zeroizing::new([0u8; 32]);
         let mut totp_key = Zeroizing::new([0u8; 32]);
+        let mut tombstone_key = Zeroizing::new([0u8; 32]);
         hk.expand(STATE_KEY_INFO, state_key.as_mut())
             .map_err(|_| SecretsError::Invalid)?;
         hk.expand(DIGEST_KEY_INFO, digest_key.as_mut())
             .map_err(|_| SecretsError::Invalid)?;
         hk.expand(TOTP_KEY_INFO, totp_key.as_mut())
             .map_err(|_| SecretsError::Invalid)?;
+        hk.expand(TOMBSTONE_KEY_INFO, tombstone_key.as_mut())
+            .map_err(|_| SecretsError::Invalid)?;
         Ok(Self {
             setup,
             state_key: SymmetricKey::from_bytes(*state_key),
             totp_key: SymmetricKey::from_bytes(*totp_key),
             digest_key,
+            tombstone_key,
         })
     }
 
@@ -123,6 +132,18 @@ impl AuthSecrets {
             .map(Zeroizing::new)
     }
 
+    /// What the tombstone of a deleted account is keyed by: a SHA-256 over the tombstone key, a
+    /// fixed label and the account id. Its own key (own HKDF label), so it matches no other digest.
+    pub(crate) fn tombstone_subject(&self, account: Uuid) -> [u8; 32] {
+        Sha256::new()
+            .chain_update(self.tombstone_key.as_slice())
+            .chain_update((TOMBSTONE_LABEL.len() as u64).to_be_bytes())
+            .chain_update(TOMBSTONE_LABEL)
+            .chain_update(account.as_bytes())
+            .finalize()
+            .into()
+    }
+
     /// A keyed SHA-256 digest of `data` for `label`. Without the key, a digest of
     /// a small space such as IPv4 addresses or six-digit codes cannot be reversed
     /// by trying every value.
@@ -140,6 +161,42 @@ impl AuthSecrets {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_tombstone_has_a_key_and_a_label_of_its_own() -> Result<(), SecretsError> {
+        let a = AuthSecrets::from_encoded(&AuthSecrets::generate())?;
+        // The derive labels differ from every other key's, and so do the derived keys.
+        let infos = [
+            STATE_KEY_INFO,
+            DIGEST_KEY_INFO,
+            TOTP_KEY_INFO,
+            TOMBSTONE_KEY_INFO,
+        ];
+        for (i, one) in infos.iter().enumerate() {
+            for other in &infos[i + 1..] {
+                assert_ne!(one, other);
+            }
+        }
+        assert_ne!(*a.tombstone_key, *a.digest_key);
+        // No other digest of the same id is the tombstone's, whatever its label.
+        let id = Uuid::new_v4();
+        let subject = a.tombstone_subject(id);
+        for label in [
+            "account-tombstone",
+            "orbyn/account-tombstone/v1",
+            "totp-account",
+            "account-delete-schedule",
+            "delete-unused-mail",
+            "ip",
+        ] {
+            assert_ne!(subject, a.digest(label, id.as_bytes()), "{label}");
+        }
+        assert_eq!(subject, a.tombstone_subject(id));
+        assert_ne!(subject, a.tombstone_subject(Uuid::new_v4()));
+        let other = AuthSecrets::from_encoded(&AuthSecrets::generate())?;
+        assert_ne!(subject, other.tombstone_subject(id));
+        Ok(())
+    }
 
     #[test]
     fn a_generated_setup_round_trips_and_keys_digests() -> Result<(), SecretsError> {

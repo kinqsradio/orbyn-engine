@@ -297,6 +297,32 @@ impl Accounts {
         )
     }
 
+    /// The UTC day `account_id` was deleted, if a tombstone says so: one indexed lookup whether or
+    /// not a row exists, and nothing else read. Limited per IP prefix, for every id alike. A live
+    /// account and an id nobody used look the same (`None`).
+    pub async fn deleted_on(
+        &self,
+        client: &Client,
+        account_id: Uuid,
+    ) -> Result<Option<chrono::NaiveDate>> {
+        if !limits::allow(
+            &self.pool,
+            "account-status",
+            &self.ip_prefix_digest(client),
+            self.limits.account_status_per_prefix,
+        )
+        .await?
+        {
+            return Err(AccountError::TooManyAttempts);
+        }
+        Ok(
+            sqlx::query_scalar("SELECT deleted_at FROM account_tombstones WHERE subject = $1")
+                .bind(self.secrets.tombstone_subject(account_id).as_slice())
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
     /// Accounts whose deletion is due, the earliest first, for the worker.
     pub async fn due_for_deletion(&self, limit: i64) -> Result<Vec<Uuid>> {
         Ok(sqlx::query_scalar(
@@ -467,6 +493,17 @@ impl Accounts {
         if removed != 1 {
             return Ok(false);
         }
+
+        // The tombstone: the keyed digest of the id and the UTC day, nothing else (see
+        // "Deleted-account tombstone" in docs/architecture.md). Both deletion paths come through
+        // here.
+        sqlx::query(
+            "INSERT INTO account_tombstones (subject, deleted_at)
+             VALUES ($1, (now() AT TIME ZONE 'utc')::date) ON CONFLICT DO NOTHING",
+        )
+        .bind(self.secrets.tombstone_subject(account_id).as_slice())
+        .execute(&mut **tx)
+        .await?;
 
         // The audit log keeps its history without a way back. After the DELETE, so a row written
         // meanwhile by a request that does not take the account's lock is caught too: this

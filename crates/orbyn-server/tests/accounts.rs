@@ -6235,3 +6235,317 @@ async fn the_limits_hold() {
         StatusCode::NO_CONTENT
     );
 }
+
+// ---- The deleted-account tombstone ----
+
+const STATUS: &str = "/v1/accounts/status";
+
+fn status_limits() -> Limits {
+    Limits {
+        account_status_per_prefix: Limit::new(10_000, Duration::from_secs(3600)),
+        ..unused_limits()
+    }
+}
+
+impl Server {
+    async fn status_raw(&self, id: &str) -> (StatusCode, Vec<(String, String)>, Vec<u8>) {
+        self.raw(
+            self.ip,
+            Method::POST,
+            STATUS,
+            Some(json!({"account_id": id})),
+        )
+        .await
+    }
+
+    async fn tombstones(&self) -> i64 {
+        orbyn_core::sqlx::query_scalar("SELECT count(*) FROM account_tombstones")
+            .fetch_one(self.db.pool())
+            .await
+            .expect("count")
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn both_deletion_paths_leave_a_tombstone_and_the_status_tells_only_of_deleted_accounts() {
+    let _turn = TURN.lock().await;
+    let server = server_with(status_limits()).await;
+    let today_before = chrono::Utc::now().date_naive();
+
+    // New account ids are random version-4 UUIDs: no sequence, no time-ordered part.
+    let mut ids = Vec::new();
+    for _ in 0..4 {
+        let (_, _, session) = unused_account(&server).await;
+        ids.push(uuid_of(&session["account_id"]));
+    }
+    for id in &ids {
+        assert_eq!(id.get_version_num(), 4, "{id}");
+        assert_eq!(id.get_variant(), uuid::Variant::RFC4122);
+    }
+    let (scheduled, unused_email) = (ids[0], {
+        // The delete-unused path: ask, decide, confirm.
+        let email: String =
+            orbyn_core::sqlx::query_scalar("SELECT email FROM accounts WHERE id = $1")
+                .bind(ids[1])
+                .fetch_one(server.db.pool())
+                .await
+                .expect("email");
+        email
+    });
+    let live = ids[2];
+
+    // Scheduled path: due now, deleted by the worker.
+    let before = server.tombstones().await;
+    server.make_due(scheduled).await;
+    assert!(
+        server
+            .worker()
+            .delete_if_due(scheduled)
+            .await
+            .expect("worker")
+    );
+    assert_eq!(
+        server.tombstones().await,
+        before + 1,
+        "exactly one tombstone"
+    );
+
+    // delete-unused path.
+    server.ask_unused(&unused_email).await;
+    server.decide_requests(status_limits()).await;
+    let token = server.unused_tokens(&unused_email).await.remove(0);
+    let before = server.tombstones().await;
+    assert_eq!(
+        server.confirm_unused(&token).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        server.tombstones().await,
+        before + 1,
+        "exactly one tombstone"
+    );
+    let today_after = chrono::Utc::now().date_naive();
+
+    // The status: 200 with the UTC day for both deleted accounts.
+    for id in [scheduled, ids[1]] {
+        let (status, _, body) = server.status_raw(&id.to_string()).await;
+        assert_eq!(status, StatusCode::OK);
+        let body: Value = serde_json::from_slice(&body).expect("json");
+        let day = body["deleted_at"].as_str().expect("day");
+        assert!(
+            [today_before, today_after]
+                .iter()
+                .any(|d| day == format!("{d}T00:00:00Z")),
+            "{day}"
+        );
+        assert_eq!(body.as_object().expect("object").len(), 1, "nothing else");
+    }
+    // A live account, and an id nobody used, are the same 404 down to the bytes.
+    let live_answer = server.status_raw(&live.to_string()).await;
+    let unknown_answer = server.status_raw(&Uuid::new_v4().to_string()).await;
+    assert_eq!(live_answer.0, StatusCode::NOT_FOUND);
+    assert_eq!(live_answer, unknown_answer);
+    // Not an id at all.
+    let (status, body) = server
+        .call(
+            Method::POST,
+            STATUS,
+            None,
+            Some(json!({"account_id": "nope"})),
+        )
+        .await;
+    assert_eq!(
+        (status, &body["code"]),
+        (StatusCode::BAD_REQUEST, &json!("invalid_request"))
+    );
+
+    // The table holds a digest and a day, and nothing else; the digest is not the id.
+    let columns: Vec<String> = orbyn_core::sqlx::query_scalar(
+        "SELECT column_name::text FROM information_schema.columns
+         WHERE table_name = 'account_tombstones' ORDER BY column_name",
+    )
+    .fetch_all(server.db.pool())
+    .await
+    .expect("columns");
+    assert_eq!(columns, ["deleted_at", "subject"]);
+    let leaked: i64 = orbyn_core::sqlx::query_scalar(
+        "SELECT count(*) FROM account_tombstones WHERE subject = ANY($1)",
+    )
+    .bind([scheduled, ids[1]].map(|id| id.as_bytes().to_vec()))
+    .fetch_one(server.db.pool())
+    .await
+    .expect("leak");
+    assert_eq!(leaked, 0, "no row is keyed by the plain id");
+
+    // The same address signs up again with a new id, which is not reported deleted.
+    let again = server
+        .register(
+            &unused_email,
+            b"another password",
+            &DeviceKeys::generate().expect("keys"),
+        )
+        .await;
+    let new_id = uuid_of(&again["account_id"]);
+    assert_ne!(new_id, ids[1]);
+    assert_eq!(
+        server.status_raw(&new_id.to_string()).await.0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn the_status_is_limited_per_prefix_and_takes_the_same_time_for_every_id() {
+    let _turn = TURN.lock().await;
+    let limits = Limits {
+        account_status_per_prefix: Limit::new(2, Duration::from_secs(3600)),
+        ..unused_limits()
+    };
+    let server = server_with(limits).await;
+    let id = Uuid::new_v4().to_string();
+    for _ in 0..2 {
+        assert_eq!(server.status_raw(&id).await.0, StatusCode::NOT_FOUND);
+    }
+    let (status, _, body) = server.status_raw(&id).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(String::from_utf8_lossy(&body).contains("too_many_attempts"));
+
+    // Timing: with the limit out of the way, a deleted id and an unknown one take about as long.
+    let server = server_with(status_limits()).await;
+    let (_, _, session) = unused_account(&server).await;
+    let gone = uuid_of(&session["account_id"]);
+    server.make_due(gone).await;
+    assert!(server.worker().delete_if_due(gone).await.expect("worker"));
+    let mut medians = Vec::new();
+    for deleted in [true, false] {
+        let mut times = Vec::new();
+        for _ in 0..40 {
+            let id = if deleted { gone } else { Uuid::new_v4() }.to_string();
+            let start = std::time::Instant::now();
+            server.status_raw(&id).await;
+            times.push(start.elapsed());
+        }
+        times.sort();
+        medians.push(times[times.len() / 2]);
+    }
+    let (low, high) = (medians[0].min(medians[1]), medians[0].max(medians[1]));
+    assert!(high < low * 4 + Duration::from_millis(40), "{medians:?}");
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn tombstones_are_pruned_after_four_hundred_days_and_not_before() {
+    let _turn = TURN.lock().await;
+    let server = server_with(status_limits()).await;
+    let (old, young) = (vec![1u8; 31], vec![2u8; 31]);
+    let (mut old_key, mut young_key) = (old.clone(), young.clone());
+    old_key.push(rand32()[0]);
+    young_key.push(rand32()[0]);
+    let mut edge_key = vec![3u8; 31];
+    edge_key.push(rand32()[0]);
+    for (key, days) in [(&old_key, 401), (&edge_key, 400), (&young_key, 399)] {
+        orbyn_core::sqlx::query(
+            "INSERT INTO account_tombstones (subject, deleted_at)
+             VALUES ($1, (now() AT TIME ZONE 'utc')::date - $2::int)
+             ON CONFLICT (subject) DO UPDATE SET deleted_at = EXCLUDED.deleted_at",
+        )
+        .bind(key)
+        .bind(days)
+        .execute(server.db.pool())
+        .await
+        .expect("insert");
+    }
+    orbyn_core::accounts::limits::prune(server.db.pool())
+        .await
+        .expect("prune");
+    let left: Vec<Vec<u8>> = orbyn_core::sqlx::query_scalar(
+        "SELECT subject FROM account_tombstones WHERE subject = ANY($1)",
+    )
+    .bind(vec![old_key.clone(), edge_key.clone(), young_key.clone()])
+    .fetch_all(server.db.pool())
+    .await
+    .expect("left");
+    let mut expected = vec![edge_key.clone(), young_key.clone()];
+    let mut left = left;
+    expected.sort();
+    left.sort();
+    assert_eq!(left, expected, "401 days goes; exactly 400 days stays");
+    orbyn_core::sqlx::query("DELETE FROM account_tombstones WHERE subject = ANY($1)")
+        .bind(vec![edge_key.clone(), young_key.clone()])
+        .execute(server.db.pool())
+        .await
+        .expect("clean");
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_failed_deletion_leaves_no_tombstone() {
+    let _turn = TURN.lock().await;
+    let server = server_with(status_limits()).await;
+    let (_, _, session) = unused_account(&server).await;
+    let account = uuid_of(&session["account_id"]);
+    server.make_due(account).await;
+    let pool = server.db.pool();
+    // Make the deletion fail after the tombstone is written: its last audit row is refused while a
+    // marker exists. Only this test makes the marker, and deletions take TURN.
+    orbyn_core::sqlx::query(
+        "CREATE OR REPLACE FUNCTION fail_erase_marker() RETURNS trigger AS $$
+         BEGIN
+             IF EXISTS (SELECT 1 FROM auth_attempts WHERE action = 'fail-erase-marker') THEN
+                 RAISE EXCEPTION 'the deletion fails here';
+             END IF;
+             RETURN NEW;
+         END; $$ LANGUAGE plpgsql",
+    )
+    .execute(pool)
+    .await
+    .expect("function");
+    orbyn_core::sqlx::query(
+        "CREATE TRIGGER fail_erase BEFORE INSERT ON audit_log
+         FOR EACH ROW WHEN (NEW.action = 'account.deleted') EXECUTE FUNCTION fail_erase_marker()",
+    )
+    .execute(pool)
+    .await
+    .expect("trigger");
+    orbyn_core::sqlx::query(
+        "INSERT INTO auth_attempts (action, subject) VALUES ('fail-erase-marker', decode(repeat('00', 32), 'hex'))",
+    )
+    .execute(pool)
+    .await
+    .expect("marker");
+    let before = server.tombstones().await;
+    let failed = server.worker().delete_if_due(account).await;
+    // Whatever happens, take the trap down first.
+    orbyn_core::sqlx::query("DELETE FROM auth_attempts WHERE action = 'fail-erase-marker'")
+        .execute(pool)
+        .await
+        .expect("marker gone");
+    orbyn_core::sqlx::query("DROP TRIGGER fail_erase ON audit_log")
+        .execute(pool)
+        .await
+        .expect("trigger gone");
+    assert!(failed.is_err(), "the deletion fails");
+    assert_eq!(server.tombstones().await, before, "no tombstone");
+    let exists: bool =
+        orbyn_core::sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM accounts WHERE id = $1)")
+            .bind(account)
+            .fetch_one(pool)
+            .await
+            .expect("exists");
+    assert!(exists, "the account is still there");
+    assert_eq!(
+        server.status_raw(&account.to_string()).await.0,
+        StatusCode::NOT_FOUND,
+        "a live account is not shown as deleted"
+    );
+    // And it deletes, with its tombstone, once the trap is gone.
+    assert!(
+        server
+            .worker()
+            .delete_if_due(account)
+            .await
+            .expect("worker")
+    );
+    assert_eq!(server.tombstones().await, before + 1);
+}
