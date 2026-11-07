@@ -117,10 +117,18 @@ async fn a_fetch_racing_a_purge_sees_the_deletes_or_is_told_to_start_over() {
     reached.notified().await;
     let mut removed = 0;
     for _ in 0..50 {
-        removed += crate::purge(db.pool(), Duration::from_secs(30 * 86_400), 1000, 100)
-            .await
-            .expect("purge")
-            .records;
+        // Scoped to this test's account: the database is shared with the other tests, whose rows
+        // a global purge would also take.
+        removed += crate::purge_accounts(
+            db.pool(),
+            &[me.account_id],
+            Duration::from_secs(30 * 86_400),
+            1000,
+            100,
+        )
+        .await
+        .expect("purge")
+        .records;
         let left: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM records WHERE deleted AND zone_id =
                  (SELECT id FROM zones WHERE owner_id = $1)",
@@ -158,4 +166,132 @@ async fn a_fetch_racing_a_purge_sees_the_deletes_or_is_told_to_start_over() {
         store.fetch_changes(&me, "list", Some(&early), None).await,
         Err(StoreError::TokenExpired)
     ));
+}
+
+/// What the failing run looked like (a counter at -100) cannot happen to real data: every write
+/// changes rows and counters together under the zone's row lock, and the purge takes the same lock
+/// and subtracts exactly the rows it deleted. This runs real uploads and real purges against one
+/// zone at once and checks the counters equal the rows at the end.
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn the_counters_equal_the_rows_when_uploads_and_purges_race() {
+    let url = std::env::var("DATABASE_URL").expect("set DATABASE_URL to run the Postgres tests");
+    let db = Database::connect(&url).await.expect("connect");
+    db.migrate().await.expect("migrate");
+    let hub = Hub::start(db.pool().clone());
+    // Many uploads from one device: the per-minute limits are not what this is about.
+    let limit = |max| orbyn_core::accounts::Limit::new(max, Duration::from_secs(60));
+    let store = Store::new(db.pool().clone(), hub).with_limits(Limits {
+        uploads_per_device: limit(100_000),
+        uploads_per_account: limit(100_000),
+        max_uploads_in_flight: 64,
+        max_uploads_in_flight_per_address: 64,
+        max_uploads_in_flight_global: 256,
+        ..Limits::default()
+    });
+    let me = session(&db).await;
+    store.create_zone(&me, "list").await.expect("zone");
+
+    // 300 tombstones to purge: saved, then deleted, then aged past the window.
+    for chunk in 0..3 {
+        let ids: Vec<String> = (0..100).map(|i| format!("old-{chunk}-{i}")).collect();
+        let saved = store
+            .upload(
+                &me,
+                "list",
+                &upload(ids.iter().map(|id| save(id)).collect()),
+            )
+            .await
+            .expect("saves");
+        let deletes = saved
+            .records
+            .iter()
+            .map(|r| Change::Delete {
+                record_id: r.record_id.clone(),
+                expected_version: r.version,
+                proof: None,
+            })
+            .collect();
+        store
+            .upload(&me, "list", &upload(deletes))
+            .await
+            .expect("deletes");
+    }
+    sqlx::query(
+        "UPDATE records SET modified_at = now() - interval '40 days'
+         WHERE deleted AND zone_id = (SELECT id FROM zones WHERE owner_id = $1)",
+    )
+    .bind(me.account_id)
+    .execute(db.pool())
+    .await
+    .expect("age");
+
+    // Purges (small batches, so each takes the zone lock many times) against uploads of new
+    // records and deletes of them, all at once.
+    let mut tasks = Vec::new();
+    for _ in 0..3 {
+        let pool = db.pool().clone();
+        let account = me.account_id;
+        tasks.push(tokio::spawn(async move {
+            for _ in 0..30 {
+                crate::purge_accounts(&pool, &[account], Duration::from_secs(30 * 86_400), 7, 50)
+                    .await
+                    .expect("purge");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }));
+    }
+    for writer in 0..3 {
+        let store = store.clone();
+        tasks.push(tokio::spawn(async move {
+            for round in 0..15 {
+                let ids: Vec<String> = (0..10)
+                    .map(|i| format!("new-{writer}-{round}-{i}"))
+                    .collect();
+                let saved = store
+                    .upload(
+                        &me,
+                        "list",
+                        &upload(ids.iter().map(|id| save(id)).collect()),
+                    )
+                    .await
+                    .expect("save");
+                let deletes = saved
+                    .records
+                    .iter()
+                    .take(5)
+                    .map(|r| Change::Delete {
+                        record_id: r.record_id.clone(),
+                        expected_version: r.version,
+                        proof: None,
+                    })
+                    .collect();
+                store
+                    .upload(&me, "list", &upload(deletes))
+                    .await
+                    .expect("delete");
+            }
+        }));
+    }
+    for task in tasks {
+        task.await.expect("task");
+    }
+
+    let (live, total, rows, live_rows): (i32, i64, i64, i64) = sqlx::query_as(
+        "SELECT z.live_records, z.total_records::bigint,
+                (SELECT count(*) FROM records r WHERE r.zone_id = z.id),
+                (SELECT count(*) FROM records r WHERE r.zone_id = z.id AND NOT r.deleted)
+         FROM zones z WHERE z.owner_id = $1 AND z.name = 'list'",
+    )
+    .bind(me.account_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("counters");
+    assert!(total >= 0 && live >= 0);
+    assert_eq!(total, rows, "the total counter is the number of rows");
+    assert_eq!(
+        i64::from(live),
+        live_rows,
+        "the live counter is the number of live rows"
+    );
 }

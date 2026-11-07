@@ -293,6 +293,12 @@ mod tests {
             .execute(&pool)
             .await
             .expect("zones");
+            // The rows and the counters the limits and the purge read go in together, in one
+            // transaction: a purge running meanwhile (another test's, on this shared database)
+            // must never see tombstones whose counter has not caught up, or it would take the
+            // counter below zero. Production keeps rows and counters together under the zone lock;
+            // this makes the fixture do the same.
+            let mut tx = pool.begin().await.expect("transaction");
             sqlx::query(
                 "INSERT INTO records (zone_id, record_id, record_type, version, ciphertext,
                                       wrapped_key, author_device_id, modified_at, deleted)
@@ -302,7 +308,7 @@ mod tests {
                  FROM generate_series(1, 150000) g",
             )
             .bind(account)
-            .execute(&pool)
+            .execute(&mut *tx)
             .await
             .expect("live records");
             sqlx::query(
@@ -314,7 +320,7 @@ mod tests {
                  FROM generate_series(1, 100) g",
             )
             .bind(account)
-            .execute(&pool)
+            .execute(&mut *tx)
             .await
             .expect("tombstones");
             // The counters the limits and the purge read agree with the rows.
@@ -323,14 +329,15 @@ mod tests {
                  WHERE owner_id = $1 AND name = 'z1'",
             )
             .bind(account)
-            .execute(&pool)
+            .execute(&mut *tx)
             .await
             .expect("counters");
             sqlx::query("UPDATE zones SET total_records = 100 WHERE owner_id = $1 AND name = 'z2'")
                 .bind(account)
-                .execute(&pool)
+                .execute(&mut *tx)
                 .await
                 .expect("counters");
+            tx.commit().await.expect("commit");
             sqlx::query("ANALYZE records")
                 .execute(&pool)
                 .await
