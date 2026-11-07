@@ -289,6 +289,7 @@ impl Accounts {
         self.allow_sign_in_attempt(client, account_id).await?;
 
         let mut tx = self.pool.begin().await?;
+        Self::lock_account_shared(&mut tx, account_id).await?;
         // The state is read again under its lock: two requests with one login id take turns.
         let state: Option<(Vec<u8>, i32)> = sqlx::query_as(
             "SELECT sealed, attempts FROM second_factor_states

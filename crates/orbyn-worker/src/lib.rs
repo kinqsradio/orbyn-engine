@@ -118,9 +118,10 @@ where
 /// the auth setup, which the digests that key the account's rate-limit rows come from: without it
 /// nothing is deleted, and that is logged.
 ///
-/// Returns false when deletions are due and this worker cannot do them (no auth setup): it is not
-/// healthy, and says so by stopping, which the process reports as a failure.
-async fn delete_due_accounts(db: &Database, mailer: &Mailer) -> bool {
+/// A worker with no auth setup (development with `ORBYN_MAIL=log`) cannot do them: it logs an error
+/// on each tick that finds one due and carries on with everything else (purging, pruning, mail), so
+/// one due account never takes the worker down.
+async fn delete_due_accounts(db: &Database, mailer: &Mailer) {
     let Some(secrets) = mailer.secrets.clone() else {
         let due: Result<bool, _> = orbyn_core::sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM accounts WHERE deletion_scheduled_at <= now())",
@@ -129,11 +130,10 @@ async fn delete_due_accounts(db: &Database, mailer: &Mailer) -> bool {
         .await;
         if due.unwrap_or(false) {
             tracing::error!(
-                "account deletions are due, but this worker has no ORBYN_AUTH_SETUP to delete them"
+                "account deletions are due, but this worker has no ORBYN_AUTH_SETUP to delete them; skipping them"
             );
-            return false;
         }
-        return true;
+        return;
     };
     let accounts = orbyn_core::Accounts::with_shared_secrets(db.pool().clone(), secrets);
     match accounts.due_for_deletion(DELETE_BATCH).await {
@@ -150,7 +150,6 @@ async fn delete_due_accounts(db: &Database, mailer: &Mailer) -> bool {
         }
         Err(err) => tracing::warn!(error = %err, "could not look for accounts due for deletion"),
     }
-    true
 }
 
 /// Claims and runs jobs until `stop` turns true.
@@ -186,9 +185,7 @@ pub async fn run(
         }
         if tokio::time::Instant::now() >= next_delete {
             next_delete = tokio::time::Instant::now() + DELETE_EVERY;
-            if !delete_due_accounts(&db, &mailer).await {
-                return;
-            }
+            delete_due_accounts(&db, &mailer).await;
         }
         if tokio::time::Instant::now() >= next_purge {
             match orbyn_store::purge(db.pool(), retention, PURGE_BATCH, PURGE_STEPS).await {
@@ -364,11 +361,12 @@ mod tests {
         assert_eq!(out, None);
     }
 
-    /// With deletions due and no auth setup the worker cannot do its job, so it stops, which the
-    /// process reports as a failure, instead of idling as if it were well.
+    /// With deletions due and no auth setup the worker cannot delete them, so it skips them and says
+    /// so, and keeps running its other work: a queued job still runs and the worker still stops when
+    /// asked.
     #[tokio::test]
     #[ignore = "needs DATABASE_URL"]
-    async fn a_worker_that_cannot_delete_due_accounts_stops() {
+    async fn a_worker_that_cannot_delete_due_accounts_skips_them_and_keeps_working() {
         let url =
             std::env::var("DATABASE_URL").expect("set DATABASE_URL to run the Postgres tests");
         let db = Database::connect(&url).await.expect("connect");
@@ -383,23 +381,51 @@ mod tests {
         .execute(db.pool())
         .await
         .expect("account");
-        let (_stop, rx) = watch::channel(false);
-        let ended = tokio::time::timeout(
-            Duration::from_secs(20),
-            run(
-                db.clone(),
-                "worker-test".into(),
-                Duration::from_secs(86_400),
-                Mailer::log_only(),
-                rx,
-            ),
-        )
-        .await;
+        let job = jobs::enqueue(db.pool(), "noop", Default::default(), None)
+            .await
+            .expect("job");
+        let (stop, rx) = watch::channel(false);
+        let mut worker = tokio::spawn(run(
+            db.clone(),
+            "worker-test".into(),
+            Duration::from_secs(86_400),
+            Mailer::log_only(),
+            rx,
+        ));
+        // The queued job is done although a deletion was due (and skipped) on the first tick.
+        let mut state = String::new();
+        for _ in 0..40 {
+            state = orbyn_core::sqlx::query_scalar("SELECT state FROM jobs WHERE id = $1")
+                .bind(job)
+                .fetch_one(db.pool())
+                .await
+                .expect("job state");
+            if state == "done" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        assert!(
+            !worker.is_finished(),
+            "the worker stopped with deletions due"
+        );
+        stop.send(true).expect("stop");
+        tokio::time::timeout(Duration::from_secs(10), &mut worker)
+            .await
+            .expect("it stops when asked")
+            .expect("task");
+        let left: i64 =
+            orbyn_core::sqlx::query_scalar("SELECT count(*) FROM accounts WHERE id = $1")
+                .bind(id)
+                .fetch_one(db.pool())
+                .await
+                .expect("count");
         orbyn_core::sqlx::query("DELETE FROM accounts WHERE id = $1")
             .bind(id)
             .execute(db.pool())
             .await
             .expect("clean");
-        assert!(ended.is_ok(), "the worker kept running with deletions due");
+        assert_eq!(left, 1, "nothing was deleted");
+        assert_eq!(state, "done", "the other work ran");
     }
 }

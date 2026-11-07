@@ -5217,3 +5217,174 @@ async fn the_email_link_cancels_once_without_a_sign_in_and_a_repeat_request_keep
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(server.exists(account).await);
 }
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn an_approval_waits_for_the_account_lock_before_touching_its_rows() {
+    let _turn = TURN.lock().await;
+    let server = server().await;
+    let p = pair(&server).await;
+    server.approve_fully(&p).await; // both devices trusted: either can start another approval
+    let account = p.account_id;
+    // An open approval row already exists, so a second `create_approval` has a row to update.
+    let (status, body, _) = server.start_approval(&p).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // The deletion holds the account lock (it takes it first, then deletes the account's rows).
+    let mut deleting = server.db.pool().begin().await.expect("tx");
+    orbyn_core::sqlx::query("SELECT id FROM accounts WHERE id = $1 FOR UPDATE")
+        .bind(account)
+        .execute(&mut *deleting)
+        .await
+        .expect("lock");
+    let again = server.start_approval(&p);
+    let check = async {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // The request is waiting for the account. It has not locked the approval row: taking that
+        // row without waiting works. Before the fix it held the row and waited for the account, the
+        // opposite order of the deletion, which deadlocks.
+        let mut other = server.db.pool().begin().await.expect("tx");
+        let row = orbyn_core::sqlx::query(
+            "SELECT id FROM device_approvals WHERE account_id = $1 FOR UPDATE NOWAIT",
+        )
+        .bind(account)
+        .fetch_all(&mut *other)
+        .await;
+        other.rollback().await.expect("rollback");
+        deleting.commit().await.expect("release");
+        row.is_ok()
+    };
+    let ((status, body, _), row_free) = tokio::join!(again, check);
+    assert!(
+        row_free,
+        "the approval request locked its row before the account"
+    );
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+/// Runs `op` while the test holds the account lock as the deletion does (it takes the account, then
+/// deletes its rows). While `op` waits, it must not have finished and must not hold any row `free_sql`
+/// selects (`$1` is the account): those rows can be taken without waiting. A lock moved after the rows,
+/// or removed, fails one of the two. Then the lock is released and `op`'s answer returned.
+async fn waits_for_the_account_before_its_rows<T>(
+    server: &Server,
+    account: Uuid,
+    free_sql: &'static str,
+    op: impl Future<Output = T>,
+) -> T {
+    let mut op = Box::pin(op);
+    let mut deleting = server.db.pool().begin().await.expect("tx");
+    orbyn_core::sqlx::query("SELECT id FROM accounts WHERE id = $1 FOR UPDATE")
+        .bind(account)
+        .execute(&mut *deleting)
+        .await
+        .expect("lock");
+    // Wait until something is really waiting for a lock (the operation's own client-side work can take a
+    // while), never past ten seconds, and never letting the operation finish.
+    let mut waiting = false;
+    for _ in 0..100 {
+        tokio::select! {
+            _ = &mut op => panic!("the operation finished while the account was locked"),
+            () = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+        let waits: i64 = orbyn_core::sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+             WHERE datname = current_database() AND wait_event_type = 'Lock' AND pid <> pg_backend_pid()",
+        )
+        .fetch_one(server.db.pool())
+        .await
+        .expect("waits");
+        if waits > 0 {
+            waiting = true;
+            break;
+        }
+    }
+    assert!(waiting, "the operation never waited for the account lock");
+    let mut probe = server.db.pool().begin().await.expect("tx");
+    let rows = orbyn_core::sqlx::query(orbyn_core::sqlx::AssertSqlSafe(format!(
+        "{free_sql} FOR UPDATE NOWAIT"
+    )))
+    .bind(account)
+    .fetch_all(&mut *probe)
+    .await;
+    probe.rollback().await.expect("rollback");
+    deleting.commit().await.expect("release");
+    assert!(
+        rows.is_ok(),
+        "the operation locked its rows before the account"
+    );
+    op.await
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn an_approval_code_waits_for_the_account_lock_before_touching_its_rows() {
+    let _turn = TURN.lock().await;
+    let server = server().await;
+    for right in [false, true] {
+        let p = pair(&server).await;
+        let (status, body, run) = server.start_approval(&p).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let sas = server.exchange(&p, &run).await;
+        let code = if right { sas } else { "000000".to_owned() };
+        let (status, body) = waits_for_the_account_before_its_rows(
+            &server,
+            p.account_id,
+            "SELECT id FROM device_approvals WHERE account_id = $1",
+            server.step(token(&p.b_session), &run, "code", json!({"code": code})),
+        )
+        .await;
+        // Right: the device is trusted. Wrong: the approval is closed, as the answer says.
+        assert!(
+            (right && status == StatusCode::OK) || (!right && status.is_client_error()),
+            "{right} {status} {body}"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_sign_in_of_a_known_device_waits_for_the_account_lock_before_its_device_row() {
+    let _turn = TURN.lock().await;
+    let server = server().await;
+    let email = email();
+    let laptop = DeviceKeys::generate().expect("keys");
+    let session = server.register(&email, b"correct horse", &laptop).await;
+    let account = uuid_of(&session["account_id"]);
+    // The same device signs in again. The start (which writes the sign-in state) is done first, so what
+    // waits is `complete_login`, which reads and locks the device row.
+    let (login, status, started) = server.login_start(&email, b"correct horse").await;
+    assert_eq!(status, StatusCode::OK, "{started}");
+    let finish = login
+        .finish(b"correct horse", &unb64(&started["credential_response"]))
+        .expect("right password");
+    let (status, again) = waits_for_the_account_before_its_rows(
+        &server,
+        account,
+        "SELECT id FROM devices WHERE account_id = $1",
+        server.login_finish(&started, &finish.finalization, &laptop),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again["device_id"], session["device_id"]);
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn the_second_factor_step_waits_for_the_account_lock_before_its_state_row() {
+    let _turn = TURN.lock().await;
+    let server = server_pinned(Limits::default()).await;
+    let p = protected(&server).await;
+    let account = uuid_of(&p.session["account_id"]);
+    let phone = DeviceKeys::generate().expect("keys");
+    let login_id = server.password_step(&p.email, b"pw", &phone).await;
+    let code = code_for(&p.secret, 1);
+    let (status, body) = waits_for_the_account_before_its_rows(
+        &server,
+        account,
+        "SELECT id FROM second_factor_states WHERE account_id = $1",
+        server.second_factor(&login_id, Some(&code), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
