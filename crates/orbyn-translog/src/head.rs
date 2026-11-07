@@ -40,6 +40,31 @@ impl UnsignedHead {
         out
     }
 
+    /// Reads the canonical bytes, the exact inverse of [`UnsignedHead::encode`]: the context, then
+    /// the fields, and nothing else.
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let rest = bytes.strip_prefix(LABEL)?;
+        let (size, rest) = rest.split_first_chunk::<8>()?;
+        let (log_root, rest) = rest.split_first_chunk::<32>()?;
+        let (service_map_root, rest) = rest.split_first_chunk::<32>()?;
+        let (identity_map_root, rest) = rest.split_first_chunk::<32>()?;
+        let (time_ms, rest) = rest.split_first_chunk::<8>()?;
+        let (prev_head_hash, rest) = rest.split_first_chunk::<32>()?;
+        let (version, rest) = rest.split_first_chunk::<4>()?;
+        if !rest.is_empty() {
+            return None;
+        }
+        Some(Self {
+            size: u64::from_be_bytes(*size),
+            log_root: *log_root,
+            service_map_root: *service_map_root,
+            identity_map_root: *identity_map_root,
+            time_ms: u64::from_be_bytes(*time_ms),
+            prev_head_hash: *prev_head_hash,
+            log_key_version: u32::from_be_bytes(*version),
+        })
+    }
+
     /// SHA-256 of the canonical bytes.
     pub fn hash(&self) -> Hash {
         Sha256::digest(self.encode()).into()
@@ -73,6 +98,21 @@ mod tests {
             prev_head_hash: [4; 32],
             log_key_version: 1,
         }
+    }
+
+    #[test]
+    fn decode_is_the_strict_inverse_of_encode() {
+        let h = head();
+        let bytes = h.encode();
+        assert_eq!(UnsignedHead::decode(&bytes), Some(h));
+        assert_eq!(UnsignedHead::decode(&bytes[..bytes.len() - 1]), None);
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert_eq!(UnsignedHead::decode(&longer), None);
+        let mut other_context = bytes;
+        other_context[0] ^= 1;
+        assert_eq!(UnsignedHead::decode(&other_context), None);
+        assert_eq!(UnsignedHead::decode(&[]), None);
     }
 
     #[test]
