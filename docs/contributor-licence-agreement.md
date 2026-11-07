@@ -23,7 +23,7 @@ Each outside contributor, once, before their first pull request is merged:
 
 ## Open before adoption
 
-- **The text itself.** A lawyer drafts or reviews it, together with the licence choices, as the Product Line Plan requires.
+- **The text itself.** A lawyer drafts or reviews it. The licences themselves are in force; the lawyer reviews them after the fact, and any change they ask for lands as its own pull request.
 - **The signing tool.**
 - **The beneficiary.** The licence files name Anh Dang as the copyright holder. If Orbyn becomes a legal entity, the CLA and the copyright lines must name the same holder.
 - **Scope.** Whether the same CLA also covers orbyn-planner and the other Orbyn repositories.

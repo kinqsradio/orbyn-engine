@@ -1,6 +1,6 @@
 # orbyn-engine
 
-The core every Orbyn app shares, planned to be open source once the licences land: one account, encrypted sync and the keychain under every Orbyn app. Orbyn Planner is the first app on it; Orbyn Engineering, Orbyn Notes and Orbyn Studio are planned to join. It has two halves: the device core that every app embeds, which keeps everything on the device and syncs it encrypted end to end, and the server, which holds accounts, encrypted records and keys and ships as one Docker image.
+The core every Orbyn app shares, open source by side (see Licence): one account, encrypted sync and the keychain under every Orbyn app. Orbyn Planner is the first app on it; Orbyn Engineering, Orbyn Notes and Orbyn Studio are planned to join. It has two halves: the device core that every app embeds, which keeps everything on the device and syncs it encrypted end to end, and the server, which holds accounts, encrypted records and keys and ships as one Docker image.
 
 **Private by design · Local first · One account · Agent ready.** Records are encrypted on the device before upload, every device works offline and keeps a full copy, one account will sign in to every Orbyn app, and agents will reach it only through grants the person controls (planned).
 
@@ -51,7 +51,7 @@ The engine is split in two, so that anyone can audit the encryption and embed th
 | Crates | Licence | Files |
 | --- | --- | --- |
 | App-side, the device half that apps embed: `orbyn-contracts`, `orbyn-crypto`, `orbyn-client`, `orbyn-sync`, `orbyn-wasm`, `orbyn-planner`, `orbyn-auth-client`, `orbyn-translog` | MIT or Apache 2.0, at your option (`MIT OR Apache-2.0`) | [LICENSE-MIT](LICENSE-MIT), [LICENSE-APACHE](LICENSE-APACHE) |
-| Server-side: `orbyn-server`, `orbyn-store`, `orbyn-core`, `orbyn-worker`, `orbyn-cli`, `orbyn-keyservice` | GNU Affero General Public License 3.0 only (`AGPL-3.0-only`) | [LICENSE-AGPL](LICENSE-AGPL) |
+| Server-side: `orbyn-server`, `orbyn-store`, `orbyn-core`, `orbyn-worker`, `orbyn-cli`, `orbyn-keyservice`, `orbyn-keyservice-server`, `orbyn-keyservice-daemon`, `orbyn-keyservice-client`, `orbyn-witness` | GNU Affero General Public License 3.0 only (`AGPL-3.0-only`) | [LICENSE-AGPL](LICENSE-AGPL) |
 
 Each crate's `Cargo.toml` names its licence. CI checks that no app-side crate depends on a server-side one (`scripts/check_licence_split.py`).
 

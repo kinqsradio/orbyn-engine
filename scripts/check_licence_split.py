@@ -29,9 +29,13 @@ SIDES = {
     "orbyn-cli": SERVER,
     "orbyn-core": SERVER,
     "orbyn-keyservice": SERVER,
+    "orbyn-keyservice-client": SERVER,
+    "orbyn-keyservice-daemon": SERVER,
+    "orbyn-keyservice-server": SERVER,
     "orbyn-server": SERVER,
     "orbyn-store": SERVER,
     "orbyn-worker": SERVER,
+    "orbyn-witness": SERVER,
 }
 
 
