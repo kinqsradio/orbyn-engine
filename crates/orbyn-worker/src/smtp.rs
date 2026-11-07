@@ -162,22 +162,10 @@ fn tls_with_extra_roots(url: &str, path: &str) -> Result<(Tls, Vec<String>, Vec<
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
     let (mut warnings, mut subjects) = (Vec::new(), Vec::new());
     for (index, der) in certs.into_iter().enumerate() {
-        let info = cert_info(der.as_ref()).ok_or_else(|| damaged(path, index + 1))?;
-        // A server certificate in the CA file is a mistake, not a trust anchor. A self-issued one
-        // is the way to trust a single self-signed server, so it stays.
-        if !info.is_ca && !info.self_issued {
-            return Err(format!(
-                "{OPERATOR_ERROR}ORBYN_SMTP_CA_FILE ({path}) holds a server certificate, not a CA ({})\n  Use the certificate of the authority that signed your mail server,\n  not the mail server's own certificate.\n{ROOTS_NOTE}",
-                common_name(&info.subject)
-            ));
-        }
-        if let Some(warning) =
-            expiry_warning(path, &common_name(&info.subject), info.not_after, now)
-        {
-            warnings.push(warning);
-        }
-        subjects.push(info.subject.clone());
-        tracing::info!(subject = %info.subject, "SMTP also trusts a CA from ORBYN_SMTP_CA_FILE");
+        let verdict = vet_ca(path, index, der.as_ref(), now)?;
+        warnings.extend(verdict.warning);
+        tracing::info!(subject = %verdict.subject, "SMTP also trusts a CA from ORBYN_SMTP_CA_FILE");
+        subjects.push(verdict.subject);
         let cert =
             Certificate::from_der(der.as_ref().to_vec()).map_err(|_| damaged(path, index + 1))?;
         params = params.add_root_certificate(cert);
@@ -191,6 +179,39 @@ fn tls_with_extra_roots(url: &str, path: &str) -> Result<(Tls, Vec<String>, Vec<
         Tls::Required(params)
     };
     Ok((tls, warnings, subjects))
+}
+
+/// What start-up says about one certificate of the CA file: its subject, for the log, and the
+/// designed warning when it has expired.
+#[derive(Debug, PartialEq, Eq)]
+struct CaVerdict {
+    subject: String,
+    warning: Option<String>,
+}
+
+/// The whole decision about one certificate of the CA file (`index` counts from 0, for the damaged
+/// message): no file, no logging and no clock of its own, so a test can run it on a certificate in
+/// memory and move `now`.
+///
+/// A certificate must be a CA (basic constraints `CA:TRUE`, which an intermediate CA is, though it
+/// is not self-issued) or self-issued. A server's own certificate pasted instead of its CA is
+/// neither, and is refused. **Self-issued means the issuer and subject names are equal, byte for
+/// byte; the self-signature is not checked.** That is enough: this check only tells a mistake (a
+/// leaf certificate) from a deliberate trust anchor and grants nothing. Trust comes from the
+/// operator listing the certificate in this file, and rustls verifies every server certificate
+/// against it either way.
+fn vet_ca(path: &str, index: usize, der: &[u8], now: i64) -> Result<CaVerdict, String> {
+    let info = cert_info(der).ok_or_else(|| damaged(path, index + 1))?;
+    if !info.is_ca && !info.self_issued {
+        return Err(format!(
+            "{OPERATOR_ERROR}ORBYN_SMTP_CA_FILE ({path}) holds a server certificate, not a CA ({})\n  Use the certificate of the authority that signed your mail server,\n  not the mail server's own certificate.\n{ROOTS_NOTE}",
+            common_name(&info.subject)
+        ));
+    }
+    Ok(CaVerdict {
+        warning: expiry_warning(path, &common_name(&info.subject), info.not_after, now),
+        subject: info.subject,
+    })
 }
 
 /// The error for a file with no certificate in it, as designed.
@@ -1448,6 +1469,105 @@ mod tests {
         // A good one is accepted.
         let good = PemFile::new(&ca("Orbyn test CA").2.pem());
         assert!(Smtp::new(url, from, Some(good.path())).is_ok());
+    }
+
+    /// The decision about each certificate, on certificates in memory and a clock the test moves.
+    #[test]
+    fn each_certificate_is_judged_without_a_file_or_a_clock_of_its_own() {
+        let path = "/etc/orbyn/smtp-ca.pem";
+        let (_, _, fresh) = ca("Orbyn test CA");
+        let key = rcgen::KeyPair::generate().expect("key");
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("params");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Old lab CA");
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.not_before = rcgen::date_time_ymd(2001, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2002, 1, 1);
+        let old = params.self_signed(&key).expect("self signed");
+        // 2030-01-01: rcgen's default validity (to 4096) keeps the fresh CA in date; the old is not.
+        let now = 1_893_456_000;
+        let verdict = vet_ca(path, 0, fresh.der(), now).expect("fresh");
+        assert_eq!(verdict.subject, "CN=Orbyn test CA, O=Orbyn tests");
+        assert_eq!(verdict.warning, None);
+        let verdict = vet_ca(path, 1, old.der(), now).expect("old");
+        assert_eq!(verdict.subject, "CN=Old lab CA");
+        let warning = verdict.warning.expect("expired");
+        assert!(
+            warning.contains("expired on 2002-01-01 (CN=Old lab CA)"),
+            "{warning}"
+        );
+        // The same certificate is in date at an earlier time: the answer follows the clock given.
+        assert_eq!(
+            vet_ca(path, 1, old.der(), 1_000_000_000)
+                .expect("early")
+                .warning,
+            None
+        );
+        // A server certificate is refused with its designed message; garbage is a damaged block,
+        // counted from 1 by its place in the file.
+        let pki = pki("Orbyn test CA");
+        let leaf = rustls_pki_types::CertificateDer::from_pem_slice(pki.server_pem.as_bytes())
+            .expect("pem");
+        let error = vet_ca(path, 0, leaf.as_ref(), now).expect_err("a server certificate");
+        assert!(
+            error.contains("holds a server certificate, not a CA"),
+            "{error}"
+        );
+        assert_eq!(vet_ca(path, 2, &[1, 2, 3], now), Err(damaged(path, 3)));
+    }
+
+    /// An intermediate CA is a CA but not self-issued: it must be accepted. A check that asked only
+    /// for "self-issued" would refuse it.
+    #[test]
+    fn an_intermediate_ca_is_accepted() {
+        let (root_params, root_key, _) = ca("Orbyn test CA");
+        let key = rcgen::KeyPair::generate().expect("key");
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("params");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Orbyn test intermediate");
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+        let issuer = rcgen::Issuer::from_params(&root_params, &root_key);
+        let intermediate = params.signed_by(&key, &issuer).expect("signed");
+        let info = cert_info(intermediate.der()).expect("info");
+        assert!(info.is_ca && !info.self_issued, "an intermediate");
+        let verdict =
+            vet_ca("/etc/orbyn/ca.pem", 0, intermediate.der(), 1_893_456_000).expect("accepted");
+        assert_eq!(verdict.subject, "CN=Orbyn test intermediate");
+        let file = PemFile::new(&intermediate.pem());
+        assert!(
+            Smtp::new(
+                "smtps://mail.example.com",
+                "hello@example.com",
+                Some(file.path())
+            )
+            .is_ok()
+        );
+    }
+
+    /// A key hidden after a certificate in a file with lone `\r` line endings, which the PEM reader
+    /// accepts, is still found; the certificate alone with those endings, or with CRLF, is fine.
+    #[test]
+    fn a_key_after_old_style_line_endings_is_still_refused() {
+        let (_, key, cert) = ca("Orbyn test CA");
+        let url = "smtps://mail.example.com";
+        let from = "hello@example.com";
+        let both = format!("{}{}", cert.pem(), key.serialize_pem())
+            .replace("\r\n", "\n")
+            .replace('\n', "\r");
+        assert!(!both.contains('\n'));
+        let file = PemFile::new(&both);
+        let error = Smtp::new(url, from, Some(file.path())).expect_err("a key behind lone CRs");
+        assert!(
+            error.contains("holds a private key, not a certificate"),
+            "{error}"
+        );
+        let alone = PemFile::new(&cert.pem().replace('\n', "\r"));
+        assert!(Smtp::new(url, from, Some(alone.path())).is_ok());
+        let crlf = PemFile::new(&cert.pem().replace('\n', "\r\n"));
+        assert!(Smtp::new(url, from, Some(crlf.path())).is_ok());
     }
 
     #[test]
