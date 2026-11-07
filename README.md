@@ -37,7 +37,7 @@ The engine is split in two, so that anyone can audit the encryption and embed th
 
 | Crates | Licence | Files |
 | --- | --- | --- |
-| App-side, embedded by every Orbyn app: `orbyn-contracts`, `orbyn-crypto`, `orbyn-client`, `orbyn-sync`, `orbyn-wasm`, `orbyn-planner`, `orbyn-auth-client`, `orbyn-translog` | MIT or Apache 2.0, at your option (`MIT OR Apache-2.0`) | [LICENSE-MIT](LICENSE-MIT), [LICENSE-APACHE](LICENSE-APACHE) |
+| App-side, the device half that apps embed: `orbyn-contracts`, `orbyn-crypto`, `orbyn-client`, `orbyn-sync`, `orbyn-wasm`, `orbyn-planner`, `orbyn-auth-client`, `orbyn-translog` | MIT or Apache 2.0, at your option (`MIT OR Apache-2.0`) | [LICENSE-MIT](LICENSE-MIT), [LICENSE-APACHE](LICENSE-APACHE) |
 | Server-side: `orbyn-server`, `orbyn-store`, `orbyn-core`, `orbyn-worker`, `orbyn-cli`, `orbyn-keyservice` | GNU Affero General Public License 3.0 only (`AGPL-3.0-only`) | [LICENSE-AGPL](LICENSE-AGPL) |
 
 Each crate's `Cargo.toml` names its licence. CI checks that no app-side crate depends on a server-side one (`scripts/check_licence_split.py`).

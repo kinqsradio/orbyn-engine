@@ -4,7 +4,7 @@
 
 ## Why one is needed
 
-The engine is dual-licensed by side: app-side crates under MIT or Apache 2.0, server-side crates under AGPL 3.0 only (see the README). Orbyn also runs the server in its hosted plans, and the Product Line Plan keeps the right to relicense later. Both depend on Orbyn holding the rights to all of the code. An outside contribution under the inbound licence alone would not grant that.
+The engine is dual-licensed by side: app-side crates under MIT or Apache 2.0, server-side crates under AGPL 3.0 only (see the README). The Product Line Plan keeps the right to relicense later, and to run the server in the hosted plans without publishing every change. Both depend on holding the rights to all of the code. An outside contribution under the inbound licence alone would not grant that.
 
 ## What it would grant
 
@@ -25,4 +25,5 @@ Each outside contributor, once, before their first pull request is merged:
 
 - **The text itself.** A lawyer drafts or reviews it, together with the licence choices, as the Product Line Plan requires.
 - **The signing tool.**
+- **The beneficiary.** The licence files name Tran Duc Anh Dang as the copyright holder. If Orbyn becomes a legal entity, the CLA and the copyright lines must name the same holder.
 - **Scope.** Whether the same CLA also covers orbyn-planner and the other Orbyn repositories.

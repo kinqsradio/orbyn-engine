@@ -15,21 +15,46 @@ import sys
 APP = "MIT OR Apache-2.0"
 SERVER = "AGPL-3.0-only"
 
+# The side each crate is on, chosen on purpose. A new crate, or a changed licence field, fails until
+# its side is picked here: relicensing server code as MIT cannot be taken back once published.
+SIDES = {
+    "orbyn-auth-client": APP,
+    "orbyn-client": APP,
+    "orbyn-contracts": APP,
+    "orbyn-crypto": APP,
+    "orbyn-planner": APP,
+    "orbyn-sync": APP,
+    "orbyn-translog": APP,
+    "orbyn-wasm": APP,
+    "orbyn-cli": SERVER,
+    "orbyn-core": SERVER,
+    "orbyn-keyservice": SERVER,
+    "orbyn-server": SERVER,
+    "orbyn-store": SERVER,
+    "orbyn-worker": SERVER,
+}
+
 
 def main() -> int:
-    meta = json.loads(
-        subprocess.run(
-            ["cargo", "metadata", "--format-version", "1", "--no-deps", "--locked"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout
+    run = subprocess.run(
+        ["cargo", "metadata", "--format-version", "1", "--no-deps", "--locked"],
+        capture_output=True,
+        text=True,
     )
+    if run.returncode != 0:
+        print(run.stderr, file=sys.stderr)
+        print("cargo metadata failed", file=sys.stderr)
+        return 1
+    meta = json.loads(run.stdout)
     crates = {p["name"]: p for p in meta["packages"]}
     problems = []
     for name, pkg in sorted(crates.items()):
         if pkg.get("license") not in (APP, SERVER):
             problems.append(f"{name}: license must be {APP!r} or {SERVER!r}, found {pkg.get('license')!r}")
+        elif name not in SIDES:
+            problems.append(f"{name}: new crate; pick its side in SIDES in scripts/check_licence_split.py")
+        elif SIDES[name] != pkg.get("license"):
+            problems.append(f"{name}: declares {pkg.get('license')!r} but its side is {SIDES[name]!r}")
 
     def workspace_deps(name):
         return [
