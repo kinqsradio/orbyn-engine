@@ -9,6 +9,6 @@ pub mod mail;
 pub mod push;
 
 pub use accounts::Accounts;
-pub use config::Config;
+pub use config::{Config, SignupMode};
 pub use db::Database;
 pub use sqlx;

@@ -1788,12 +1788,14 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
+ "chrono",
  "clap",
  "orbyn-core",
  "orbyn-keyservice",
  "orbyn-server",
  "orbyn-store",
  "orbyn-worker",
+ "sqlx",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1964,6 +1966,7 @@ dependencies = [
  "tower",
  "tower-http 0.7.1",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

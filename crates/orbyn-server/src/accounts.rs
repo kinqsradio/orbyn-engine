@@ -24,6 +24,7 @@ pub(crate) fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/accounts/register/start", post(register_start))
         .route("/v1/accounts/register/finish", post(register_finish))
+        .route("/v1/invites/check", post(invite_check))
         .route("/v1/accounts/email/verify", post(email_verify))
         .route("/v1/accounts/email/resend", post(email_resend))
         .route("/v1/sessions/login/start", post(login_start))
@@ -119,6 +120,7 @@ impl IntoResponse for Failure {
             AccountError::InvalidEmail => (StatusCode::BAD_REQUEST, "invalid_email"),
             AccountError::InvalidDeviceName => (StatusCode::BAD_REQUEST, "invalid_device_name"),
             AccountError::InvalidEmailCode => (StatusCode::BAD_REQUEST, "invalid_email_code"),
+            AccountError::InviteInvalid => (StatusCode::BAD_REQUEST, "invite_invalid"),
             AccountError::LoginFailed => (StatusCode::UNAUTHORIZED, "login_failed"),
             AccountError::TooManyAttempts => (StatusCode::TOO_MANY_REQUESTS, "too_many_attempts"),
             // Answered above with its login id; never reached.
@@ -388,6 +390,7 @@ async fn register_finish(
             &bytes(&body.registration_upload)?,
             &new_device(&body.device)?,
             &fixed(&body.device_signature)?,
+            body.invite.as_deref(),
         )
         .await?;
     Ok((
@@ -396,6 +399,17 @@ async fn register_finish(
             signup_id: signup_id.to_string(),
         }),
     ))
+}
+
+async fn invite_check(
+    State(state): State<AppState>,
+    Caller(client): Caller,
+    Body(body): Body<wire::InviteCheck>,
+) -> Answer<StatusCode> {
+    service(&state)?
+        .check_invite(&client, Some(&body.invite))
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn email_verify(
@@ -832,11 +846,11 @@ async fn delete_unused_confirm(
     State(state): State<AppState>,
     Caller(client): Caller,
     Body(body): Body<wire::DeleteUnusedConfirm>,
-) -> Answer<StatusCode> {
-    service(&state)?
+) -> Answer<Json<wire::DeleteUnusedConfirmed>> {
+    let invite_released = service(&state)?
         .confirm_delete_unused(&client, &body.token)
         .await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(wire::DeleteUnusedConfirmed { invite_released }))
 }
 
 /// A missing signature is not a malformed request: it is a bearer token with no device behind it,

@@ -19,6 +19,7 @@ mod delete;
 mod delete_unused;
 mod devices;
 mod email;
+pub mod invites;
 pub mod limits;
 mod push_tokens;
 mod second_factor;
@@ -95,6 +96,10 @@ pub enum AccountError {
     /// A wrong, expired or closed verification code look alike.
     #[error("the code is wrong or has expired; ask for a new one")]
     InvalidEmailCode,
+    /// An unknown, expired, used or revoked invite, and one with too many sign-ups waiting, look
+    /// alike: one answer, whatever the reason.
+    #[error("this invite code can't be used")]
+    InviteInvalid,
     /// A wrong, used, voided or expired cancel link token look alike.
     #[error("the cancel link is not valid")]
     InvalidCancelToken,
@@ -411,6 +416,10 @@ pub struct Accounts {
     trace: Option<Arc<std::sync::Mutex<Vec<&'static str>>>>,
     /// Where the account site is served, for the cancel link in the deletion email.
     account_url: Option<String>,
+    /// Whether sign-up needs an invite. **`Invite` unless set**, so a service built without the
+    /// mode fails closed; the server sets it from `ORBYN_SIGNUP` (also `invite` by default), and a
+    /// test that signs people up asks for `Open`.
+    signup: crate::SignupMode,
 }
 
 /// The time a TOTP code or a device's signature is judged against, in Unix seconds. The system
@@ -433,6 +442,7 @@ impl Accounts {
             clock: Clock(Arc::new(|| u64::try_from(unix_now_secs()).unwrap_or(0))),
             trace: None,
             account_url: None,
+            signup: crate::SignupMode::Invite,
         }
     }
 
@@ -445,6 +455,7 @@ impl Accounts {
             clock: Clock(Arc::new(|| u64::try_from(unix_now_secs()).unwrap_or(0))),
             trace: None,
             account_url: None,
+            signup: crate::SignupMode::Invite,
         }
     }
 
@@ -453,6 +464,13 @@ impl Accounts {
     /// the token alone.
     pub fn with_account_url(mut self, url: impl Into<String>) -> Self {
         self.account_url = Some(url.into().trim_end_matches('/').to_owned());
+        self
+    }
+
+    /// Who may sign up: with `Invite`, `register/finish` needs a valid invite code and
+    /// `email/verify` uses it up.
+    pub fn with_signup(mut self, mode: crate::SignupMode) -> Self {
+        self.signup = mode;
         self
     }
 
@@ -589,10 +607,14 @@ impl Accounts {
         upload: &[u8],
         device: &NewDevice,
         signature: &[u8; 64],
+        invite: Option<&str>,
     ) -> Result<Uuid> {
         let email = normalize_email(email).ok_or(AccountError::InvalidEmail)?;
         let name = device.checked_name()?;
         self.allow_register(client).await?;
+        // The invite is judged before anything about the address, and before the slow work: a
+        // sign-up that cannot continue costs nothing and says nothing about the address.
+        let invite_id = self.check_invite(client, invite).await?;
         let record = RegistrationUpload::<Suite>::deserialize(upload)
             .map_err(|_| AccountError::InvalidRequest)?;
         orbyn_crypto::verify(
@@ -609,7 +631,7 @@ impl Accounts {
         // Every limiter runs before a transaction opens, and counts every start whatever the
         // address's state, so nothing about the answer depends on it.
         let plan = self.plan_start(&email).await?;
-        self.start_signup(&plan, &email, &password_file, device, &name)
+        self.start_signup(&plan, &email, &password_file, device, &name, invite_id)
             .await
     }
 

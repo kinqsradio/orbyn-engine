@@ -222,12 +222,13 @@ impl Accounts {
         device: &NewDevice,
         name: &str,
         digest: &[u8; 32],
+        invite_id: Option<Uuid>,
     ) -> Result<()> {
         sqlx::query(
             "INSERT INTO pending_signups
                  (id, email, decoy, password_file, device_name, device_platform,
-                  device_signing_key, device_agreement_key, code_digest, expires_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now() + make_interval(mins => $10))",
+                  device_signing_key, device_agreement_key, code_digest, expires_at, invite_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now() + make_interval(mins => $10), $11)",
         )
         .bind(id)
         .bind(email)
@@ -239,6 +240,7 @@ impl Accounts {
         .bind(device.keys.agreement.as_slice())
         .bind(digest.as_slice())
         .bind(SIGNUP_MINUTES)
+        .bind(invite_id)
         .execute(&mut **tx)
         .await?;
         Ok(())
@@ -254,6 +256,7 @@ impl Accounts {
         password_file: &[u8],
         device: &NewDevice,
         name: &str,
+        invite_id: Option<Uuid>,
     ) -> Result<Uuid> {
         let mut tx = self.pool.begin().await?;
         Self::lock_address(&mut tx, email).await?;
@@ -287,6 +290,7 @@ impl Accounts {
                     device,
                     name,
                     &digest,
+                    invite_id,
                 )
                 .await?;
                 if taken && plan.notice {
@@ -314,6 +318,7 @@ impl Accounts {
                     device,
                     name,
                     &digest,
+                    invite_id,
                 )
                 .await?;
                 self.queue_code(&mut tx, id, email, code).await?;
@@ -341,6 +346,7 @@ impl Accounts {
                     device,
                     name,
                     &digest,
+                    invite_id,
                 )
                 .await?;
             }
@@ -471,19 +477,20 @@ impl Accounts {
             Vec<u8>,
             Vec<u8>,
             Vec<u8>,
+            Option<Uuid>,
         );
         // Read again under the row's lock: two verifications of one sign-up take turns, and the
         // second finds it gone.
         self.step("row-lock");
         let row: Option<Row> = sqlx::query_as(
             "SELECT email, decoy, password_file, device_name, device_platform,
-                    device_signing_key, device_agreement_key, code_digest
+                    device_signing_key, device_agreement_key, code_digest, invite_id
              FROM pending_signups WHERE id = $1 AND expires_at > now() FOR UPDATE",
         )
         .bind(signup_id)
         .fetch_optional(&mut *tx)
         .await?;
-        let (email, decoy, password_file, name, platform, signing, agreement, digest) =
+        let (email, decoy, password_file, name, platform, signing, agreement, digest, invite_id) =
             row.ok_or(AccountError::InvalidEmailCode)?;
         let code: String = code.chars().filter(|c| !c.is_whitespace()).collect();
         self.step("compare");
@@ -520,6 +527,30 @@ impl Accounts {
             tx.commit().await?;
             return Err(AccountError::InvalidEmailCode);
         };
+        // The invite is used up in the transaction that makes the account: the first sign-up
+        // verified with it wins, and a revoked, expired or already used invite makes no account.
+        // (Dropping the transaction undoes the account and the deletion of the other rows.)
+        if self.signup == crate::SignupMode::Invite {
+            self.step("invite-use");
+            let used = match invite_id {
+                Some(invite) => {
+                    sqlx::query(
+                        "UPDATE invites SET used_at = now(), used_by_account = $2
+                         WHERE id = $1 AND used_at IS NULL AND revoked_at IS NULL AND expires_at > now()",
+                    )
+                    .bind(invite)
+                    .bind(account_id)
+                    .execute(&mut *tx)
+                    .await?
+                    .rows_affected()
+                }
+                // A sign-up started before invites were required has none to use.
+                None => 0,
+            };
+            if used != 1 {
+                return Err(AccountError::InviteInvalid);
+            }
+        }
         let device_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO devices (id, account_id, name, platform, signing_key, agreement_key, state, approved_at)

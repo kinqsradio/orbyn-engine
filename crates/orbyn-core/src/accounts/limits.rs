@@ -86,6 +86,9 @@ pub struct Limits {
     pub account_status_per_prefix: Limit,
     /// Push token registrations by one device: 10 an hour.
     pub push_register_per_device: Limit,
+    /// Invite codes that could not be used, from one client address: 10 an hour, then 429. Only
+    /// failures count: a code that works gives its attempt back.
+    pub invite_invalid_per_address: Limit,
 }
 
 impl Default for Limits {
@@ -117,6 +120,7 @@ impl Default for Limits {
             delete_unused_wrong_per_prefix: Limit::new(10, Duration::from_secs(60 * MINUTE)),
             account_status_per_prefix: Limit::new(60, Duration::from_secs(60 * MINUTE)),
             push_register_per_device: Limit::new(10, Duration::from_secs(60 * MINUTE)),
+            invite_invalid_per_address: Limit::new(10, Duration::from_secs(60 * MINUTE)),
             account_delete_schedules_per_account: Limit::new(
                 3,
                 Duration::from_secs(24 * 60 * MINUTE),

@@ -4,8 +4,9 @@
  * `POST /v1/accounts/delete-unused/confirm`: the token from the link in that email. No sign-in;
  * it deletes the account at once if it is still unused and does nothing else. The planner's page
  * opens from the link and posts the token only when its button is pressed (a mail scanner that
- * opens the link changes nothing). Answer 204; 400 `invalid_delete_unused_token` for any wrong,
- * used, voided or expired token; 409 `delete_unused_not_possible` when the account holds keys or
- * stored data now (nothing is deleted).
+ * opens the link changes nothing). Answer 200 [`DeleteUnusedConfirmed`]; 400
+ * `invalid_delete_unused_token` for any wrong, used, voided or expired token; 409
+ * `delete_unused_not_possible` when the account holds keys or stored data now (nothing is
+ * deleted).
  */
 export type DeleteUnusedConfirm = { token: string, };

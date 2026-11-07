@@ -201,7 +201,12 @@ impl Accounts {
     /// expired token is [`AccountError::InvalidDeleteUnusedToken`]; a right token for an account
     /// that is no longer unused is [`AccountError::DeleteUnusedNotPossible`] and ends the token.
     /// Only wrong tokens count against the limit, so a right one is never refused.
-    pub async fn confirm_delete_unused(&self, client: &Client, token: &str) -> Result<()> {
+    ///
+    /// Answers whether this deletion **released an invite**: when the account was made from an
+    /// invite, the invite is given back once, in the same transaction, keeping its original expiry
+    /// (`used_at` and `used_by_account` go back to null and `released_at` is set). An invite that
+    /// already has `released_at` is not released again, and no other deletion releases one.
+    pub async fn confirm_delete_unused(&self, client: &Client, token: &str) -> Result<bool> {
         let digest = URL_SAFE_NO_PAD
             .decode(token.trim())
             .ok()
@@ -256,11 +261,20 @@ impl Accounts {
             AuditAction::AccountDeleteUnusedConfirmed,
         )
         .await?;
+        let released = sqlx::query(
+            "UPDATE invites SET used_at = NULL, used_by_account = NULL, released_at = now()
+             WHERE used_by_account = $1 AND released_at IS NULL",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            == 1;
         if !self.erase(&mut tx, id, &email).await? {
             return Err(AccountError::InvalidDeleteUnusedToken);
         }
         tx.commit().await?;
-        Ok(())
+        Ok(released)
     }
 
     async fn eligible(tx: &mut Transaction<'_, Postgres>, account: Uuid) -> Result<bool> {

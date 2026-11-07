@@ -29,6 +29,7 @@ orbyn-client.workspace = true
 orbyn-planner.workspace = true
 tokio-tungstenite = "0.29"
 tower.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

@@ -101,7 +101,8 @@ impl Server {
         db.migrate().await.expect("migrate");
         let setup = SETUP.get_or_init(|| AuthSecrets::generate().to_string());
         let secrets = AuthSecrets::from_encoded(setup).expect("setup");
-        let accounts = Accounts::new(db.pool().clone(), secrets);
+        let accounts =
+            Accounts::new(db.pool().clone(), secrets).with_signup(orbyn_core::SignupMode::Open);
         let hub = Hub::start(db.pool().clone());
         let store = Store::new(db.pool().clone(), hub);
         let state = AppState::new(Arc::new(Up))
