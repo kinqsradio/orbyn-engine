@@ -22,7 +22,11 @@ pub mod map;
 pub mod merkle;
 
 pub use cosign::{Cosignature, cosign_message, cosigned_enough, threshold_ok};
-pub use entry::{Entry, EntryError, MapId, map_value};
+pub use entry::{
+    CERTIFICATION_STATEMENT_LEN, Entry, EntryError, KIND_ROTATION, KIND_SERVICE_KEY,
+    KIND_SERVICE_KEY_RETIRE, MapId, certification_fields, map_value, parse_certification,
+    parse_retirement, retirement_fields, service_account_map_key,
+};
 pub use head::UnsignedHead;
 pub use map::{End, Lookup, Map, MapError, Proof, Step};
 pub use merkle::{

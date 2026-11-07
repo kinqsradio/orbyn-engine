@@ -1,0 +1,39 @@
+[package]
+name = "orbyn-keyservice-daemon"
+description = "The key service binary: its internal API over mutual TLS, migrations and first-time setup. AGPL-3.0-only."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "orbyn-keyservice"
+path = "src/main.rs"
+
+[dependencies]
+axum.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+orbyn-crypto.workspace = true
+orbyn-keyservice = { workspace = true, features = ["pkcs11"] }
+orbyn-keyservice-client.workspace = true
+orbyn-keyservice-server.workspace = true
+orbyn-translog.workspace = true
+rustls-pki-types.workspace = true
+rustls-webpki.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+orbyn-keyservice = { workspace = true, features = ["pkcs11", "test-support"] }
+rcgen.workspace = true
+rustls-pki-types.workspace = true
+reqwest.workspace = true
+
+[lints]
+workspace = true

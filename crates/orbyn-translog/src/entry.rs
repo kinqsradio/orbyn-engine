@@ -6,9 +6,10 @@
 //! [`leaf_hash`](crate::merkle::leaf_hash) of these bytes, and that leaf hash is the "entry hash"
 //! the next entry of the chain names.
 //!
-//! The kinds the key service writes today are 1 (a service-key certification) and 2 (an identity or
-//! KEK rotation). 3 to 5 are reserved for recovery and the identity map's statements, and
-//! [`Entry::decode`] refuses them until they are built.
+//! The kinds the key service writes today are 1 (a service-key certification), 2 (an identity or
+//! KEK rotation) and 6 (a service-key retirement, when an account moves to Advanced). 3 to 5 are
+//! reserved for recovery and the identity map's statements, and [`Entry::decode`] refuses them
+//! until they are built.
 
 use sha2::{Digest, Sha256};
 
@@ -16,6 +17,65 @@ use crate::merkle::{Hash, leaf_hash};
 
 /// The only entry version.
 pub const VERSION: u8 = 1;
+/// A service key's certification: the statement and the identity's signature, in `fields`.
+pub const KIND_SERVICE_KEY: u8 = 1;
+/// An identity or KEK rotation.
+pub const KIND_ROTATION: u8 = 2;
+/// A service key's retirement (Advanced): the account's chain ends here until a new key is made.
+pub const KIND_SERVICE_KEY_RETIRE: u8 = 6;
+
+/// The map key an account's entries are filed under: `SHA-256(orbyn/log-account/v1 ‖ the
+/// account's certified service public key, compressed)`. The key service computes it from the key
+/// it holds for the account, and a device from the key it verified, so neither the record server
+/// nor anyone else chooses where an entry is filed.
+pub fn service_account_map_key(public: &[u8; 33]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"orbyn/log-account/v1");
+    h.update(public);
+    h.finalize().into()
+}
+
+/// The length of a service-key statement: three length-prefixed fields (the identity version, the
+/// account id, the compressed key). See `orbyn_crypto::service_key_statement`.
+pub const CERTIFICATION_STATEMENT_LEN: usize = 3 * 8 + 4 + 16 + 33;
+
+/// The `fields` of a service-key certification entry (kind 1): the statement the identity signed
+/// and the identity's signature, `statement ‖ signature`. A device reads the statement back with
+/// [`parse_certification`] and verifies the signature with `verify_service_key_statement`.
+pub fn certification_fields(statement: &[u8], signature: &[u8; 64]) -> Option<Vec<u8>> {
+    (statement.len() == CERTIFICATION_STATEMENT_LEN).then(|| {
+        let mut out = Vec::with_capacity(statement.len() + signature.len());
+        out.extend_from_slice(statement);
+        out.extend_from_slice(signature);
+        out
+    })
+}
+
+/// The statement and signature in a certification entry's `fields`, or `None` for any other
+/// length.
+pub fn parse_certification(fields: &[u8]) -> Option<(&[u8], [u8; 64])> {
+    let (statement, signature) = fields.split_at_checked(CERTIFICATION_STATEMENT_LEN)?;
+    Some((statement, signature.try_into().ok()?))
+}
+
+/// The `fields` of a service-key retirement entry (kind 6): the compressed public key it retires,
+/// so a reader sees which certification the chain's end belongs to. Nothing is signed here: the
+/// key service signs heads, and the head covers the entry.
+pub fn retirement_fields(public: &[u8; 33]) -> Vec<u8> {
+    public.to_vec()
+}
+
+/// The key a retirement entry's `fields` names, or `None` for any other length.
+pub fn parse_retirement(fields: &[u8]) -> Option<[u8; 33]> {
+    fields.try_into().ok()
+}
+
+fn kind_is_built(kind: u8) -> bool {
+    matches!(
+        kind,
+        KIND_SERVICE_KEY | KIND_ROTATION | KIND_SERVICE_KEY_RETIRE
+    )
+}
 /// The largest `fields` an entry may carry.
 pub const MAX_FIELDS: usize = 64 * 1024;
 const HEADER_LEN: usize = 1 + 1 + 1 + 32 + 32 + 8 + 4;
@@ -68,7 +128,7 @@ impl Entry {
     pub fn encode(&self) -> Result<Vec<u8>, EntryError> {
         // Only kinds `decode` accepts: an entry that cannot be read back must never be hashed
         // into a log that cannot be edited.
-        if !matches!(self.kind, 1 | 2) {
+        if !kind_is_built(self.kind) {
             return Err(EntryError::Kind);
         }
         if self.fields.len() > MAX_FIELDS {
@@ -99,7 +159,7 @@ impl Entry {
         let (prev, rest) = rest.split_first_chunk::<32>().ok_or(bad)?;
         let (time, rest) = rest.split_first_chunk::<8>().ok_or(bad)?;
         let (len, _) = rest.split_first_chunk::<4>().ok_or(bad)?;
-        if *version != VERSION || !matches!(kind, 1 | 2) {
+        if *version != VERSION || !kind_is_built(*kind) {
             return Err(bad);
         }
         let map = MapId::from_byte(*map).ok_or(bad)?;
@@ -211,15 +271,27 @@ mod tests {
 
     #[test]
     fn only_built_kinds_encode_so_every_leaf_can_be_read_back() {
-        for kind in [0u8, 3, 4, 5, 6, 255] {
+        for kind in [0u8, 3, 4, 5, 7, 255] {
             let e = Entry { kind, ..entry() };
             assert_eq!(e.encode(), Err(EntryError::Kind), "kind {kind}");
             assert_eq!(e.hash(), Err(EntryError::Kind));
         }
-        for kind in [1u8, 2] {
+        for kind in [1u8, 2, 6] {
             let e = Entry { kind, ..entry() };
             assert_eq!(Entry::decode(&e.encode().expect("built")), Ok(e));
         }
+    }
+
+    #[test]
+    fn an_account_is_filed_under_a_hash_of_its_certified_key() {
+        let one = service_account_map_key(&[2; 33]);
+        assert_eq!(one, service_account_map_key(&[2; 33]));
+        assert_ne!(one, service_account_map_key(&[3; 33]));
+        // A fixed value, so a device port computes the same: SHA-256("orbyn/log-account/v1" ‖ key).
+        let mut h = Sha256::new();
+        h.update(b"orbyn/log-account/v1");
+        h.update([2u8; 33]);
+        assert_eq!(one, <[u8; 32]>::from(h.finalize()));
     }
 
     #[test]
@@ -268,5 +340,26 @@ mod tests {
         }
         assert_ne!(map_value(&base, 1), map_value(&base, 2));
         assert_ne!(map_value(&base, 1), map_value(&[0; 32], 1));
+    }
+
+    #[test]
+    fn certification_and_retirement_fields_round_trip_and_refuse_other_lengths() {
+        let statement = [7u8; CERTIFICATION_STATEMENT_LEN];
+        let fields = certification_fields(&statement, &[9; 64]).expect("fields");
+        assert_eq!(fields.len(), CERTIFICATION_STATEMENT_LEN + 64);
+        assert_eq!(
+            parse_certification(&fields),
+            Some((statement.as_slice(), [9; 64]))
+        );
+        assert!(certification_fields(&statement[1..], &[9; 64]).is_none());
+        assert!(parse_certification(&fields[1..]).is_none());
+        let mut longer = fields.clone();
+        longer.push(0);
+        assert!(parse_certification(&longer).is_none());
+        assert_eq!(
+            parse_retirement(&retirement_fields(&[3; 33])),
+            Some([3; 33])
+        );
+        assert!(parse_retirement(&[3; 32]).is_none());
     }
 }

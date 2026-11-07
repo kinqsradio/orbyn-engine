@@ -5,10 +5,16 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use orbyn_keyservice_server::{Store, StoreError, migrate};
+use orbyn_keyservice_server::{
+    CreateError, NewServiceKey, ServiceKeyOutcome, ServiceKeyState, Store, StoreError, Timeouts,
+    migrate,
+};
 use orbyn_translog::map::{map_empty_root, verify};
 use orbyn_translog::merkle::{leaf_hash, tree_root};
-use orbyn_translog::{Entry, Hash, Lookup, Map, MapId, map_value};
+use orbyn_translog::{
+    CERTIFICATION_STATEMENT_LEN, Entry, Hash, KIND_SERVICE_KEY, KIND_SERVICE_KEY_RETIRE, Lookup,
+    Map, MapId, map_value, parse_certification, parse_retirement, service_account_map_key,
+};
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use sqlx::{AssertSqlSafe, Row};
 
@@ -238,6 +244,7 @@ async fn migrating_twice_changes_nothing_and_the_key_service_has_its_own_migrati
             "log_nodes",
             "map_nodes",
             "rate_events",
+            "retired_accounts",
             "service_keys"
         ]
     );
@@ -620,9 +627,28 @@ async fn the_runtime_role_cannot_update_delete_truncate_or_change_the_schema() {
         "UPDATE log_nodes SET hash = hash",
         "UPDATE map_nodes SET leaf_value = leaf_value",
         "UPDATE heads SET size = size",
-        "UPDATE service_keys SET wrapped = wrapped",
+        // Only `wrapped` and `retired_at` of a service key may be written at all.
+        "UPDATE service_keys SET public = public",
+        "UPDATE service_keys SET statement = statement",
+        "UPDATE service_keys SET signature = signature",
+        "UPDATE service_keys SET identity_version = identity_version",
+        "UPDATE service_keys SET account_id = account_id",
+        "UPDATE service_keys SET created_at = created_at",
     ] {
         denied(q(sql).await, sql, &["permission denied"]);
+    }
+    // The two columns it may write are held to the one change, once, by the trigger.
+    for sql in [
+        "UPDATE service_keys SET wrapped = wrapped",
+        "UPDATE service_keys SET wrapped = '\\x00'::bytea",
+        "UPDATE service_keys SET retired_at = now()",
+        "UPDATE service_keys SET wrapped = NULL",
+    ] {
+        denied(
+            q(sql).await,
+            sql,
+            &["append-only", "violates check constraint"],
+        );
     }
     // The one allowed change: included_in_head from null to a value, once, and only to a head that
     // covers the entry. A real second head (idle, covering one entry) makes the wrong-head cases real.
@@ -770,8 +796,14 @@ async fn the_triggers_stop_even_the_owner_from_changing_or_truncating_the_log() 
         "UPDATE map_nodes SET leaf_value = leaf_value",
         "UPDATE heads SET size = size",
         "UPDATE service_keys SET wrapped = wrapped",
+        "UPDATE service_keys SET public = '\\x00'::bytea",
+        "UPDATE service_keys SET statement = statement",
     ] {
-        denied(q(sql).await, sql, &["append-only"]);
+        denied(
+            q(sql).await,
+            sql,
+            &["append-only", "violates check constraint"],
+        );
     }
     // TRUNCATE: the tables that nothing references, one by one, and the pair that reference each
     // other, together (a lone TRUNCATE of heads is refused by the foreign key before the trigger).
@@ -1552,6 +1584,382 @@ async fn write_transactions_really_run_under_the_configured_timeouts_and_read_co
             "250ms".to_owned(),
             "read committed".to_owned()
         )
+    );
+    db.cleanup().await;
+}
+
+fn new_key(n: u8) -> NewServiceKey {
+    NewServiceKey {
+        wrapped: vec![n; 40],
+        public: [n; 33],
+        identity_version: 1,
+        statement: vec![n; CERTIFICATION_STATEMENT_LEN],
+        signature: [n; 64],
+    }
+}
+
+fn no_error(key: NewServiceKey) -> Result<NewServiceKey, std::convert::Infallible> {
+    Ok(key)
+}
+
+#[tokio::test]
+#[ignore = "needs ORBYN_KEYSERVICE_DATABASE_URL"]
+async fn creating_a_service_key_is_idempotent_and_logs_one_certification() {
+    let db = TestDb::new().await;
+    let store = db.store().await;
+    let account = [1u8; 16];
+    let (first, made) =
+        within(store.get_or_create_service_key(&account, 5, || no_error(new_key(2))))
+            .await
+            .expect("create");
+    let first = first.key().expect("a key");
+    assert!(made);
+    assert_eq!(first.public, [2; 33]);
+    assert_eq!(first.state, ServiceKeyState::Held);
+    assert_eq!(first.entry_index, 0);
+    assert!(!first.head_covers_entry);
+    // The second call returns the same key and never calls `make`.
+    let (second, made) = within(store.get_or_create_service_key::<()>(&account, 6, || {
+        panic!("make is called only when there is no key")
+    }))
+    .await
+    .expect("get");
+    assert!(!made);
+    assert_eq!(second.key(), Some(first.clone()));
+    assert_eq!(store.size().await.expect("size"), 1);
+    // The log holds the certification, filed under the key's hash, readable back.
+    let row = sqlx::query("SELECT payload FROM log_entries WHERE seq = 1")
+        .fetch_one(&db.runtime)
+        .await
+        .expect("entry");
+    let logged = Entry::decode(&row.get::<Vec<u8>, _>("payload")).expect("decodes");
+    assert_eq!(logged.kind, KIND_SERVICE_KEY);
+    assert_eq!(logged.map, MapId::Service);
+    assert_eq!(logged.map_key, service_account_map_key(&[2; 33]));
+    assert_eq!(logged.time_ms, 5);
+    assert_eq!(
+        parse_certification(&logged.fields),
+        Some((vec![2u8; CERTIFICATION_STATEMENT_LEN].as_slice(), [2; 64]))
+    );
+    // Another account gets its own key and its own chain.
+    let (other, _) = within(store.get_or_create_service_key(&[9; 16], 7, || no_error(new_key(3))))
+        .await
+        .expect("create other");
+    let other = other.key().expect("a key");
+    assert_eq!(other.public, [3; 33]);
+    assert_eq!(other.entry_index, 1);
+    assert_eq!(store.service_key(&[8; 16]).await.expect("read"), None);
+    // The head that covers it says so.
+    let head = store.build_head(10, 1, None).await.expect("head");
+    store
+        .commit_head(&head, &[1; 64], b"")
+        .await
+        .expect("commit");
+    assert!(
+        store
+            .service_key(&account)
+            .await
+            .expect("read")
+            .expect("there")
+            .head_covers_entry
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "needs ORBYN_KEYSERVICE_DATABASE_URL"]
+async fn a_failed_make_writes_nothing_and_racing_creates_keep_exactly_one_key() {
+    let db = TestDb::new().await;
+    let store = db.store().await;
+    let failed =
+        within(store.get_or_create_service_key(&[1; 16], 1, || Err::<NewServiceKey, _>("hsm")))
+            .await;
+    assert!(matches!(failed, Err(CreateError::Make("hsm"))));
+    assert_eq!(store.size().await.expect("size"), 0);
+    assert_eq!(store.service_key(&[1; 16]).await.expect("read"), None);
+    // A statement of the wrong length is refused before anything is written.
+    let mut bad = new_key(4);
+    bad.statement.pop();
+    let refused = within(store.get_or_create_service_key(&[1; 16], 1, || no_error(bad))).await;
+    assert!(matches!(
+        refused,
+        Err(CreateError::Store(StoreError::BadEntry))
+    ));
+    assert_eq!(store.size().await.expect("size"), 0);
+
+    let makes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let store = store.clone();
+        let makes = makes.clone();
+        tasks.spawn(async move {
+            store
+                .get_or_create_service_key(&[5; 16], 1, || {
+                    makes.fetch_add(1, Ordering::SeqCst);
+                    no_error(new_key(6))
+                })
+                .await
+        });
+    }
+    let mut results = Vec::new();
+    while let Some(done) = within(tasks.join_next()).await {
+        results.push(done.expect("task"));
+    }
+    // Each racer may have made a key (the HSM runs outside the lock), and exactly one was kept:
+    // one call stored it, and every call got that same key.
+    let made = makes.load(Ordering::SeqCst);
+    assert!((1..=8).contains(&made), "{made} keys made");
+    assert_eq!(
+        results.iter().filter(|r| r.as_ref().expect("ok").1).count(),
+        1
+    );
+    let keys: Vec<_> = results
+        .iter()
+        .map(|r| {
+            r.as_ref()
+                .expect("ok")
+                .0
+                .clone()
+                .key()
+                .expect("a key")
+                .public
+        })
+        .collect();
+    assert!(keys.iter().all(|k| *k == keys[0]), "one key for all");
+    assert_eq!(store.size().await.expect("size"), 1);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "needs ORBYN_KEYSERVICE_DATABASE_URL"]
+async fn retiring_destroys_the_wrapped_key_logs_it_once_and_is_idempotent() {
+    let db = TestDb::new().await;
+    let store = db.store().await;
+    let account = [1u8; 16];
+    // An account with no key is recorded as retired (so it cannot be given one later), and
+    // nothing is logged for it: it has no chain.
+    let never = [7u8; 16];
+    assert!(
+        store
+            .retire_service_key(&never, 1)
+            .await
+            .expect("retire none")
+    );
+    assert!(!store.retire_service_key(&never, 1).await.expect("again"));
+    assert_eq!(store.size().await.expect("size"), 0);
+    assert_eq!(
+        store.service_key_outcome(&never).await.expect("read"),
+        Some(ServiceKeyOutcome::RetiredWithoutKey)
+    );
+    let (refused, made) = store
+        .get_or_create_service_key::<()>(&never, 2, || panic!("a retired account gets no key"))
+        .await
+        .expect("get");
+    assert!(!made);
+    assert_eq!(refused, ServiceKeyOutcome::RetiredWithoutKey);
+    assert_eq!(store.size().await.expect("size"), 0);
+    // And that fact cannot be changed or removed, even by the owner.
+    for pool in [&db.runtime, &db.owner] {
+        for sql in [
+            "DELETE FROM retired_accounts",
+            "UPDATE retired_accounts SET retired_at = now()",
+            "TRUNCATE retired_accounts",
+        ] {
+            let result = sqlx::query(AssertSqlSafe(sql.to_owned()))
+                .execute(pool)
+                .await;
+            assert!(result.is_err(), "{sql}");
+        }
+    }
+    within(store.get_or_create_service_key(&account, 2, || no_error(new_key(2))))
+        .await
+        .expect("create");
+    assert!(
+        within(store.retire_service_key(&account, 3))
+            .await
+            .expect("retire")
+    );
+    let wrapped: Option<Vec<u8>> = sqlx::query_scalar("SELECT wrapped FROM service_keys")
+        .fetch_one(&db.owner)
+        .await
+        .expect("row");
+    assert_eq!(wrapped, None, "the wrapped key is gone");
+    let retired: bool = sqlx::query_scalar("SELECT retired_at IS NOT NULL FROM service_keys")
+        .fetch_one(&db.owner)
+        .await
+        .expect("row");
+    assert!(retired, "the time is set with it");
+    let record = store
+        .service_key(&account)
+        .await
+        .expect("read")
+        .expect("row stays");
+    assert_eq!(record.state, ServiceKeyState::Retired);
+    assert_eq!(record.public, [2; 33], "its certification stays");
+    // The chain: the certification, then the retirement naming it.
+    let rows = sqlx::query("SELECT kind, chain_index, prev_entry_hash, leaf_hash, payload FROM log_entries ORDER BY seq")
+        .fetch_all(&db.runtime)
+        .await
+        .expect("entries");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[1].get::<i16, _>("kind"),
+        i16::from(KIND_SERVICE_KEY_RETIRE)
+    );
+    assert_eq!(rows[1].get::<i64, _>("chain_index"), 1);
+    assert_eq!(
+        rows[1].get::<Vec<u8>, _>("prev_entry_hash"),
+        rows[0].get::<Vec<u8>, _>("leaf_hash")
+    );
+    let logged = Entry::decode(&rows[1].get::<Vec<u8>, _>("payload")).expect("decodes");
+    assert_eq!(logged.map_key, service_account_map_key(&[2; 33]));
+    assert_eq!(parse_retirement(&logged.fields), Some([2; 33]));
+    // A second retire changes and logs nothing; a create for the retired account makes no key.
+    assert!(!store.retire_service_key(&account, 4).await.expect("again"));
+    assert_eq!(store.size().await.expect("size"), 2);
+    let (again, made) = store
+        .get_or_create_service_key::<()>(&account, 5, || panic!("a retired account gets no key"))
+        .await
+        .expect("get");
+    assert!(!made);
+    assert_eq!(again.key().expect("a key").state, ServiceKeyState::Retired);
+    assert_eq!(store.size().await.expect("size"), 2);
+    // And the one change cannot be undone, even by the owner, nor made twice.
+    for (db_pool, name) in [(&db.runtime, "runtime"), (&db.owner, "owner")] {
+        for sql in [
+            "UPDATE service_keys SET wrapped = '\\x01'::bytea, retired_at = NULL",
+            "UPDATE service_keys SET retired_at = now()",
+        ] {
+            denied(
+                sqlx::query(AssertSqlSafe(sql.to_owned()))
+                    .execute(db_pool)
+                    .await,
+                &format!("{name}: {sql}"),
+                &["append-only", "violates check constraint"],
+            );
+        }
+    }
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "needs ORBYN_KEYSERVICE_DATABASE_URL"]
+async fn the_rate_limit_counts_per_subject_and_forgets_after_its_window() {
+    let db = TestDb::new().await;
+    let store = db.store().await;
+    for _ in 0..3 {
+        assert!(store.allow("act", b"one", 3, 3600).await.expect("allow"));
+    }
+    assert!(!store.allow("act", b"one", 3, 3600).await.expect("over"));
+    // Another subject and another action have their own counts.
+    assert!(
+        store
+            .allow("act", b"two", 3, 3600)
+            .await
+            .expect("other subject")
+    );
+    assert!(
+        store
+            .allow("other", b"one", 3, 3600)
+            .await
+            .expect("other action")
+    );
+    // A refused call is not recorded, and old events fall out of the window.
+    let n: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM rate_events WHERE action = 'act' AND subject = 'one'",
+    )
+    .fetch_one(&db.owner)
+    .await
+    .expect("count");
+    assert_eq!(n, 3);
+    sqlx::query("UPDATE rate_events SET at = now() - interval '2 hours' WHERE action = 'act' AND subject = 'one'")
+        .execute(&db.owner)
+        .await
+        .expect("back-date");
+    assert!(
+        store
+            .allow("act", b"one", 3, 3600)
+            .await
+            .expect("window passed")
+    );
+    let n: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM rate_events WHERE action = 'act' AND subject = 'one'",
+    )
+    .fetch_one(&db.owner)
+    .await
+    .expect("count");
+    assert_eq!(n, 1, "the old events were removed");
+    db.cleanup().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs ORBYN_KEYSERVICE_DATABASE_URL"]
+async fn a_slow_hsm_does_not_hold_the_write_lock() {
+    let db = TestDb::new().await;
+    let store = db.store().await;
+    let (began, began_rx) = std::sync::mpsc::channel();
+    let creating = {
+        let store = store.clone();
+        tokio::spawn(async move {
+            store
+                .get_or_create_service_key(&[1; 16], 1, || {
+                    // The HSM starts, and hangs for a while.
+                    began.send(()).expect("signal");
+                    // As the daemon calls the HSM: blocking, off the runtime's other work.
+                    tokio::task::block_in_place(|| {
+                        std::thread::sleep(std::time::Duration::from_millis(2500))
+                    });
+                    no_error(new_key(2))
+                })
+                .await
+        })
+    };
+    // Wait until the HSM call is really under way, so the lock (if it were held) is held.
+    tokio::task::spawn_blocking(move || began_rx.recv_timeout(std::time::Duration::from_secs(30)))
+        .await
+        .expect("join")
+        .expect("the HSM call began");
+    let started = std::time::Instant::now();
+    within(store.append(&entry(MapId::Service, 9, [0; 32], 0)))
+        .await
+        .expect("append while the HSM is slow");
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(1500),
+        "the append waited {:?}",
+        started.elapsed()
+    );
+    let (made, stored) = within(creating).await.expect("task").expect("create");
+    assert!(stored);
+    assert!(made.key().is_some());
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "needs ORBYN_KEYSERVICE_DATABASE_URL"]
+async fn the_rate_limit_is_bounded_by_the_lock_timeout() {
+    let db = TestDb::new().await;
+    let store = db.store().await.with_timeouts(Timeouts {
+        lock: "200ms".to_owned(),
+        statement: "5s".to_owned(),
+    });
+    // Another session holds the lock this subject's count takes.
+    let mut holder = db.owner.begin().await.expect("begin");
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1 || encode($2, 'hex'), 0))")
+        .bind("act")
+        .bind(b"one".as_slice())
+        .execute(&mut *holder)
+        .await
+        .expect("hold");
+    let started = std::time::Instant::now();
+    let result = within(store.allow("act", b"one", 3, 3600)).await;
+    assert!(matches!(result, Err(StoreError::Busy)), "{result:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    holder.rollback().await.expect("release");
+    assert!(
+        store
+            .allow("act", b"one", 3, 3600)
+            .await
+            .expect("free again")
     );
     db.cleanup().await;
 }

@@ -1883,6 +1883,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "orbyn-keyservice-client"
+version = "0.1.0"
+dependencies = [
+ "rcgen",
+ "reqwest",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+]
+
+[[package]]
+name = "orbyn-keyservice-daemon"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "hyper",
+ "hyper-util",
+ "orbyn-crypto",
+ "orbyn-keyservice",
+ "orbyn-keyservice-client",
+ "orbyn-keyservice-server",
+ "orbyn-translog",
+ "rcgen",
+ "reqwest",
+ "rustls-pki-types",
+ "rustls-webpki",
+ "serde_json",
+ "sqlx",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "orbyn-keyservice-server"
 version = "0.1.0"
 dependencies = [

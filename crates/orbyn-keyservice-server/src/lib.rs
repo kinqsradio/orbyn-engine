@@ -22,9 +22,13 @@
 mod head;
 mod log;
 mod map;
+mod service_keys;
 
 pub use head::StoredHead;
 pub use log::Appended;
+pub use service_keys::{
+    CreateError, NewServiceKey, ServiceKeyOutcome, ServiceKeyRecord, ServiceKeyState,
+};
 
 // The log and the maps are reached only through `Store`: it takes the write lock, starts the
 // transaction at READ COMMITTED with timeouts, and has been through the role check. Their write
@@ -156,13 +160,7 @@ pub(crate) fn to_u64(n: i64) -> Result<u64> {
 /// the grants are reset to the same set each time. The roles themselves are made by whoever runs
 /// the database; this function creates neither.
 pub async fn migrate(owner: &PgPool, runtime_role: &str) -> Result<()> {
-    let valid = !runtime_role.is_empty()
-        && runtime_role.len() <= 63
-        && runtime_role.starts_with(|c: char| c.is_ascii_lowercase())
-        && runtime_role
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
-    if !valid {
+    if !valid_role_name(runtime_role) {
         return Err(StoreError::BadRole);
     }
     // The runtime role must be a plain role: a superuser, the owner, the owner of this database or
@@ -195,10 +193,13 @@ pub async fn migrate(owner: &PgPool, runtime_role: &str) -> Result<()> {
         "REVOKE CREATE ON SCHEMA public FROM PUBLIC".to_owned(),
         format!("GRANT USAGE ON SCHEMA public TO {role}"),
         format!(
-            "GRANT SELECT, INSERT ON service_keys, log_entries, log_nodes, map_nodes, heads TO {role}"
+            "GRANT SELECT, INSERT ON service_keys, retired_accounts, log_entries, log_nodes, map_nodes, \
+             heads TO {role}"
         ),
         // The one change an entry ever gets: the head that covers it.
         format!("GRANT UPDATE (included_in_head) ON log_entries TO {role}"),
+        // And the one a service key ever gets: its wrapped key destroyed when it is retired.
+        format!("GRANT UPDATE (wrapped, retired_at) ON service_keys TO {role}"),
         format!("GRANT SELECT, INSERT, DELETE ON rate_events TO {role}"),
         format!("GRANT USAGE ON SEQUENCE heads_id_seq, rate_events_id_seq TO {role}"),
     ] {
@@ -233,8 +234,9 @@ pub async fn migrate(owner: &PgPool, runtime_role: &str) -> Result<()> {
 }
 
 /// The tables the key service owns, by name.
-const TABLES: [&str; 6] = [
+const TABLES: [&str; 7] = [
     "service_keys",
+    "retired_accounts",
     "log_entries",
     "log_nodes",
     "map_nodes",
@@ -242,10 +244,31 @@ const TABLES: [&str; 6] = [
     "rate_events",
 ];
 
-/// Refuses a role that could undo the guards: a superuser or one that can create roles, **or a member
-/// of such a role**, or a member of the owner of this database, of schema `public`, of any of the key service's tables, or of any of its trigger
-/// functions (`ks_*`). Looks at the owners as they are, not at who ran the migration.
-async fn check_plain_role<'e, E>(executor: E, role: &str) -> Result<()>
+/// Why a role may not be the runtime role.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoleProblem {
+    /// There is no such role.
+    Missing,
+    /// It is, or belongs to, a superuser or a role that can create roles.
+    Privileged,
+    /// It belongs to the owner of the database, the schema, the tables or the trigger functions.
+    OwnerMember,
+}
+
+/// Whether `role` is a name `migrate` accepts: lowercase letters, digits and underscores, starting
+/// with a letter, at most 63 long.
+pub fn valid_role_name(role: &str) -> bool {
+    !role.is_empty()
+        && role.len() <= 63
+        && role.starts_with(|c: char| c.is_ascii_lowercase())
+        && role
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// What is wrong with `role` as the runtime role, if anything, judged against the owners as they
+/// are now. The same test [`migrate`] and [`Store::connect`] apply, with the reason kept.
+pub async fn runtime_role_problem<'e, E>(executor: E, role: &str) -> Result<Option<RoleProblem>>
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {
@@ -263,23 +286,40 @@ where
     .bind(role)
     .bind(&TABLES[..])
     .fetch_optional(executor)
-    .await?
-    .ok_or(StoreError::UnsafeRole)?;
+    .await?;
+    let Some(row) = row else {
+        return Ok(Some(RoleProblem::Missing));
+    };
     // `privileged`: the role, or any role it belongs to, is a superuser or can create roles. A
     // member can `SET ROLE` to that role, and a role that creates roles can make itself a member of
     // the one that owns the tables; either way the guards could be dropped.
+    if row.try_get::<bool, _>("privileged")? {
+        return Ok(Some(RoleProblem::Privileged));
+    }
     for column in [
-        "privileged",
         "database_owner",
         "schema_owner",
         "table_owner",
         "function_owner",
     ] {
         if row.try_get::<bool, _>(column)? {
-            return Err(StoreError::UnsafeRole);
+            return Ok(Some(RoleProblem::OwnerMember));
         }
     }
-    Ok(())
+    Ok(None)
+}
+
+/// Refuses a role that could undo the guards: a superuser or one that can create roles, **or a member
+/// of such a role**, or a member of the owner of this database, of schema `public`, of any of the key service's tables, or of any of its trigger
+/// functions (`ks_*`). Looks at the owners as they are, not at who ran the migration.
+async fn check_plain_role<'e, E>(executor: E, role: &str) -> Result<()>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    match runtime_role_problem(executor, role).await? {
+        None => Ok(()),
+        Some(_) => Err(StoreError::UnsafeRole),
+    }
 }
 
 /// The key service's store, on the runtime role's pool.
@@ -397,6 +437,61 @@ impl Store {
         let id = head::commit(&mut tx, head, log_signature, cosignatures).await?;
         tx.commit().await?;
         Ok(id)
+    }
+
+    /// Counts one `action` by `subject` against a limit of `limit` in the last `window_secs`
+    /// seconds, in `rate_events`. Returns whether it was within the limit; an event over the limit
+    /// is not recorded. Events of this subject older than the window are removed in the same
+    /// transaction, so the table stays small. A lock on the pair keeps two callers from both
+    /// taking the last slot.
+    pub async fn allow(
+        &self,
+        action: &str,
+        subject: &[u8],
+        limit: u32,
+        window_secs: u64,
+    ) -> Result<bool> {
+        let window = i64::try_from(window_secs).map_err(|_| StoreError::BadEntry)?;
+        let mut tx = self.pool.begin().await?;
+        // The same bounds a write has: a stuck lock or statement is an error, not a queue.
+        sqlx::query(
+            "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true)",
+        )
+        .bind(&self.timeouts.lock)
+        .bind(&self.timeouts.statement)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1 || encode($2, 'hex'), 0))")
+            .bind(action)
+            .bind(subject)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "DELETE FROM rate_events WHERE action = $1 AND subject = $2 \
+             AND at < now() - make_interval(secs => $3)",
+        )
+        .bind(action)
+        .bind(subject)
+        .bind(window as f64)
+        .execute(&mut *tx)
+        .await?;
+        let used: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM rate_events WHERE action = $1 AND subject = $2",
+        )
+        .bind(action)
+        .bind(subject)
+        .fetch_one(&mut *tx)
+        .await?;
+        let allowed = used < i64::from(limit);
+        if allowed {
+            sqlx::query("INSERT INTO rate_events (action, subject) VALUES ($1, $2)")
+                .bind(action)
+                .bind(subject)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(allowed)
     }
 
     /// The newest stored head.
