@@ -124,7 +124,6 @@ impl State {
             frontier.push(*h);
             rest = r;
         }
-        let mut rest = rest;
         let mut heads = [None, None];
         for slot in &mut heads {
             let (flag, after) = rest.split_first().ok_or_else(bad)?;
@@ -159,10 +158,10 @@ impl State {
             final_head,
         };
         // A final head is never newer than the head the state stands on.
-        if let Some(final_head) = &state.final_head {
-            if final_head.head.size > state.size || final_head.head.time_ms > state.head_time_ms {
-                return Err(bad());
-            }
+        if let Some(final_head) = &state.final_head
+            && (final_head.head.size > state.size || final_head.head.time_ms > state.head_time_ms)
+        {
+            return Err(bad());
         }
         // The head the state keeps is the head it describes, field for field.
         match &state.head {
