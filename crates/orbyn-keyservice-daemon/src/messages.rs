@@ -1,5 +1,5 @@
 //! Everything `orbyn-keyservice` says to an operator, word for word as designed (Account Designs
-//! v50, "Key service"). Errors are `error: <what>` and an indented hint, on stderr, exit status 1;
+//! v51, "Key service", orbyn-designs#45). Errors are `error: <what>` and an indented hint, on stderr, exit status 1;
 //! the help and the `init` success line go to stdout. **No setting's value is ever printed** (a
 //! database address, a PIN): messages name the setting, never its value. The two things shown
 //! that are not settings are a role's name and the address the service could not listen on.

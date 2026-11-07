@@ -133,6 +133,23 @@ impl Client {
         })
     }
 
+    /// Sends a request, and **once more** if the connection closed without an answer. All three
+    /// calls are idempotent, and the service closes connections on purpose (after a reload, after
+    /// 5 minutes, after 1000 requests), so a closed connection is not an outage. A timeout is not
+    /// retried: a service that is hung would only be waited on twice.
+    async fn send(
+        &self,
+        request: impl Fn() -> reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, ClientError> {
+        match request().send().await {
+            Ok(response) => Ok(response),
+            Err(first) if !first.is_timeout() => {
+                request().send().await.map_err(|_| ClientError::Unavailable)
+            }
+            Err(_) => Err(ClientError::Unavailable),
+        }
+    }
+
     /// Creates the account's service key, or returns the one it has. Idempotent.
     pub async fn create_or_get(
         &self,
@@ -143,13 +160,13 @@ impl Client {
         })
         .map_err(|_| ClientError::Invalid)?;
         let response = self
-            .http
-            .post(format!("{}{COLLECTION}", self.base))
-            .header("content-type", "application/json")
-            .body(body)
-            .send()
-            .await
-            .map_err(|_| ClientError::Unavailable)?;
+            .send(|| {
+                self.http
+                    .post(format!("{}{COLLECTION}", self.base))
+                    .header("content-type", "application/json")
+                    .body(body.clone())
+            })
+            .await?;
         let status = response.status().as_u16();
         let bytes = read_limited(response).await?;
         match status {
@@ -164,11 +181,11 @@ impl Client {
         account_id: &[u8; 16],
     ) -> Result<Option<ServiceKeyAnswer>, ClientError> {
         let response = self
-            .http
-            .get(format!("{}{COLLECTION}/{}", self.base, hex(account_id)))
-            .send()
-            .await
-            .map_err(|_| ClientError::Unavailable)?;
+            .send(|| {
+                self.http
+                    .get(format!("{}{COLLECTION}/{}", self.base, hex(account_id)))
+            })
+            .await?;
         let status = response.status().as_u16();
         let bytes = read_limited(response).await?;
         match status {
@@ -181,11 +198,11 @@ impl Client {
     /// Retires the account's service key (Advanced). Idempotent; also fine when it has none.
     pub async fn retire(&self, account_id: &[u8; 16]) -> Result<(), ClientError> {
         let response = self
-            .http
-            .delete(format!("{}{COLLECTION}/{}", self.base, hex(account_id)))
-            .send()
-            .await
-            .map_err(|_| ClientError::Unavailable)?;
+            .send(|| {
+                self.http
+                    .delete(format!("{}{COLLECTION}/{}", self.base, hex(account_id)))
+            })
+            .await?;
         let status = response.status().as_u16();
         let bytes = read_limited(response).await?;
         match status {
