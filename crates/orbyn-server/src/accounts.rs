@@ -26,6 +26,13 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/v1/accounts/register/finish", post(register_finish))
         .route("/v1/sessions/login/start", post(login_start))
         .route("/v1/sessions/login/finish", post(login_finish))
+        .route(
+            "/v1/sessions/login/second-factor",
+            post(login_second_factor),
+        )
+        .route("/v1/accounts/totp", post(totp_enrol))
+        .route("/v1/accounts/totp/confirm", post(totp_confirm))
+        .route("/v1/accounts/totp/disable", post(totp_disable))
         .route("/v1/sessions/current", delete(revoke_current))
         .route("/v1/sessions", delete(revoke_all))
         .route("/v1/devices", get(list_devices))
@@ -78,6 +85,15 @@ impl IntoResponse for Failure {
                     "The request body is larger than 64 KiB.",
                 );
             }
+            Self::Account(AccountError::SecondFactorRequired { login_id }) => {
+                let body = wire::SecondFactorRequired {
+                    code: "second_factor_required".to_owned(),
+                    message: "Send the code from your authenticator app to finish signing in."
+                        .to_owned(),
+                    login_id: login_id.to_string(),
+                };
+                return (StatusCode::UNAUTHORIZED, Json(body)).into_response();
+            }
             Self::Account(err) => err,
         };
         let (status, code) = match &err {
@@ -87,7 +103,17 @@ impl IntoResponse for Failure {
             AccountError::EmailUnavailable => (StatusCode::CONFLICT, "email_unavailable"),
             AccountError::LoginFailed => (StatusCode::UNAUTHORIZED, "login_failed"),
             AccountError::TooManyAttempts => (StatusCode::TOO_MANY_REQUESTS, "too_many_attempts"),
+            // Answered above with its login id; never reached.
+            AccountError::SecondFactorRequired { .. } => {
+                (StatusCode::UNAUTHORIZED, "second_factor_required")
+            }
+            AccountError::SecondFactorFailed => (StatusCode::UNAUTHORIZED, "second_factor_failed"),
+            AccountError::TotpAlreadyEnabled => (StatusCode::CONFLICT, "totp_already_enabled"),
+            AccountError::TotpNotEnabled => (StatusCode::CONFLICT, "totp_not_enabled"),
             AccountError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
+            AccountError::DeviceProofRequired => {
+                (StatusCode::UNAUTHORIZED, "device_proof_required")
+            }
             AccountError::DeviceNotTrusted => (StatusCode::FORBIDDEN, "device_not_trusted"),
             AccountError::NotFound => (StatusCode::NOT_FOUND, "not_found"),
             AccountError::InvalidSignature => (StatusCode::BAD_REQUEST, "invalid_signature"),
@@ -429,10 +455,14 @@ async fn current_device(
     State(state): State<AppState>,
     Authed(session): Authed,
 ) -> Answer<Json<wire::CurrentDevice>> {
-    let (device, approval) = service(&state)?.current_device(&session).await?;
+    let accounts = service(&state)?;
+    let (device, approval) = accounts.current_device(&session).await?;
+    let (totp_enabled, totp_pending) = accounts.totp_status(session.account_id).await?;
     Ok(Json(wire::CurrentDevice {
         device: wire_device(device, session.device_id),
         approval: approval.map(wire_approval),
+        totp_enabled,
+        totp_pending,
     }))
 }
 
@@ -572,4 +602,76 @@ async fn remove_device(
         )
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn login_second_factor(
+    State(state): State<AppState>,
+    Caller(client): Caller,
+    Body(body): Body<wire::SecondFactorLogin>,
+) -> Answer<Json<wire::SessionCreated>> {
+    let session = service(&state)?
+        .login_second_factor(
+            &client,
+            id(&body.login_id)?,
+            body.code.as_deref(),
+            body.recovery_code.as_deref(),
+        )
+        .await?;
+    Ok(Json(wire_session(session)))
+}
+
+async fn totp_enrol(
+    State(state): State<AppState>,
+    Authed(session): Authed,
+    Body(body): Body<wire::TotpEnrol>,
+) -> Answer<Json<wire::TotpEnrolment>> {
+    let proof = manage_proof(body.device_signature.as_deref(), body.signed_at)?;
+    let enrolment = service(&state)?
+        .totp_enrol(&session, proof.as_ref())
+        .await?;
+    Ok(Json(wire::TotpEnrolment {
+        secret: enrolment.secret.clone(),
+        uri: enrolment.uri.clone(),
+    }))
+}
+
+async fn totp_confirm(
+    State(state): State<AppState>,
+    Caller(client): Caller,
+    Authed(session): Authed,
+    Body(body): Body<wire::TotpConfirm>,
+) -> Answer<Json<wire::TotpConfirmed>> {
+    let proof = manage_proof(body.device_signature.as_deref(), body.signed_at)?;
+    let recovery_codes = service(&state)?
+        .totp_confirm(&client, &session, &body.code, proof.as_ref())
+        .await?;
+    Ok(Json(wire::TotpConfirmed { recovery_codes }))
+}
+
+async fn totp_disable(
+    State(state): State<AppState>,
+    Caller(client): Caller,
+    Authed(session): Authed,
+    Body(body): Body<wire::TotpDisable>,
+) -> Answer<StatusCode> {
+    let proof = manage_proof(body.device_signature.as_deref(), body.signed_at)?;
+    service(&state)?
+        .totp_disable(&client, &session, proof.as_ref())
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// A missing signature is not a malformed request: it is a bearer token with no device behind it,
+/// and the service answers it `device_proof_required`.
+fn manage_proof(
+    signature: Option<&str>,
+    signed_at: Option<i64>,
+) -> Answer<Option<accounts::ManageProof>> {
+    let (Some(signature), Some(signed_at)) = (signature, signed_at) else {
+        return Ok(None);
+    };
+    Ok(Some(accounts::ManageProof {
+        signed_at,
+        signature: fixed(signature)?,
+    }))
 }

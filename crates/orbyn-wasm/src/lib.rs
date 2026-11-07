@@ -243,6 +243,35 @@ impl DeviceKeys {
         Ok(self.sign(auth::TRUSTED_START_CONTEXT, &message))
     }
 
+    /// The `signature` that lets this device change the account's second factor, under
+    /// `orbyn/totp-manage/v1`. `action` is `enrol`, `confirm` or `disable`; `code` is the six
+    /// digits for `confirm` and empty otherwise; `signedAt` is Unix seconds, within five minutes of
+    /// the server's clock. `accountId` and `deviceId` are the UUIDs of the session.
+    #[wasm_bindgen(js_name = signTotpManage)]
+    pub fn sign_totp_manage(
+        &self,
+        account_id: &str,
+        device_id: &str,
+        action: &str,
+        code: &str,
+        signed_at: f64,
+    ) -> Result<Vec<u8>> {
+        if !matches!(action, "enrol" | "confirm" | "disable") {
+            return Err(error(
+                "invalid_input",
+                "the action is enrol, confirm or disable",
+            ));
+        }
+        let message = auth::totp_manage_message(
+            &uuid_bytes(account_id)?,
+            &uuid_bytes(device_id)?,
+            action,
+            code,
+            signed_at as i64,
+        );
+        Ok(self.sign(auth::TOTP_MANAGE_CONTEXT, &message))
+    }
+
     fn copy(&self) -> Result<orbyn_crypto::DeviceKeys> {
         Ok(orbyn_crypto::DeviceKeys::from_bytes(
             self.keys.to_bytes().as_slice(),

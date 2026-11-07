@@ -95,6 +95,40 @@ fn approve_json(
 #[test]
 fn device_keys_export_import_and_sign_the_auth_messages() -> Result<()> {
     let keys = DeviceKeys::create()?;
+    // The device's proof to change the second factor verifies under its own key, for that action only.
+    let (account, device_id) = (ACCOUNT, A);
+    let proof = keys.sign_totp_manage(account, device_id, "confirm", "123456", 1_800_000_000.0)?;
+    let message = auth::totp_manage_message(
+        &uuid_bytes(account)?,
+        &uuid_bytes(device_id)?,
+        "confirm",
+        "123456",
+        1_800_000_000,
+    );
+    let signature: [u8; 64] = proof.as_slice().try_into().expect("64 bytes");
+    assert!(
+        orbyn_crypto::verify(
+            &keys.keys.public(),
+            auth::TOTP_MANAGE_CONTEXT,
+            &message,
+            &signature
+        )
+        .is_ok()
+    );
+    assert!(
+        orbyn_crypto::verify(
+            &keys.keys.public(),
+            auth::TRUSTED_START_CONTEXT,
+            &message,
+            &signature
+        )
+        .is_err()
+    );
+    assert_eq!(
+        keys.sign_totp_manage(account, device_id, "delete", "", 0.0)
+            .map_err(|e| e.code),
+        Err("invalid_input")
+    );
     let sealed = keys.export(SECRET.to_vec())?;
     // The export is sealed: the secret halves are not in it.
     let raw = keys.keys.to_bytes();

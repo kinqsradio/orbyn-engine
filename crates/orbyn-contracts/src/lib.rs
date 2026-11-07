@@ -163,6 +163,80 @@ pub struct SessionCreated {
     pub expires_at: String,
 }
 
+/// The 401 body of a sign-in whose password was right but whose account has a second factor:
+/// no session was issued. Send `login_id` and a code to `POST /v1/sessions/login/second-factor`
+/// within five minutes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SecondFactorRequired {
+    /// Always `second_factor_required`.
+    pub code: String,
+    pub message: String,
+    pub login_id: String,
+}
+
+/// `POST /v1/sessions/login/second-factor`: the second step of a sign-in. Exactly one of `code`
+/// (six digits from the authenticator app) and `recovery_code` (one-time, `XXXXX-XXXXX`).
+/// Answers a [`SessionCreated`]; every wrong code is `second_factor_failed`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SecondFactorLogin {
+    pub login_id: String,
+    pub code: Option<String>,
+    pub recovery_code: Option<String>,
+}
+
+/// `POST /v1/accounts/totp`, from a trusted device: a new secret, pending until confirmed.
+/// Shown once.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TotpEnrolment {
+    /// Base32, for typing into an authenticator app.
+    pub secret: String,
+    /// `otpauth://totp/Orbyn:<email>?...`, for a QR code.
+    pub uri: String,
+}
+
+/// `POST /v1/accounts/totp/confirm`: a current code from the pending secret turns TOTP on.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TotpConfirm {
+    pub code: String,
+    /// The device's `orbyn/totp-manage/v1` signature over the account, device, action and code.
+    #[serde(default)]
+    pub device_signature: Option<String>,
+    /// Unix seconds, as the device signed them (within five minutes of the server's clock).
+    #[serde(default)]
+    pub signed_at: Option<i64>,
+}
+
+/// `POST /v1/accounts/totp`: the trusted device proves the request with its own key.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TotpEnrol {
+    #[serde(default)]
+    pub device_signature: Option<String>,
+    #[serde(default)]
+    pub signed_at: Option<i64>,
+}
+
+/// The answer to a confirmed enrolment: ten one-time recovery codes, shown this once.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TotpConfirmed {
+    pub recovery_codes: Vec<String>,
+}
+
+/// `POST /v1/accounts/totp/disable`, from a trusted device: its signature alone, no code.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TotpDisable {
+    #[serde(default)]
+    pub device_signature: Option<String>,
+    #[serde(default)]
+    pub signed_at: Option<i64>,
+}
+
 /// A device of the account.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
@@ -266,6 +340,10 @@ pub struct PendingApproval {
 pub struct CurrentDevice {
     pub device: Device,
     pub approval: Option<PendingApproval>,
+    /// Sign-in asks for a second factor.
+    pub totp_enabled: bool,
+    /// Enrolled but not yet confirmed with a code.
+    pub totp_pending: bool,
 }
 
 /// `POST /v1/devices/approvals`, step 1, from a trusted device.
