@@ -25,5 +25,5 @@ Each outside contributor, once, before their first pull request is merged:
 
 - **The text itself.** A lawyer drafts or reviews it, together with the licence choices, as the Product Line Plan requires.
 - **The signing tool.**
-- **The beneficiary.** The licence files name Tran Duc Anh Dang as the copyright holder. If Orbyn becomes a legal entity, the CLA and the copyright lines must name the same holder.
+- **The beneficiary.** The licence files name Anh Dang as the copyright holder. If Orbyn becomes a legal entity, the CLA and the copyright lines must name the same holder.
 - **Scope.** Whether the same CLA also covers orbyn-planner and the other Orbyn repositories.
