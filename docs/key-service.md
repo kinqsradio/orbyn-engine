@@ -107,7 +107,6 @@ It does not trust its own rows for time. A recovery's 72 hours are measured from
     This binds the envelope to the exact certified service key, so it cannot be presented against a rotated or other key.
   - **Storage.** `key_envelopes` tells the suites apart by its recipient kind column (`device`, `service`, and later `account`), never by sniffing bytes.
   - **Library.** The P-256 code is the RustCrypto `p256` crate (Apache-2.0 or MIT), which runs in wasm too. It sits beside the existing crypto in `orbyn-crypto` and falls under the same outside review.
-  - `key_envelopes` gains a recipient kind, `device` or `service`.
   - The 5000-envelope cap and the replace-on-retry rule apply per recipient.
 - **Opening one.**
   - **Validate first.** Before anything reaches the HSM, the key service parses the envelope's ephemeral key with `p256::PublicKey::from_sec1_bytes`, which rejects a point off the curve or the identity. It does not trust the HSM to check: the service key is static and envelopes come from any device, so an invalid-curve point must never reach a derive.
