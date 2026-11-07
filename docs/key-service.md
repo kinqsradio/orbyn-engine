@@ -89,7 +89,7 @@ It does not trust its own rows for time. A recovery's 72 hours are measured from
     - recovery approvals.
   - **Certification.** The key service signs a service key only one it generated inside the HSM in the same call. It has no API that takes a key to sign.
 - **Account service key.** One X25519 pair per Standard account, generated in the HSM when the account first signs Standard.
-  - The private key leaves the HSM only wrapped under the key-encryption key (CKM_AES_KEY_WRAP_KWP), stored in the key service's schema.
+  - The private key leaves the HSM only wrapped under the key-encryption key (`CKM_AES_KEY_WRAP_PAD`, the AES key wrap with padding of RFC 5649, which is KWP; SoftHSM 2.6 has no mechanism by the name `CKM_AES_KEY_WRAP_KWP`, and a cloud HSM that offers it under that name can be configured to use it), stored in the key service's schema.
   - To open envelopes, it is unwrapped back into the HSM as a non-extractable session object and destroyed afterwards.
 - **Service envelopes.** These use the device envelope format (`orbyn_crypto::wrap_key`) with the service public key as the recipient and the same label (`orbyn/zone-key/v1`, account, zone, key id).
   - `key_envelopes` gains a recipient kind, `device` or `service`.
@@ -259,13 +259,17 @@ A cancel is a statement signed by a device (`orbyn/recovery-cancel/v1`: account,
 
 ## Running it
 
-- **PKCS#11** through the `cryptoki` crate (Apache-2.0 or MIT).
+- **PKCS#11** through the `cryptoki` crate (Apache-2.0).
   - Production: a cloud HSM with a PKCS#11 library. The provider is an open decision.
-  - Development, CI and self-hosting: SoftHSM 2.6 or later. Its Curve25519 support is believed to cover X25519 derive (CKK_EC_MONTGOMERY); step 3 confirms this with a test before relying on it. SoftHSM has no CKM_HKDF_DERIVE, so these use the one-at-a-time fallback.
+  - Development, CI and self-hosting: SoftHSM 2.6.1 or later. Checked against 2.6.1: ECDH derive on P-256 (`CKM_ECDH1_DERIVE`, `CKD_NULL`), Ed25519 signing (`CKM_EC_EDWARDS_KEY_PAIR_GEN`, `CKM_EDDSA`), and AES key wrap with padding (`CKM_AES_KEY_WRAP_PAD`). It has no Curve25519 key agreement (no `CKM_EC_MONTGOMERY_KEY_PAIR_GEN`), which is why the account service key is P-256, and no `CKM_HKDF_DERIVE`, so these use the one-at-a-time fallback. A key unwrapped into SoftHSM as a non-extractable session object reports itself as such (a test checks it).
 - **Configuration:**
   - `ORBYN_HSM_MODULE`, `ORBYN_HSM_SLOT`, `ORBYN_HSM_PIN` (a secret);
   - the key service URL and mutual TLS settings, in `orbyn-server`;
   - `orbyn keyservice init`, which makes the KEK and the first identity and prints the identity public key for client configuration.
+- **Signing is closed.** An identity signs only a message this crate builds itself (a closed set, today the service-key statement; the log head and the recovery approval join it when they exist). The message type cannot be made outside the crate, so no code, and no operator tool built on the library, can have an identity sign bytes it chose; a compile-fail test pins it. The `Hsm` handle is not exposed by `KeyService` outside tests.
+- **Every key template sets every usage flag**, true only for what the key is for: the KEK wraps and unwraps, an identity signs (public half verifies), an account key derives, and the derived secret does nothing. SoftHSM tests read them back.
+- **Required for production, skipped on SoftHSM: a trusted KEK.** `init` should mark the KEK `CKA_TRUSTED` (an action only the Security Officer can take, so it needs `ORBYN_HSM_SO_PIN`, read for `init` only and never stored) and account keys should be created with `CKA_WRAP_WITH_TRUSTED`, so that only the trusted KEK can wrap them. SoftHSM cannot do this cleanly: the Security Officer cannot see the user's private objects, so it cannot mark the KEK, and a key with `CKA_WRAP_WITH_TRUSTED` is refused by an untrusted KEK. A cloud HSM that lets an administrator mark the key should turn it on; it is a step of the production runbook until the key service's deployment (3c) carries it.
+- **Partial `init`.** `init` makes the KEK, then identity 1. If it fails between them (the HSM goes away), the KEK exists without an identity, and `init` refuses to run again, because it never deletes or overwrites a key. Look at what exists with the HSM's administration tools (the separate role), delete the KEK only if no account key was ever wrapped under it (a fresh deployment), and run `init` again. If account keys were wrapped under it, keep the KEK and make the missing identity by hand with the same label (`orbyn-identity-v1`).
 - **Without a key service configured**, recovery is off: `/v1/recovery` answers 503, and new accounts' first devices sign the setting as Standard but send no service envelopes until a service key exists. When a self-hoster adds a key service later, escrow starts through backfill, and the planner tells the person when it begins, naming the key service.
 
 ## Order of work

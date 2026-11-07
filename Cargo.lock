@@ -536,6 +536,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "cryptoki"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "625cf4599c43d69a16996ce2573fc80745a0b0300c962f0bfa11d55b6cab2b2d"
+dependencies = [
+ "bitflags 2.13.2",
+ "cryptoki-sys",
+ "libloading",
+ "log",
+ "secrecy",
+]
+
+[[package]]
+name = "cryptoki-sys"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1fd850498411e4057f1cba79e6e2bc7cbe960544c1046ab46d4685c403a1121"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
 name = "ctutils"
 version = "0.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1473,6 +1495,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link 0.2.1",
+]
+
+[[package]]
 name = "libsqlite3-sys"
 version = "0.37.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1637,8 +1669,10 @@ name = "orbyn-cli"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "clap",
  "orbyn-core",
+ "orbyn-keyservice",
  "orbyn-server",
  "orbyn-store",
  "orbyn-worker",
@@ -1714,6 +1748,18 @@ dependencies = [
  "subtle",
  "thiserror",
  "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
+name = "orbyn-keyservice"
+version = "0.1.0"
+dependencies = [
+ "cryptoki",
+ "ed25519-dalek",
+ "orbyn-crypto",
+ "orbyn-keyservice",
+ "thiserror",
  "zeroize",
 ]
 
@@ -2303,6 +2349,15 @@ dependencies = [
  "der 0.8.3",
  "hybrid-array",
  "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "secrecy"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e891af845473308773346dc847b2c23ee78fe442e0472ac50e22a18a93d3ae5a"
+dependencies = [
  "zeroize",
 ]
 

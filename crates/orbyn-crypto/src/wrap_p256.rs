@@ -64,6 +64,20 @@ impl P256Point {
         Ok(Self { compressed, key })
     }
 
+    /// Reads the public key an HSM reports for a P-256 key (`CKA_EC_POINT`): the point as SEC1,
+    /// compressed (33 bytes) or uncompressed (65 bytes), optionally inside the DER OCTET STRING
+    /// PKCS#11 wraps it in. It is validated like any key and re-encoded compressed, the one form
+    /// this suite uses. Not for keys that come from a peer: those go through [`P256Point::parse`].
+    pub fn from_hsm_point(bytes: &[u8]) -> Result<Self, CryptoError> {
+        let point = match bytes {
+            [0x04, 0x21, rest @ ..] if rest.len() == 33 => rest,
+            [0x04, 0x41, rest @ ..] if rest.len() == 65 => rest,
+            other => other,
+        };
+        let key = PublicKey::from_sec1_bytes(point).map_err(|_| CryptoError::InvalidKey)?;
+        Ok(point_of(&key))
+    }
+
     /// The 33-byte compressed form.
     pub fn compressed(&self) -> &[u8; P256_POINT_LEN] {
         &self.compressed
@@ -322,6 +336,37 @@ fn wrap_with(
     })
 }
 
+/// Checks the sender's signature on an envelope, which binds the ephemeral key, the recipient key,
+/// the certification (identity version and statement hash), the label and the sealed bytes. It
+/// needs no secret, so a key service runs it **before** any HSM work: an envelope from anyone but
+/// `sender`, or made for another certification, never reaches the HSM.
+pub fn verify_wrap_sender(
+    ephemeral: &P256Point,
+    recipient: &P256Point,
+    sender: &DevicePublic,
+    identity_version: u32,
+    statement_hash: &[u8; 32],
+    label: &[u8],
+    wrapped: &WrappedKeyP256,
+) -> Result<(), CryptoError> {
+    if ephemeral.compressed() != &wrapped.ephemeral {
+        return Err(CryptoError::Open);
+    }
+    verify(
+        sender,
+        WRAP_P256_CONTEXT,
+        &transcript(
+            &wrapped.ephemeral,
+            recipient.compressed(),
+            identity_version,
+            statement_hash,
+            label,
+            &wrapped.sealed,
+        ),
+        &wrapped.signature,
+    )
+}
+
 /// Opens a key from [`wrap_key_p256`], given the shared secret (the 32-byte x-coordinate of
 /// ECDH between the service key and `ephemeral`) from wherever it was derived, such as an HSM.
 /// `ephemeral` must come from [`derive_input`] on the envelope's own ephemeral key, and
@@ -339,21 +384,14 @@ pub fn open_with_shared_secret(
     label: &[u8],
     wrapped: &WrappedKeyP256,
 ) -> Result<SymmetricKey, CryptoError> {
-    if ephemeral.compressed() != &wrapped.ephemeral {
-        return Err(CryptoError::Open);
-    }
-    verify(
+    verify_wrap_sender(
+        ephemeral,
+        recipient,
         sender,
-        WRAP_P256_CONTEXT,
-        &transcript(
-            &wrapped.ephemeral,
-            recipient.compressed(),
-            identity_version,
-            statement_hash,
-            label,
-            &wrapped.sealed,
-        ),
-        &wrapped.signature,
+        identity_version,
+        statement_hash,
+        label,
+        wrapped,
     )?;
     let wrap = wrapping_key(shared, &wrapped.ephemeral, recipient.compressed(), label)?;
     let bound = bind(WRAP_P256_CONTEXT, label);

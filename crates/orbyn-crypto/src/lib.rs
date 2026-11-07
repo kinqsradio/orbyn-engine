@@ -14,6 +14,7 @@
 //! Every operation binds a context string into the authenticated data, so a value
 //! sealed for one purpose can never be opened as another.
 
+mod service_key;
 mod wrap_p256;
 
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -29,9 +30,13 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 /// Length of a nonce for XChaCha20-Poly1305.
 pub const NONCE_LEN: usize = 24;
 
+pub use service_key::{
+    SERVICE_KEY_CONTEXT, service_key_signed_bytes, service_key_statement,
+    service_key_statement_hash, verify_service_key_statement,
+};
 pub use wrap_p256::{
     P256_POINT_LEN, P256Keys, P256Point, WRAP_P256_CONTEXT, WRAP_P256_FORMAT, WrappedKeyP256,
-    derive_input, open_with_shared_secret, unwrap_key_p256, wrap_key_p256,
+    derive_input, open_with_shared_secret, unwrap_key_p256, verify_wrap_sender, wrap_key_p256,
 };
 
 /// What went wrong. Messages never include key material or plaintext.

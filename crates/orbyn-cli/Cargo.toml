@@ -12,8 +12,10 @@ path = "src/main.rs"
 
 [dependencies]
 axum.workspace = true
+base64.workspace = true
 clap.workspace = true
 orbyn-core.workspace = true
+orbyn-keyservice = { workspace = true, features = ["pkcs11"] }
 orbyn-server.workspace = true
 orbyn-store.workspace = true
 orbyn-worker.workspace = true

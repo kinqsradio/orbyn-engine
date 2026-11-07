@@ -142,10 +142,26 @@ jobs:
       - if: env.RUN == 'true'
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # Formatting ran in "Cheap checks".
+      # SoftHSM runs the key service's PKCS#11 tests on this lane only. The tests are ignored without
+      # ORBYN_SOFTHSM_MODULE, so the other lanes, which have no SoftHSM, skip them; here
+      # ORBYN_SOFTHSM_REQUIRED makes a missing module a failure instead of a silent skip.
+      - name: SoftHSM for the key service tests
+        if: env.RUN == 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq softhsm2
+          mkdir -p "$RUNNER_TEMP/softhsm/tokens"
+          printf 'directories.tokendir = %s/softhsm/tokens\nobjectstore.backend = file\n' "$RUNNER_TEMP" > "$RUNNER_TEMP/softhsm/softhsm2.conf"
+          echo "SOFTHSM2_CONF=$RUNNER_TEMP/softhsm/softhsm2.conf" >> "$GITHUB_ENV"
+          echo "ORBYN_SOFTHSM_MODULE=/usr/lib/softhsm/libsofthsm2.so" >> "$GITHUB_ENV"
+          echo "ORBYN_SOFTHSM_REQUIRED=1" >> "$GITHUB_ENV"
       - if: env.RUN == 'true'
         run: cargo clippy --workspace --all-targets -- -D warnings
       - if: env.RUN == 'true'
         run: cargo test --workspace -- --include-ignored
+      - name: The key service builds without PKCS#11
+        if: env.RUN == 'true'
+        run: cargo check -p orbyn-keyservice --no-default-features
       - name: Device crates build for the web
         if: env.RUN == 'true'
         run: cargo check -p orbyn-crypto -p orbyn-sync -p orbyn-planner -p orbyn-contracts -p orbyn-auth-client -p orbyn-client -p orbyn-wasm --target wasm32-unknown-unknown
