@@ -103,6 +103,17 @@ async fn main() -> ExitCode {
     if let Command::Keyservice(Keyservice::Init) = &cli.command {
         return keyservice_init();
     }
+    if let Command::Invite { args } = &cli.command {
+        // Read the arguments before the configuration: help and a mistake in them need no database.
+        return invite_command(args, || async {
+            let config = Config::from_env().map_err(|err| err.to_string())?;
+            Database::connect_with_pool(&config.database_url, 2)
+                .await
+                // Never the error itself: it can hold the address and the password.
+                .map_err(|_| invite::database_unreachable(invite::DATABASE_URL_SETTING))
+        })
+        .await;
+    }
     init_tracing();
     let config = match Config::from_env() {
         Ok(config) => config,
@@ -120,8 +131,10 @@ async fn main() -> ExitCode {
         Command::Serve => serve(config).await,
         Command::Worker => worker(config).await,
         Command::Migrate => migrate(config).await,
-        Command::Invite { args } => return invite_command(config, &args).await,
-        Command::Health { .. } | Command::AuthSetup | Command::Keyservice(_) => Ok(()),
+        Command::Invite { .. }
+        | Command::Health { .. }
+        | Command::AuthSetup
+        | Command::Keyservice(_) => Ok(()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -137,21 +150,13 @@ async fn main() -> ExitCode {
     }
 }
 
-/// `orbyn invite ...`: stdout and exit status 0, or stderr and exit status 1. The arguments are
-/// read first, so help and a mistake in them never touch the database.
-async fn invite_command(config: Config, args: &[String]) -> ExitCode {
-    let outcome = match invite::parse(args) {
-        Err(text) => Err(text),
-        Ok(invite::Command::Help(text)) => Ok(text),
-        Ok(command) => {
-            match Database::connect_with_pool(&config.database_url, 2).await {
-                Ok(db) => invite::execute(db.pool(), command).await,
-                // Never the error itself: it can hold the address and the password.
-                Err(_) => Err(invite::database_unreachable(invite::DATABASE_URL_SETTING)),
-            }
-        }
-    };
-    match outcome {
+/// `orbyn invite ...`: stdout and exit status 0, or stderr and exit status 1.
+async fn invite_command<F, Fut>(args: &[String], connect: F) -> ExitCode
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Database, String>>,
+{
+    match invite_outcome(args, connect).await {
         Ok(text) => {
             print!("{}", with_newline(text));
             ExitCode::SUCCESS
@@ -159,6 +164,22 @@ async fn invite_command(config: Config, args: &[String]) -> ExitCode {
         Err(text) => {
             eprint!("{}", with_newline(text));
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// What `orbyn invite <args>` says. The arguments are read first, so help and a mistake in them
+/// never ask for the configuration or the database: `connect` runs only for a command that needs it.
+async fn invite_outcome<F, Fut>(args: &[String], connect: F) -> invite::Outcome
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Database, String>>,
+{
+    match invite::parse(args)? {
+        invite::Command::Help(text) => Ok(text),
+        command => {
+            let db = connect().await?;
+            invite::execute(db.pool(), command).await
         }
     }
 }
@@ -594,6 +615,65 @@ mod tests {
         assert!(
             !all.contains("482913") && !all.contains("sam@example.com"),
             "{all}"
+        );
+    }
+
+    fn words(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|p| (*p).to_owned()).collect()
+    }
+
+    /// A `connect` that counts how often it is asked, and then fails the way a missing setting does.
+    fn counting(
+        asked: &std::sync::atomic::AtomicUsize,
+    ) -> impl FnOnce() -> std::future::Ready<Result<Database, String>> + '_ {
+        move || {
+            asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Err("DATABASE_URL is not set".to_owned()))
+        }
+    }
+
+    #[tokio::test]
+    async fn invite_help_and_mistakes_in_the_arguments_never_ask_for_the_configuration() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let asked = AtomicUsize::new(0);
+        for parts in [
+            &["--help"][..],
+            &["help"],
+            &["create", "--help"],
+            &["list", "-h"],
+            &[],
+            &["frobnicate"],
+            &["create", "--count", "0"],
+            &["create", "--expires-days", "soon"],
+            &["create", "--label", "a@b"],
+            &["create", "--frob"],
+            &["create", "--label"],
+            &["create", "extra"],
+            &["revoke"],
+            &["revoke", "7f3a", "extra"],
+        ] {
+            let _ = invite_outcome(&words(parts), counting(&asked)).await;
+            assert_eq!(asked.load(Ordering::SeqCst), 0, "{parts:?}");
+        }
+        // The same words that parse are the ones that do ask, once, and the failure is printed as it is.
+        for parts in [&["list"][..], &["create"], &["revoke", "7f3a"]] {
+            let before = asked.load(Ordering::SeqCst);
+            let outcome = invite_outcome(&words(parts), counting(&asked)).await;
+            assert_eq!(asked.load(Ordering::SeqCst), before + 1, "{parts:?}");
+            assert_eq!(outcome, Err("DATABASE_URL is not set".to_owned()));
+        }
+    }
+
+    #[tokio::test]
+    async fn invite_help_is_the_help_text_with_no_database_setting_at_all() {
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        assert_eq!(
+            invite_outcome(&words(&["--help"]), counting(&asked)).await,
+            Ok(invite::HELP.to_owned())
+        );
+        assert_eq!(
+            invite_outcome(&words(&["frobnicate"]), counting(&asked)).await,
+            Err(invite::unknown_command("frobnicate"))
         );
     }
 }
