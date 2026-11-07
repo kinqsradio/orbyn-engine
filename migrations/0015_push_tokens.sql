@@ -21,3 +21,14 @@ CREATE TABLE push_tokens (
 
 CREATE INDEX push_tokens_account ON push_tokens (account_id);
 CREATE INDEX push_tokens_refreshed ON push_tokens (refreshed_at);
+
+-- What a `zone_changed` job has already sent, per device, so a retry wakes only the devices that
+-- failed. Kept for the days a job can be retried, then pruned.
+CREATE TABLE push_deliveries (
+    job_id    uuid        NOT NULL,
+    device_id uuid        NOT NULL REFERENCES devices (id) ON DELETE CASCADE,
+    sent_at   timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (job_id, device_id)
+);
+
+CREATE INDEX push_deliveries_age ON push_deliveries (sent_at);

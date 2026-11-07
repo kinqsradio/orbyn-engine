@@ -49,6 +49,7 @@ const TOMBSTONE_KEY_INFO: &[u8] = b"orbyn/account-tombstone-key/v1";
 const TOMBSTONE_LABEL: &[u8] = b"orbyn/account-tombstone/v1";
 const TOTP_SECRET_CONTEXT: &str = "orbyn/totp-secret/v1";
 const MAIL_CONTEXT: &str = "orbyn/mail-job/v1";
+const PUSH_TOKEN_CONTEXT: &str = "orbyn/push-token/v1";
 
 impl AuthSecrets {
     /// A new value for `ORBYN_AUTH_SETUP`, base64url without padding.
@@ -120,6 +121,27 @@ impl AuthSecrets {
         let sealed = Sealed::from_bytes(sealed).ok()?;
         self.totp_key
             .open(TOTP_SECRET_CONTEXT, account.as_bytes(), &sealed)
+            .ok()
+            .map(Zeroizing::new)
+    }
+
+    /// A device's push token sealed under a context of its own, bound to the device: a sealed token
+    /// copied to another device's row does not open there.
+    pub(crate) fn seal_push_token(&self, device: Uuid, token: &[u8]) -> Option<Vec<u8>> {
+        self.state_key
+            .seal(PUSH_TOKEN_CONTEXT, device.as_bytes(), token)
+            .ok()
+            .map(|sealed| sealed.to_bytes())
+    }
+
+    pub(crate) fn open_push_token(
+        &self,
+        device: Uuid,
+        sealed: &[u8],
+    ) -> Option<Zeroizing<Vec<u8>>> {
+        let sealed = Sealed::from_bytes(sealed).ok()?;
+        self.state_key
+            .open(PUSH_TOKEN_CONTEXT, device.as_bytes(), &sealed)
             .ok()
             .map(Zeroizing::new)
     }

@@ -11,12 +11,13 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::accounts::{AuthSecrets, push_token_aad};
+use crate::accounts::AuthSecrets;
 use crate::jobs::Job;
 
 /// The key a provider coalesces wake-ups under: several changes are one wake-up.
@@ -112,6 +113,28 @@ pub enum PushDelivery {
     GiveUp(String),
 }
 
+/// How long one send may take before it counts as "try again later".
+pub const SEND_TIMEOUT: Duration = Duration::from_secs(10);
+/// The most devices one job wakes. Past it a device is simply not woken: it syncs when it is next
+/// opened, as a device without a push token does.
+pub const MAX_DEVICES_PER_JOB: usize = 50;
+
+/// The handler's bounds, so a test can shorten them.
+#[derive(Clone, Copy, Debug)]
+pub struct Options {
+    pub send_timeout: Duration,
+    pub max_devices: usize,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            send_timeout: SEND_TIMEOUT,
+            max_devices: MAX_DEVICES_PER_JOB,
+        }
+    }
+}
+
 fn message_id(job: Uuid, device: Uuid) -> Uuid {
     let digest = Sha256::new()
         .chain_update(job.as_bytes())
@@ -123,12 +146,23 @@ fn message_id(job: Uuid, device: Uuid) -> Uuid {
 }
 
 /// Wakes the devices of the account that subscribed to the zone and have a token, except the one
-/// that wrote the change. Safe to run again for one job: the message ids repeat.
+/// that wrote the change. A retry of one job wakes only the devices it has not reached yet.
 pub async fn handle_zone_changed(
     pool: &PgPool,
     secrets: Option<&AuthSecrets>,
     sender: &dyn PushSender,
     job: &Job,
+) -> PushDelivery {
+    handle_zone_changed_with(pool, secrets, sender, job, &Options::default()).await
+}
+
+/// [`handle_zone_changed`] with its bounds given.
+pub async fn handle_zone_changed_with(
+    pool: &PgPool,
+    secrets: Option<&AuthSecrets>,
+    sender: &dyn PushSender,
+    job: &Job,
+    options: &Options,
 ) -> PushDelivery {
     // No provider: nothing is read, sent or logged, as before push existed.
     if !sender.active() {
@@ -147,48 +181,70 @@ pub async fn handle_zone_changed(
     else {
         return PushDelivery::GiveUp("the job does not name a zone and an account".to_owned());
     };
-    let rows: Result<Vec<(Uuid, String, Vec<u8>)>, _> = sqlx::query_as(
-        "SELECT p.device_id, p.provider, p.sealed_token FROM push_tokens p
+    // Trusted devices with a token that subscribed to the zone, other than the author, that this
+    // job has not reached yet.
+    let rows: Result<Vec<(Uuid, String, Vec<u8>, Vec<u8>)>, _> = sqlx::query_as(
+        "SELECT p.device_id, p.provider, p.sealed_token, p.token_digest
+         FROM push_tokens p
+         JOIN devices d ON d.id = p.device_id AND d.state = 'trusted'
          WHERE p.account_id = $1 AND p.device_id <> $2
            AND EXISTS (SELECT 1 FROM subscriptions s
-                       WHERE s.device_id = p.device_id AND (s.zone_id IS NULL OR s.zone_id = $3))",
+                       WHERE s.device_id = p.device_id AND (s.zone_id IS NULL OR s.zone_id = $3))
+           AND NOT EXISTS (SELECT 1 FROM push_deliveries r
+                           WHERE r.job_id = $4 AND r.device_id = p.device_id)
+         ORDER BY p.device_id LIMIT $5",
     )
     .bind(account)
     .bind(author)
     .bind(zone)
+    .bind(job.id)
+    .bind(i64::try_from(options.max_devices).unwrap_or(i64::MAX))
     .fetch_all(pool)
     .await;
     let Ok(rows) = rows else {
         return PushDelivery::Retry("the devices to wake could not be read".to_owned());
     };
     let mut retry = false;
-    for (device, provider, sealed) in rows {
-        // A token that does not open (another setup sealed it) or a provider we do not know is
-        // no token: it is deleted, and the device registers again at its next launch.
-        let opened = secrets.open_mail(&push_token_aad(device), &sealed);
+    for (device, provider, sealed, digest) in rows {
+        // A token that does not open (another setup sealed it, or it was copied from another
+        // device) or a provider we do not know is no token: it is deleted, and the device
+        // registers again at its next launch.
+        let opened = secrets.open_push_token(device, &sealed);
         let token = opened
             .as_deref()
             .and_then(|bytes| std::str::from_utf8(bytes).ok());
         let provider = PushProvider::parse(&provider);
         let outcome = match (token, provider) {
             (Some(token), Some(provider)) => {
-                sender
-                    .send(Push {
-                        provider,
-                        token,
-                        collapse_key: COLLAPSE_KEY,
-                        message_id: message_id(job.id, device),
-                    })
+                let send = sender.send(Push {
+                    provider,
+                    token,
+                    collapse_key: COLLAPSE_KEY,
+                    message_id: message_id(job.id, device),
+                });
+                // A provider that never answers is "try again later", not a stuck job.
+                tokio::time::timeout(options.send_timeout, send)
                     .await
+                    .unwrap_or(PushOutcome::Retry)
             }
             _ => PushOutcome::TokenInvalid,
         };
         match outcome {
-            PushOutcome::Sent => {}
+            PushOutcome::Sent => {
+                // Remembered, so a retry of this job leaves this device alone. Losing it costs
+                // at worst one more wake-up.
+                let _ = sqlx::query(
+                    "INSERT INTO push_deliveries (job_id, device_id) VALUES ($1, $2)
+                     ON CONFLICT DO NOTHING",
+                )
+                .bind(job.id)
+                .bind(device)
+                .execute(pool)
+                .await;
+            }
             PushOutcome::Retry => retry = true,
             PushOutcome::TokenInvalid => {
-                let gone = delete_token(pool, device).await;
-                if gone.is_err() {
+                if delete_token(pool, device, &digest).await.is_err() {
                     retry = true;
                 }
             }
@@ -201,15 +257,22 @@ pub async fn handle_zone_changed(
     }
 }
 
-/// Deletes a device's token and its all-zones subscription.
-async fn delete_token(pool: &PgPool, device: Uuid) -> Result<(), sqlx::Error> {
-    sqlx::query("DELETE FROM push_tokens WHERE device_id = $1")
+/// Deletes the token the provider refused (identified by its digest, so a token the device
+/// registered since is not touched) and, only if it was deleted, the device's all-zones
+/// subscription, in one transaction.
+async fn delete_token(pool: &PgPool, device: Uuid, digest: &[u8]) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let gone = sqlx::query("DELETE FROM push_tokens WHERE device_id = $1 AND token_digest = $2")
         .bind(device)
-        .execute(pool)
-        .await?;
-    sqlx::query("DELETE FROM subscriptions WHERE device_id = $1 AND zone_id IS NULL")
-        .bind(device)
-        .execute(pool)
-        .await?;
-    Ok(())
+        .bind(digest)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if gone == 1 {
+        sqlx::query("DELETE FROM subscriptions WHERE device_id = $1 AND zone_id IS NULL")
+            .bind(device)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await
 }

@@ -15,13 +15,6 @@ const MAX_TOKEN: usize = 512;
 /// hands its app a token.
 pub const PUSH_TOKEN_DAYS: i32 = 90;
 
-/// What binds a sealed token to its device.
-pub fn push_token_aad(device: Uuid) -> Vec<u8> {
-    let mut aad = device.as_bytes().to_vec();
-    aad.extend_from_slice(b"orbyn/push-token/v1");
-    aad
-}
-
 impl Accounts {
     /// Registers (or replaces) the token of the session's device and subscribes it to every zone.
     /// The same token registered by another device moves to this one.
@@ -52,7 +45,7 @@ impl Accounts {
         let digest = self.secrets.digest("push-token", token.as_bytes());
         let sealed = self
             .secrets
-            .seal_mail(&push_token_aad(session.device_id), token.as_bytes())
+            .seal_push_token(session.device_id, token.as_bytes())
             .ok_or(AccountError::Internal)?;
 
         // Two devices registering one token at once: the loser's insert hits the unique digest,
@@ -83,11 +76,18 @@ impl Accounts {
         Self::lock_account_shared(&mut tx, session.account_id).await?;
         self.require_trusted(&mut tx, session).await?;
         // The OS token follows the install: whoever held it before loses it.
-        sqlx::query("DELETE FROM push_tokens WHERE token_digest = $1 AND device_id <> $2")
-            .bind(digest.as_slice())
-            .bind(session.device_id)
-            .execute(&mut *tx)
-            .await?;
+        // The old holder's all-zones subscription goes with it, as on every other path.
+        sqlx::query(
+            "WITH gone AS (
+                 DELETE FROM push_tokens WHERE token_digest = $1 AND device_id <> $2
+                 RETURNING device_id)
+             DELETE FROM subscriptions
+             WHERE zone_id IS NULL AND device_id IN (SELECT device_id FROM gone)",
+        )
+        .bind(digest.as_slice())
+        .bind(session.device_id)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query(
             "INSERT INTO push_tokens (device_id, account_id, provider, token_digest, sealed_token)
              VALUES ($1, $2, $3, $4, $5)

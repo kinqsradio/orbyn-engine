@@ -32,7 +32,7 @@ pub const TOMBSTONE_DAYS: i32 = 400;
 
 pub use delete_unused::{DELETE_UNUSED_TTL, REQUEST_JOB_KIND as DELETE_UNUSED_JOB_KIND};
 pub use limits::{Limit, Limits};
-pub use push_tokens::{PUSH_TOKEN_DAYS, push_token_aad};
+pub use push_tokens::PUSH_TOKEN_DAYS;
 pub use second_factor::{ManageProof, TotpEnrolment};
 pub use secrets::{AuthSecrets, SecretsError};
 

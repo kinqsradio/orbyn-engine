@@ -6696,6 +6696,11 @@ async fn a_token_registers_replaces_moves_and_is_refused_where_it_should_be() {
         StatusCode::NO_CONTENT
     );
     assert_eq!(server.push_rows(p.account_id).await, 0, "moved away");
+    assert_eq!(
+        server.all_zone_subscriptions(a_id).await,
+        0,
+        "the old holder's subscription went with the token"
+    );
     assert_eq!(server.push_rows(other.account_id).await, 1);
 
     // Deleting ends the token and its subscription, and deleting again is fine.
@@ -6973,7 +6978,9 @@ async fn the_handler_wakes_each_subscribed_device_with_a_token_and_says_nothing(
         (PushProvider::Fcm, b_tok.as_str())
     );
 
-    // A retry is the same message to the provider; a provider that is down is a retry for the job.
+    // A provider that is down is a retry for the job (b was reached by the job above, so a new
+    // job is used), and its message id is the same each time it is tried.
+    let job = zone_job(p.account_id, zone, a_id);
     let down = Recording::new(PushOutcome::Retry);
     let first = handle_zone_changed(pool, Some(&secrets), &down, &job).await;
     let second = handle_zone_changed(pool, Some(&secrets), &down, &job).await;
@@ -7092,4 +7099,276 @@ async fn the_default_sender_reads_nothing_and_a_token_sealed_by_another_setup_is
     );
     assert!(sender.seen.lock().expect("lock").is_empty(), "never sent");
     assert_eq!(server.push_rows(p.account_id).await, 0, "deleted");
+}
+
+/// A trusted device added by SQL (the approval protocol is not the subject), with a registered
+/// token, as `Pair` has none to spare. Returns its id.
+async fn extra_device_with_token(server: &Server, account: Uuid, token: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    orbyn_core::sqlx::query(
+        "INSERT INTO devices (id, account_id, name, platform, signing_key, agreement_key, state, approved_at)
+         VALUES ($1, $2, 'extra', 'linux', $3, $4, 'trusted', now())",
+    )
+    .bind(id)
+    .bind(account)
+    .bind(rand32().as_slice())
+    .bind(rand32().as_slice())
+    .execute(server.db.pool())
+    .await
+    .expect("device");
+    let session = orbyn_core::accounts::Session {
+        id: Uuid::new_v4(),
+        account_id: account,
+        device_id: id,
+        device_state: orbyn_core::accounts::DeviceState::Trusted,
+    };
+    server
+        .worker()
+        .register_push_token(
+            &orbyn_core::accounts::Client::default(),
+            &session,
+            orbyn_core::push::PushProvider::Fcm,
+            token,
+        )
+        .await
+        .expect("registered");
+    id
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_sealed_token_copied_to_another_device_does_not_open_there() {
+    use orbyn_core::push::{PushDelivery, PushOutcome, handle_zone_changed};
+    let _turn = TURN.lock().await;
+    let server = server_with(push_limits()).await;
+    let p = two_trusted(&server).await;
+    let (a_id, b_id) = (
+        uuid_of(&p.a_session["device_id"]),
+        uuid_of(&p.b_session["device_id"]),
+    );
+    let (a_tok, b_tok) = (
+        format!("a-{}", Uuid::new_v4()),
+        format!("b-{}", Uuid::new_v4()),
+    );
+    server.put_push(&p.a_session, "apns", &a_tok).await;
+    server.put_push(&p.b_session, "fcm", &b_tok).await;
+    // a's sealed token is copied onto b's row (with a's digest, as a copy of the whole row would
+    // have it): b's push opens it with b's id and finds nothing.
+    orbyn_core::sqlx::query(
+        "UPDATE push_tokens SET sealed_token = (SELECT sealed_token FROM push_tokens WHERE device_id = $1)
+         WHERE device_id = $2",
+    )
+    .bind(a_id)
+    .bind(b_id)
+    .execute(server.db.pool())
+    .await
+    .expect("copied");
+    let sender = Recording::new(PushOutcome::Sent);
+    // A change written by a wakes b, whose row now holds a token sealed for a.
+    let job = zone_job(p.account_id, Uuid::new_v4(), a_id);
+    let done = handle_zone_changed(server.db.pool(), Some(&secrets()), &sender, &job).await;
+    assert_eq!(done, PushDelivery::Done);
+    assert!(
+        sender.seen.lock().expect("lock").is_empty(),
+        "nothing was sent to anyone"
+    );
+    let rows: i64 =
+        orbyn_core::sqlx::query_scalar("SELECT count(*) FROM push_tokens WHERE device_id = $1")
+            .bind(b_id)
+            .fetch_one(server.db.pool())
+            .await
+            .expect("rows");
+    assert_eq!(rows, 0, "the copied row is deleted");
+    assert_eq!(server.all_zone_subscriptions(b_id).await, 0);
+    assert_eq!(
+        server.push_rows(p.account_id).await,
+        1,
+        "a's own token is untouched"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_refused_token_does_not_delete_the_one_the_device_registered_since() {
+    use orbyn_core::push::{PushDelivery, PushOutcome, PushSender, handle_zone_changed};
+    let _turn = TURN.lock().await;
+    let server = server_with(push_limits()).await;
+    let p = two_trusted(&server).await;
+    let (a_id, b_id) = (
+        uuid_of(&p.a_session["device_id"]),
+        uuid_of(&p.b_session["device_id"]),
+    );
+    server
+        .put_push(&p.b_session, "apns", &format!("old-{}", Uuid::new_v4()))
+        .await;
+
+    // While the provider is answering "invalid" for the old token, the device registers a new one.
+    struct Racing<'a> {
+        server: &'a Server,
+        session: &'a Value,
+        fresh: String,
+    }
+    impl PushSender for Racing<'_> {
+        fn send<'a>(&'a self, _: orbyn_core::push::Push<'a>) -> orbyn_core::push::PushFuture<'a> {
+            Box::pin(async move {
+                let (status, _) = self.server.put_push(self.session, "fcm", &self.fresh).await;
+                assert_eq!(status, StatusCode::NO_CONTENT);
+                PushOutcome::TokenInvalid
+            })
+        }
+    }
+    let fresh = format!("new-{}", Uuid::new_v4());
+    let sender = Racing {
+        server: &server,
+        session: &p.b_session,
+        fresh: fresh.clone(),
+    };
+    let job = zone_job(p.account_id, Uuid::new_v4(), a_id);
+    let done = handle_zone_changed(server.db.pool(), Some(&secrets()), &sender, &job).await;
+    assert_eq!(done, PushDelivery::Done);
+    // The new token, and the subscription it needs, are still there.
+    assert_eq!(server.push_rows(p.account_id).await, 1);
+    assert_eq!(server.all_zone_subscriptions(b_id).await, 1);
+    let provider: String =
+        orbyn_core::sqlx::query_scalar("SELECT provider FROM push_tokens WHERE device_id = $1")
+            .bind(b_id)
+            .fetch_one(server.db.pool())
+            .await
+            .expect("provider");
+    assert_eq!(provider, "fcm");
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn signing_out_ends_the_wake_ups_of_that_device_or_of_all() {
+    let _turn = TURN.lock().await;
+    let server = server_with(push_limits()).await;
+    let p = two_trusted(&server).await;
+    let (a_id, b_id) = (
+        uuid_of(&p.a_session["device_id"]),
+        uuid_of(&p.b_session["device_id"]),
+    );
+    server
+        .put_push(&p.a_session, "apns", &format!("a-{}", Uuid::new_v4()))
+        .await;
+    server
+        .put_push(&p.b_session, "fcm", &format!("b-{}", Uuid::new_v4()))
+        .await;
+    assert_eq!(
+        (
+            server.push_rows(p.account_id).await,
+            server.all_zone_subscriptions(b_id).await
+        ),
+        (2, 1)
+    );
+
+    // b signs out: its token and subscription go, a's stay.
+    let (status, _) = server
+        .call(
+            Method::DELETE,
+            "/v1/sessions/current",
+            Some(token(&p.b_session)),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(server.push_rows(p.account_id).await, 1);
+    assert_eq!(server.all_zone_subscriptions(b_id).await, 0);
+    assert_eq!(server.all_zone_subscriptions(a_id).await, 1);
+
+    // a signs every device out: none is left.
+    let (status, _) = server
+        .call(
+            Method::DELETE,
+            "/v1/sessions",
+            Some(token(&p.a_session)),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(server.push_rows(p.account_id).await, 0);
+    assert_eq!(server.all_zone_subscriptions(a_id).await, 0);
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_retry_wakes_only_the_devices_that_failed_and_the_handler_is_bounded() {
+    use orbyn_core::push::{
+        Options, PushDelivery, PushOutcome, handle_zone_changed, handle_zone_changed_with,
+    };
+    let _turn = TURN.lock().await;
+    let server = server_with(push_limits()).await;
+    let p = two_trusted(&server).await;
+    let a_id = uuid_of(&p.a_session["device_id"]);
+    let (good, bad) = (
+        format!("good-{}", Uuid::new_v4()),
+        format!("bad-{}", Uuid::new_v4()),
+    );
+    extra_device_with_token(&server, p.account_id, &good).await;
+    extra_device_with_token(&server, p.account_id, &bad).await;
+    let pool = server.db.pool();
+    let secrets = secrets();
+
+    // A sender that fails only for the "bad" token.
+    struct Picky(std::sync::Mutex<Vec<String>>, String);
+    impl orbyn_core::push::PushSender for Picky {
+        fn send<'a>(
+            &'a self,
+            push: orbyn_core::push::Push<'a>,
+        ) -> orbyn_core::push::PushFuture<'a> {
+            self.0.lock().expect("lock").push(push.token.to_owned());
+            let answer = if push.token == self.1 {
+                PushOutcome::Retry
+            } else {
+                PushOutcome::Sent
+            };
+            Box::pin(async move { answer })
+        }
+    }
+    let sender = Picky(std::sync::Mutex::new(Vec::new()), bad.clone());
+    let job = zone_job(p.account_id, Uuid::new_v4(), a_id);
+    let first = handle_zone_changed(pool, Some(&secrets), &sender, &job).await;
+    assert!(matches!(first, PushDelivery::Retry(_)));
+    let mut tried = sender.0.lock().expect("lock").clone();
+    tried.sort();
+    let mut both = vec![good.clone(), bad.clone()];
+    both.sort();
+    assert_eq!(tried, both);
+    // The retry of the same job reaches only the device that failed.
+    sender.0.lock().expect("lock").clear();
+    let second = handle_zone_changed(pool, Some(&secrets), &sender, &job).await;
+    assert!(matches!(second, PushDelivery::Retry(_)));
+    assert_eq!(sender.0.lock().expect("lock").as_slice(), [bad.clone()]);
+    // A new job is a new wake-up for everyone.
+    sender.0.lock().expect("lock").clear();
+    let other = zone_job(p.account_id, Uuid::new_v4(), a_id);
+    handle_zone_changed(pool, Some(&secrets), &sender, &other).await;
+    assert_eq!(sender.0.lock().expect("lock").len(), 2);
+
+    // A provider that never answers is a retry after the time given, not a stuck job.
+    struct Silent;
+    impl orbyn_core::push::PushSender for Silent {
+        fn send<'a>(&'a self, _: orbyn_core::push::Push<'a>) -> orbyn_core::push::PushFuture<'a> {
+            Box::pin(std::future::pending())
+        }
+    }
+    let quick = Options {
+        send_timeout: Duration::from_millis(200),
+        max_devices: 50,
+    };
+    let job = zone_job(p.account_id, Uuid::new_v4(), a_id);
+    let started = std::time::Instant::now();
+    let answer = handle_zone_changed_with(pool, Some(&secrets), &Silent, &job, &quick).await;
+    assert!(matches!(answer, PushDelivery::Retry(_)));
+    assert!(started.elapsed() < Duration::from_secs(5));
+
+    // A job wakes at most the number of devices given.
+    let capped = Options {
+        send_timeout: Duration::from_secs(10),
+        max_devices: 1,
+    };
+    let sender = Recording::new(PushOutcome::Sent);
+    let job = zone_job(p.account_id, Uuid::new_v4(), a_id);
+    handle_zone_changed_with(pool, Some(&secrets), &sender, &job, &capped).await;
+    assert_eq!(sender.seen.lock().expect("lock").len(), 1);
 }

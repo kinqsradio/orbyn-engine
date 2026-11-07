@@ -464,6 +464,21 @@ pub async fn prune(pool: &PgPool) -> Result<u64, sqlx::Error> {
             break;
         }
     }
+    // What retried pushes have already sent: the job is long finished after a week.
+    for _ in 0..100 {
+        let n = sqlx::query(
+            "DELETE FROM push_deliveries WHERE ctid IN (
+                 SELECT ctid FROM push_deliveries WHERE sent_at < now() - interval '7 days'
+                 LIMIT 5000)",
+        )
+        .execute(pool)
+        .await?
+        .rows_affected();
+        removed += n;
+        if n < BATCH {
+            break;
+        }
+    }
     for statement in STATEMENTS {
         // Keep deleting until a batch comes back short, so pruning keeps up
         // however fast rows arrive; the cap stops one run from going on forever.
