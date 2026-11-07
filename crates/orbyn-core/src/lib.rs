@@ -6,6 +6,7 @@ pub mod db;
 pub mod feeds;
 pub mod jobs;
 pub mod mail;
+pub mod push;
 
 pub use accounts::Accounts;
 pub use config::Config;

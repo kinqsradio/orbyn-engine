@@ -757,6 +757,16 @@ impl Accounts {
         .bind(device_id)
         .execute(&mut *tx)
         .await?;
+        // A removed device keeps its row for its history, so its wake-up token is deleted here
+        // with the subscription it made.
+        sqlx::query("DELETE FROM push_tokens WHERE device_id = $1")
+            .bind(device_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM subscriptions WHERE device_id = $1")
+            .bind(device_id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query(
             "UPDATE device_approvals SET state = 'closed'
              WHERE (device_id = $1 OR approver_id = $1) AND state = 'open'",

@@ -20,6 +20,7 @@ mod delete_unused;
 mod devices;
 mod email;
 pub mod limits;
+mod push_tokens;
 mod second_factor;
 pub mod secrets;
 mod sessions;
@@ -31,6 +32,7 @@ pub const TOMBSTONE_DAYS: i32 = 400;
 
 pub use delete_unused::{DELETE_UNUSED_TTL, REQUEST_JOB_KIND as DELETE_UNUSED_JOB_KIND};
 pub use limits::{Limit, Limits};
+pub use push_tokens::{PUSH_TOKEN_DAYS, push_token_aad};
 pub use second_factor::{ManageProof, TotpEnrolment};
 pub use secrets::{AuthSecrets, SecretsError};
 
@@ -365,6 +367,8 @@ enum AuditAction {
     AccountDeletionCancelled,
     AccountDeleted,
     AccountDeleteUnusedConfirmed,
+    DevicePushRegistered,
+    DevicePushRemoved,
 }
 
 impl AuditAction {
@@ -389,6 +393,8 @@ impl AuditAction {
             Self::AccountDeletionCancelled => "account.deletion_cancelled",
             Self::AccountDeleted => "account.deleted",
             Self::AccountDeleteUnusedConfirmed => "account.delete_unused_confirmed",
+            Self::DevicePushRegistered => "device.push_registered",
+            Self::DevicePushRemoved => "device.push_removed",
         }
     }
 }

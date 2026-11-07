@@ -84,6 +84,8 @@ pub struct Limits {
     pub delete_unused_wrong_per_prefix: Limit,
     /// Asks whether an account was deleted, from one IP prefix: 60 an hour.
     pub account_status_per_prefix: Limit,
+    /// Push token registrations by one device: 10 an hour.
+    pub push_register_per_device: Limit,
 }
 
 impl Default for Limits {
@@ -114,6 +116,7 @@ impl Default for Limits {
             delete_unused_mail_per_account: Limit::new(3, Duration::from_secs(60 * MINUTE)),
             delete_unused_wrong_per_prefix: Limit::new(10, Duration::from_secs(60 * MINUTE)),
             account_status_per_prefix: Limit::new(60, Duration::from_secs(60 * MINUTE)),
+            push_register_per_device: Limit::new(10, Duration::from_secs(60 * MINUTE)),
             account_delete_schedules_per_account: Limit::new(
                 3,
                 Duration::from_secs(24 * 60 * MINUTE),
@@ -437,6 +440,27 @@ pub async fn prune(pool: &PgPool) -> Result<u64, sqlx::Error> {
         .rows_affected();
         removed += n;
         if n < BATCH {
+            break;
+        }
+    }
+    // Push tokens not refreshed for 90 days, and the all-zones subscription each one made.
+    for _ in 0..100 {
+        let n: i64 = sqlx::query_scalar(
+            "WITH gone AS (
+                 DELETE FROM push_tokens WHERE device_id IN (
+                     SELECT device_id FROM push_tokens
+                     WHERE refreshed_at < now() - make_interval(days => $1) LIMIT 5000)
+                 RETURNING device_id),
+             ended AS (
+                 DELETE FROM subscriptions
+                 WHERE zone_id IS NULL AND device_id IN (SELECT device_id FROM gone))
+             SELECT count(*) FROM gone",
+        )
+        .bind(super::PUSH_TOKEN_DAYS)
+        .fetch_one(pool)
+        .await?;
+        removed += n as u64;
+        if n < BATCH as i64 {
             break;
         }
     }
