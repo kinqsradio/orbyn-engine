@@ -17,6 +17,7 @@ orbyn-sync = { path = "crates/orbyn-sync" }
 orbyn-core = { path = "crates/orbyn-core" }
 orbyn-planner = { path = "crates/orbyn-planner" }
 orbyn-server = { path = "crates/orbyn-server" }
+orbyn-keyservice = { path = "crates/orbyn-keyservice" }
 orbyn-store = { path = "crates/orbyn-store" }
 orbyn-worker = { path = "crates/orbyn-worker" }
 
@@ -36,6 +37,8 @@ opaque-getrandom = { package = "getrandom", version = "0.2" }
 opaque-rand-core = { package = "rand_core", version = "0.6", features = ["getrandom"] }
 opaque-sha2 = { package = "sha2", version = "0.10", default-features = false }
 hkdf = "0.13"
+# PKCS#11 for the key service (Apache-2.0). Only `orbyn-keyservice`, behind its `pkcs11` feature, uses it.
+cryptoki = "0.12"
 # NIST P-256 for the account service key (Standard protection). RustCrypto, Apache-2.0 OR MIT, and it
 # builds for wasm.
 p256 = { version = "0.14", default-features = false, features = ["arithmetic", "ecdh"] }

@@ -25,11 +25,12 @@ The plan lives in the [Orbyn platform plan](https://claude.ai/artifact/BBhxZSmXR
 | `orbyn-wasm` | JavaScript bindings (wasm-bindgen) for sign-in, device keys and the sync engine | The web |
 | `orbyn-core` | Configuration, Postgres, migrations, job queue, accounts and devices | Server |
 | `orbyn-store` | The CloudKit-style record store: zones, encrypted records, change tokens, uploads, live notices | Server |
+| `orbyn-keyservice` | The key service library: the `Hsm` trait, service-key certification, opening service envelopes, and `orbyn keyservice init`. PKCS#11 (SoftHSM, cloud HSMs) is behind its `pkcs11` feature, and an in-memory HSM for tests behind `test-support`. No HTTP and no deployment yet | Key service |
 | `orbyn-server` | HTTP API and the `/v1/sync` WebSocket | Server |
 | `orbyn-worker` | Job runner | Server |
 | `orbyn-cli` | The `orbyn` binary with every role | Server |
 
-Later phases add local storage for `orbyn-client` (SQLite on desktop and mobile), `orbyn-keychain` and `orbyn-keyservice` (HSM-held keys), as the plan describes.
+Later phases add local storage for `orbyn-client` (SQLite on desktop and mobile), `orbyn-keychain`, and the key service's own deployment, store and routes (`orbyn-keyservice` is its library), as the plan describes.
 
 ## Cryptography
 

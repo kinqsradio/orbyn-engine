@@ -28,11 +28,45 @@ enum Command {
     /// once per deployment and keep it in the secret store: every replica needs
     /// the same value, and a new one makes every existing password unusable.
     AuthSetup,
+    /// The key service (Standard protection).
+    #[command(subcommand)]
+    Keyservice(Keyservice),
     /// Exit 0 if the API at ADDRESS answers /health, for container health checks.
     Health {
         #[arg(default_value = "127.0.0.1:8080")]
         address: String,
     },
+}
+
+#[derive(Subcommand)]
+enum Keyservice {
+    /// Make the key-encryption key and the first signing identity in the HSM that
+    /// ORBYN_HSM_MODULE, ORBYN_HSM_SLOT and ORBYN_HSM_PIN name, and print the identity's
+    /// public key for client configuration to pin. Refuses, changing nothing, when the keys
+    /// already exist.
+    Init,
+}
+
+/// `orbyn keyservice init`.
+fn keyservice_init() -> ExitCode {
+    use base64::Engine as _;
+    match orbyn_keyservice::pkcs11::init_from_env() {
+        Ok(public) => {
+            println!(
+                "identity_version={}",
+                orbyn_keyservice::FIRST_IDENTITY_VERSION
+            );
+            println!(
+                "identity_public_key={}",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(public)
+            );
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            eprintln!("orbyn keyservice init: {message}");
+            ExitCode::from(2)
+        }
+    }
 }
 
 fn init_tracing() {
@@ -57,6 +91,9 @@ async fn main() -> ExitCode {
         println!("{}", orbyn_core::accounts::AuthSecrets::generate().as_str());
         return ExitCode::SUCCESS;
     }
+    if let Command::Keyservice(Keyservice::Init) = &cli.command {
+        return keyservice_init();
+    }
     init_tracing();
     let config = match Config::from_env() {
         Ok(config) => config,
@@ -69,7 +106,7 @@ async fn main() -> ExitCode {
         Command::Serve => serve(config).await,
         Command::Worker => worker(config).await,
         Command::Migrate => migrate(config).await,
-        Command::Health { .. } | Command::AuthSetup => Ok(()),
+        Command::Health { .. } | Command::AuthSetup | Command::Keyservice(_) => Ok(()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

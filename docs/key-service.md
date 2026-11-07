@@ -89,7 +89,7 @@ It does not trust its own rows for time. A recovery's 72 hours are measured from
     - recovery approvals.
   - **Certification.** The key service signs a service key only one it generated inside the HSM in the same call. It has no API that takes a key to sign.
 - **Account service key.** One X25519 pair per Standard account, generated in the HSM when the account first signs Standard.
-  - The private key leaves the HSM only wrapped under the key-encryption key (CKM_AES_KEY_WRAP_KWP), stored in the key service's schema.
+  - The private key leaves the HSM only wrapped under the key-encryption key (`CKM_AES_KEY_WRAP_PAD`, the AES key wrap with padding of RFC 5649, which is KWP; SoftHSM 2.6 has no mechanism by the name `CKM_AES_KEY_WRAP_KWP`, and a cloud HSM that offers it under that name can be configured to use it), stored in the key service's schema.
   - To open envelopes, it is unwrapped back into the HSM as a non-extractable session object and destroyed afterwards.
 - **Service envelopes.** These use the device envelope format (`orbyn_crypto::wrap_key`) with the service public key as the recipient and the same label (`orbyn/zone-key/v1`, account, zone, key id).
   - `key_envelopes` gains a recipient kind, `device` or `service`.
@@ -259,9 +259,9 @@ A cancel is a statement signed by a device (`orbyn/recovery-cancel/v1`: account,
 
 ## Running it
 
-- **PKCS#11** through the `cryptoki` crate (Apache-2.0 or MIT).
+- **PKCS#11** through the `cryptoki` crate (Apache-2.0).
   - Production: a cloud HSM with a PKCS#11 library. The provider is an open decision.
-  - Development, CI and self-hosting: SoftHSM 2.6 or later. Its Curve25519 support is believed to cover X25519 derive (CKK_EC_MONTGOMERY); step 3 confirms this with a test before relying on it. SoftHSM has no CKM_HKDF_DERIVE, so these use the one-at-a-time fallback.
+  - Development, CI and self-hosting: SoftHSM 2.6.1 or later. Checked against 2.6.1: ECDH derive on P-256 (`CKM_ECDH1_DERIVE`, `CKD_NULL`), Ed25519 signing (`CKM_EC_EDWARDS_KEY_PAIR_GEN`, `CKM_EDDSA`), and AES key wrap with padding (`CKM_AES_KEY_WRAP_PAD`). It has no Curve25519 key agreement (no `CKM_EC_MONTGOMERY_KEY_PAIR_GEN`), which is why the account service key is P-256, and no `CKM_HKDF_DERIVE`, so these use the one-at-a-time fallback. A key unwrapped into SoftHSM as a non-extractable session object reports itself as such (a test checks it).
 - **Configuration:**
   - `ORBYN_HSM_MODULE`, `ORBYN_HSM_SLOT`, `ORBYN_HSM_PIN` (a secret);
   - the key service URL and mutual TLS settings, in `orbyn-server`;

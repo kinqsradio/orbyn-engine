@@ -64,6 +64,20 @@ impl P256Point {
         Ok(Self { compressed, key })
     }
 
+    /// Reads the public key an HSM reports for a P-256 key (`CKA_EC_POINT`): the point as SEC1,
+    /// compressed (33 bytes) or uncompressed (65 bytes), optionally inside the DER OCTET STRING
+    /// PKCS#11 wraps it in. It is validated like any key and re-encoded compressed, the one form
+    /// this suite uses. Not for keys that come from a peer: those go through [`P256Point::parse`].
+    pub fn from_hsm_point(bytes: &[u8]) -> Result<Self, CryptoError> {
+        let point = match bytes {
+            [0x04, 0x21, rest @ ..] if rest.len() == 33 => rest,
+            [0x04, 0x41, rest @ ..] if rest.len() == 65 => rest,
+            other => other,
+        };
+        let key = PublicKey::from_sec1_bytes(point).map_err(|_| CryptoError::InvalidKey)?;
+        Ok(point_of(&key))
+    }
+
     /// The 33-byte compressed form.
     pub fn compressed(&self) -> &[u8; P256_POINT_LEN] {
         &self.compressed

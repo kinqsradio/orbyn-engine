@@ -1,0 +1,28 @@
+[package]
+name = "orbyn-keyservice"
+description = "The key service library: an HSM trait, service-key certification and opening service envelopes."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+# The PKCS#11 implementation (SoftHSM, cloud HSMs). Off by default: without it the crate builds
+# with no PKCS#11 library and no `cryptoki`.
+pkcs11 = ["dep:cryptoki"]
+# The in-memory HSM for tests. Never enabled by a build the key service ships in.
+test-support = ["dep:ed25519-dalek"]
+
+[dependencies]
+cryptoki = { workspace = true, optional = true }
+ed25519-dalek = { workspace = true, optional = true }
+orbyn-crypto.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+ed25519-dalek.workspace = true
+orbyn-keyservice = { path = ".", features = ["test-support"] }
+
+[lints]
+workspace = true
