@@ -155,7 +155,11 @@ async fn a_cosign_over_http_answers_the_cosignature_and_the_newest_head_follows(
 
     let chain = Chain::new(30, 30, T0);
     let request = chain.svc.request(0, 30, [0; 32], T0);
-    let cosignature = client.cosign(&request).await.expect("cosigned");
+    let cosignature = client
+        .cosign(&request)
+        .await
+        .expect("cosigned")
+        .expect("a final head is signed");
     assert_eq!(cosignature.head_hash, request.head.hash());
     assert_eq!(cosignature.time_ms, T0);
     assert!(cosignature.verify(&witness.public));
@@ -236,7 +240,8 @@ async fn the_witness_cosigns_the_newest_head_again_on_its_own_schedule() {
     let first = client
         .cosign(&chain.svc.request(0, 10, [0; 32], T0))
         .await
-        .expect("first");
+        .expect("first")
+        .expect("a final head is signed");
     // Ten minutes on, with no new head: the same head, a fresh witness time.
     witness.clock.advance(10 * 60 * 1000);
     assert!(witness.service.recosign());
@@ -1213,7 +1218,8 @@ async fn an_answer_without_end_is_not_read_past_the_limit_and_a_huge_request_is_
 
 // ---- Round 2 of the review ----
 
-/// A witness that records what it is asked, and answers every cosign with a valid cosignature.
+/// A witness that records what it is asked, and answers every final head with a valid cosignature
+/// (an intermediate one with nothing, as a witness does).
 async fn recording_witness(
     seed: u8,
 ) -> (
@@ -1222,6 +1228,7 @@ async fn recording_witness(
     Arc<Mutex<Vec<(bool, Hash)>>>,
     tokio::task::JoinHandle<()>,
 ) {
+    use axum::response::IntoResponse;
     use axum::routing::{get, post};
     use ed25519_dalek::Signer;
     let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
@@ -1241,6 +1248,10 @@ async fn recording_witness(
                     let request = wire::decode_request(&body).expect("a request");
                     let hash = request.head.hash();
                     log.lock().expect("lock").push((request.intermediate, hash));
+                    // A head on the way is accepted and not signed: 204, no body.
+                    if request.intermediate {
+                        return axum::http::StatusCode::NO_CONTENT.into_response();
+                    }
                     let signature = key
                         .sign(&orbyn_witness::cosign_message(&hash, T0))
                         .to_bytes();
@@ -1249,7 +1260,7 @@ async fn recording_witness(
                         time_ms: T0,
                         signature,
                     };
-                    cosignature.encode().to_vec()
+                    cosignature.encode().to_vec().into_response()
                 }
             }),
         );
@@ -1500,7 +1511,8 @@ async fn a_catch_up_cut_short_resumes_from_the_chain_head_and_reaches_the_target
                 .svc
                 .request(from, to, chain.head(prev).hash(), chain.head(head).time_ms);
         request.intermediate = true;
-        client.cosign(&request).await.expect("on the way");
+        // A head on the way is accepted and not signed: the answer is nothing at all.
+        assert_eq!(client.cosign(&request).await, Ok(None));
     }
     assert_eq!(witness.service.witness().state().size, 40);
     let newest = client.newest().await.expect("newest").expect("final");
@@ -1549,5 +1561,207 @@ async fn an_endless_answer_is_cut_off_at_the_limit_within_the_timeout() {
         .await
         .expect("cut off, not read for ever");
     assert_eq!(answer, Err(ClientError::Invalid));
+    task.abort();
+}
+
+// ---- The walk guards (round of the reviewer on the head publisher) ----
+
+/// A chain of heads that a test lays out by hand, served by the head a witness holds: the head
+/// that names it as its previous (or the first for none), unless `ignore_after` makes it answer
+/// the first head to everyone. Counts its calls.
+struct ListSource {
+    requests: Vec<CosignRequest>,
+    calls: std::sync::atomic::AtomicUsize,
+    ignore_after: bool,
+}
+
+impl RequestSource for ListSource {
+    fn next<'a>(
+        &'a self,
+        after: Option<&'a UnsignedHead>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<CosignRequest, ClientError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let want = if self.ignore_after {
+                [0; 32]
+            } else {
+                after.map_or([0; 32], UnsignedHead::hash)
+            };
+            self.requests
+                .iter()
+                .find(|r| r.head.prev_head_hash == want)
+                .cloned()
+                .ok_or(ClientError::Source)
+        })
+    }
+}
+
+impl ListSource {
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// `n` heads: the first covers 10 entries, and each after it is an idle head (the same size and
+/// roots, a later time), as a key service with nothing new to say publishes every interval.
+fn idle_chain(n: usize, ignore_after: bool) -> (ListSource, UnsignedHead) {
+    let mut svc = Svc::new();
+    svc.fill(10);
+    let mut requests = vec![svc.request(0, 10, [0; 32], T0)];
+    for i in 1..n {
+        let prev = requests[i - 1].head.hash();
+        requests.push(svc.request(10, 10, prev, T0 + i as u64 * 1000));
+    }
+    let target = requests[n - 1].head.clone();
+    (
+        ListSource {
+            requests,
+            calls: Default::default(),
+            ignore_after,
+        },
+        target,
+    )
+}
+
+#[tokio::test]
+async fn size_is_not_progress_a_witness_is_walked_through_idle_heads_of_the_targets_size() {
+    let witness = serve(81, 60).await;
+    let cosigner = Cosigner::new(vec![client(&witness)], 1).expect("threshold");
+    // Four heads, all of size 10: the first has the entries, the others are idle, and the target
+    // is the last. Every one before it stands at the target's size.
+    let (source, target) = idle_chain(4, false);
+    witness.clock.set(target.time_ms);
+    let outcome = cosigner.cosign(&source, &target).await;
+    assert!(outcome.enough, "{:?}", outcome.failures);
+    assert_eq!(outcome.cosignatures[0].1.head_hash, target.hash());
+    assert_eq!(source.calls(), 4, "one request for each head");
+    assert_eq!(witness.service.witness().state().head_hash, target.hash());
+}
+
+#[tokio::test]
+async fn a_walk_is_bounded_in_steps_and_the_next_run_goes_on_from_where_it_got_to() {
+    let witness = serve(82, 60).await;
+    let cosigner = Cosigner::new(vec![client(&witness)], 1)
+        .expect("threshold")
+        .with_max_steps(3);
+    let (source, target) = idle_chain(8, false);
+    witness.clock.set(target.time_ms);
+    // The first run walks three heads on the way and stops: the source is not trusted to be going
+    // anywhere past the bound.
+    let outcome = cosigner.cosign(&source, &target).await;
+    assert!(!outcome.enough);
+    assert_eq!(outcome.failures.len(), 1);
+    assert_eq!(outcome.failures[0].1, ClientError::Source);
+    assert_eq!(source.calls(), 4, "three steps and the one that went over");
+    // What the witness accepted stands, so the next run goes on from there and finishes.
+    let before = source.calls();
+    let outcome = cosigner.cosign(&source, &target).await;
+    assert!(outcome.enough, "{:?}", outcome.failures);
+    assert!(
+        source.calls() - before <= 6,
+        "it did not start again from the first head"
+    );
+    assert_eq!(witness.service.witness().state().head_hash, target.hash());
+    // The bound is a thousand heads a request unless a test lowers it.
+    assert_eq!(orbyn_witness::client::MAX_CATCH_UP_STEPS, 1000);
+}
+
+#[tokio::test]
+async fn a_source_that_gives_the_same_head_again_is_stopped_at_once() {
+    let witness = serve(83, 60).await;
+    // The bound is the default thousand: only the same-head check can stop this early.
+    let cosigner = Cosigner::new(vec![client(&witness)], 1).expect("threshold");
+    let (mut source, _) = idle_chain(4, true);
+    let target = source.requests[3].head.clone();
+    witness.clock.set(target.time_ms);
+    let outcome = cosigner.cosign(&source, &target).await;
+    assert_eq!(outcome.failures.len(), 1);
+    assert_eq!(outcome.failures[0].1, ClientError::Source);
+    assert_eq!(source.calls(), 2, "the head, and the same head again");
+    source.ignore_after = false;
+}
+
+#[tokio::test]
+async fn a_source_that_goes_past_the_target_is_stopped() {
+    let witness = serve(84, 60).await;
+    let cosigner = Cosigner::new(vec![client(&witness)], 1).expect("threshold");
+    let (source, _) = idle_chain(2, false);
+    // A target the chain's first head is already past (a smaller log): the source gives the
+    // heads of a longer one.
+    let mut svc = Svc::new();
+    svc.fill(5);
+    let small = svc.request(0, 5, [0; 32], T0).head;
+    witness.clock.set(T0 + 2000);
+    let outcome = cosigner.cosign(&source, &small).await;
+    assert_eq!(outcome.failures.len(), 1);
+    assert_eq!(source.calls(), 1);
+}
+
+#[tokio::test]
+async fn the_cosigner_returns_as_soon_as_enough_have_cosigned_and_never_waits_for_a_slow_witness() {
+    use axum::routing::post;
+    let fast = [serve(85, 60).await, serve(86, 60).await];
+    // A witness that holds every request for far longer than the deadline.
+    let slow_key = ed25519_dalek::SigningKey::from_bytes(&[87; 32]);
+    let slow_public = slow_key.verifying_key().to_bytes();
+    let app = axum::Router::new()
+        .route(
+            "/v1/cosignature",
+            axum::routing::get(|| async { axum::http::StatusCode::NOT_FOUND }),
+        )
+        .route(
+            "/v1/cosign",
+            post(|| async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("addr"));
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let slow = WitnessClient::new(&url, slow_public, Duration::from_secs(120)).expect("client");
+    let cosigner =
+        Cosigner::new(vec![client(&fast[0]), client(&fast[1]), slow], 2).expect("threshold");
+    let (source, target) = idle_chain(1, false);
+    let started = std::time::Instant::now();
+    let outcome = cosigner
+        .cosign_within(&source, &target, Duration::from_secs(30))
+        .await;
+    assert!(outcome.enough, "{:?}", outcome.failures);
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "waited {:?}",
+        started.elapsed()
+    );
+    assert_eq!(outcome.cosignatures.len(), 2);
+    assert_eq!(outcome.unfinished, vec![2], "the slow one was let go");
+    // With a threshold that needs the slow one, the deadline ends the run instead.
+    let cosigner = Cosigner::new(
+        vec![
+            client(&fast[0]),
+            client(&fast[1]),
+            WitnessClient::new(&url, slow_public, Duration::from_secs(120)).expect("client"),
+        ],
+        3,
+    )
+    .expect("threshold");
+    let (source, target) = idle_chain(1, false);
+    let started = std::time::Instant::now();
+    let outcome = cosigner
+        .cosign_within(&source, &target, Duration::from_millis(1500))
+        .await;
+    assert!(!outcome.enough);
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "waited {:?}",
+        started.elapsed()
+    );
+    assert_eq!(outcome.unfinished, vec![2]);
     task.abort();
 }

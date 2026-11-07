@@ -375,7 +375,13 @@ impl<S: StateStore, C: Clock> Witness<S, C> {
     /// Checks a request and, if every check passes, saves the new state **and then** answers with
     /// a cosignature. A refusal, or a state that could not be saved, changes nothing and signs
     /// nothing.
-    pub fn cosign(&self, request: &CosignRequest) -> Result<Cosignature, CosignError> {
+    ///
+    /// **A head on the way to the final one is never signed.** A request marked `intermediate` is
+    /// checked in full and moves the witness's state forward (that is how a witness that was away
+    /// catches up through the chain), and is answered with no cosignature at all: a witness signs
+    /// only the head that ends a request, and only within its clock window. So `None` is the
+    /// whole answer to an intermediate head, and a `Some` is always of a final one.
+    pub fn accept(&self, request: &CosignRequest) -> Result<Option<Cosignature>, CosignError> {
         let mut state = self.lock();
         let head = &request.head;
 
@@ -447,11 +453,12 @@ impl<S: StateStore, C: Clock> Witness<S, C> {
                 self.store.save(&next)?;
                 *state = next;
             }
-            let cosignature = self.sign(state.head_hash, now);
-            if !request.intermediate {
-                *self.last_cosignature() = Some(cosignature.clone());
+            if request.intermediate {
+                return Ok(None);
             }
-            return Ok(cosignature);
+            let cosignature = self.sign(state.head_hash, now);
+            *self.last_cosignature() = Some(cosignature.clone());
+            return Ok(Some(cosignature));
         }
         if head.size < state.size {
             return Err(rollback("the head is smaller than the last one").into());
@@ -542,11 +549,33 @@ impl<S: StateStore, C: Clock> Witness<S, C> {
         // Durable before it is answered.
         self.store.save(&next)?;
         *state = next;
-        let cosignature = self.sign(head.hash(), now);
-        if !request.intermediate {
-            *self.last_cosignature() = Some(cosignature.clone());
+        if request.intermediate {
+            return Ok(None);
         }
-        Ok(cosignature)
+        let cosignature = self.sign(head.hash(), now);
+        *self.last_cosignature() = Some(cosignature.clone());
+        Ok(Some(cosignature))
+    }
+
+    /// [`Witness::accept`] for a request that ends a catch-up: the cosignature of its head. An
+    /// `intermediate` request is refused here as a bad request, since it has no cosignature to
+    /// give (use [`Witness::accept`]).
+    pub fn cosign(&self, request: &CosignRequest) -> Result<Cosignature, CosignError> {
+        // Refused before anything is checked or saved: nothing changes.
+        if request.intermediate {
+            return Err(refuse(
+                Reason::BadRequest,
+                "a head on the way to another is not signed",
+            )
+            .into());
+        }
+        self.accept(request)?.ok_or_else(|| {
+            refuse(
+                Reason::BadRequest,
+                "a head on the way to another is not signed",
+            )
+            .into()
+        })
     }
 }
 

@@ -101,9 +101,15 @@ impl WitnessClient {
         }
     }
 
-    /// Posts one request. The cosignature is returned only if it verifies under the pinned key
-    /// and is of the request's head.
-    pub async fn cosign(&self, request: &CosignRequest) -> Result<Cosignature, ClientError> {
+    /// Posts one request. A request that ends the catch-up is answered with a cosignature, which
+    /// is returned only if it verifies under the pinned key and is of the request's head. **A
+    /// request marked `intermediate` is answered with none** (204): a witness signs only the head
+    /// that ends a request. An answer that does not match what was asked (a signature for an
+    /// intermediate head, or none for the last one) is [`ClientError::Invalid`].
+    pub async fn cosign(
+        &self,
+        request: &CosignRequest,
+    ) -> Result<Option<Cosignature>, ClientError> {
         let body = wire::encode_request(request).map_err(|_| ClientError::Source)?;
         let response = self
             .http
@@ -115,12 +121,19 @@ impl WitnessClient {
             .map_err(|_| ClientError::Unavailable)?;
         let status = response.status().as_u16();
         let bytes = read_limited(response).await?;
-        if status == 200 {
-            let cosignature = Cosignature::decode(&bytes).ok_or(ClientError::Invalid)?;
-            if cosignature.head_hash != request.head.hash() || !cosignature.verify(&self.public) {
-                return Err(ClientError::Invalid);
+        match status {
+            200 if request.intermediate => return Err(ClientError::Invalid),
+            200 => {
+                let cosignature = Cosignature::decode(&bytes).ok_or(ClientError::Invalid)?;
+                if cosignature.head_hash != request.head.hash() || !cosignature.verify(&self.public)
+                {
+                    return Err(ClientError::Invalid);
+                }
+                return Ok(Some(cosignature));
             }
-            return Ok(cosignature);
+            204 if request.intermediate && bytes.is_empty() => return Ok(None),
+            204 => return Err(ClientError::Invalid),
+            _ => {}
         }
         match serde_json::from_slice(&bytes)
             .ok()
@@ -129,6 +142,11 @@ impl WitnessClient {
             Some(refusal) => Err(ClientError::Refused(refusal)),
             None => Err(ClientError::Unavailable),
         }
+    }
+
+    /// Posts a request that ends the catch-up and returns its cosignature.
+    async fn cosign_final(&self, request: &CosignRequest) -> Result<Cosignature, ClientError> {
+        self.cosign(request).await?.ok_or(ClientError::Invalid)
     }
 }
 
@@ -177,15 +195,24 @@ pub struct Outcome {
     pub cosignatures: Vec<(usize, Cosignature)>,
     /// Why each of the others gave none.
     pub failures: Vec<(usize, ClientError)>,
+    /// The witnesses still working when the run ended, because enough had already cosigned or
+    /// the deadline came: their requests were dropped, and they are asked again next time.
+    pub unfinished: Vec<usize>,
     /// Whether enough pinned witnesses cosigned the head.
     pub enough: bool,
 }
+
+/// The most heads one catch-up walks: a witness behind by more is brought forward over several
+/// runs (each leaves it where it got to). Bounded so a source that never reaches the target cannot
+/// keep a run busy.
+pub const MAX_CATCH_UP_STEPS: usize = 1000;
 
 /// The pinned witnesses and the threshold.
 #[derive(Debug, Clone)]
 pub struct Cosigner {
     witnesses: Vec<WitnessClient>,
     threshold: usize,
+    max_steps: usize,
 }
 
 impl Cosigner {
@@ -202,32 +229,105 @@ impl Cosigner {
         Ok(Self {
             witnesses,
             threshold,
+            max_steps: MAX_CATCH_UP_STEPS,
         })
     }
 
-    /// Gets `target` cosigned. Each witness is brought to the target head by itself, head by head,
-    /// and all of them at once.
+    /// A lower bound on the heads one catch-up walks, for tests of the bound.
+    pub fn with_max_steps(mut self, steps: usize) -> Self {
+        self.max_steps = steps;
+        self
+    }
+
+    /// Gets `target` cosigned and waits for every witness. Each witness is brought to the target
+    /// head by itself, head by head, and all of them at once.
     pub async fn cosign(&self, source: &dyn RequestSource, target: &UnsignedHead) -> Outcome {
-        let runs = self
+        self.run(source, target, None, false).await
+    }
+
+    /// Like [`Cosigner::cosign`], but it **returns as soon as enough witnesses have cosigned**,
+    /// without waiting for the rest, and gives up on whoever is still working when `deadline` ends.
+    /// A slow witness cannot hold the others back: it is listed in [`Outcome::unfinished`], its
+    /// request is dropped, and it is asked again the next time. (What it had already accepted on
+    /// its side stands, so the next run goes on from where it got to.)
+    pub async fn cosign_within(
+        &self,
+        source: &dyn RequestSource,
+        target: &UnsignedHead,
+        deadline: Duration,
+    ) -> Outcome {
+        self.run(source, target, Some(deadline), true).await
+    }
+
+    async fn run(
+        &self,
+        source: &dyn RequestSource,
+        target: &UnsignedHead,
+        deadline: Option<Duration>,
+        stop_when_enough: bool,
+    ) -> Outcome {
+        type Run<'a> = Pin<Box<dyn Future<Output = Result<Cosignature, ClientError>> + Send + 'a>>;
+        let pinned: Vec<[u8; 32]> = self.witnesses.iter().map(WitnessClient::public).collect();
+        let hash = target.hash();
+        let mut runs: Vec<Option<Run<'_>>> = self
             .witnesses
             .iter()
-            .map(|witness| catch_up(witness, source, target))
-            .collect::<Vec<_>>();
-        let results = join_all(runs).await;
+            .map(|witness| {
+                Some(Box::pin(catch_up(witness, source, target, self.max_steps)) as Run<'_>)
+            })
+            .collect();
+        let mut results: Vec<Option<Result<Cosignature, ClientError>>> =
+            runs.iter().map(|_| None).collect();
+        let mut timer = deadline.map(|d| Box::pin(tokio::time::sleep(d)));
+        let threshold = self.threshold;
+        std::future::poll_fn(|cx| {
+            for (slot, out) in runs.iter_mut().zip(results.iter_mut()) {
+                if let Some(run) = slot
+                    && let Poll::Ready(value) = run.as_mut().poll(cx)
+                {
+                    *out = Some(value);
+                    *slot = None;
+                }
+            }
+            let signed: Vec<Cosignature> = results
+                .iter()
+                .flatten()
+                .filter_map(|r| r.as_ref().ok().cloned())
+                .collect();
+            if (stop_when_enough && cosigned_enough(&hash, &pinned, &signed, threshold))
+                || runs.iter().all(Option::is_none)
+            {
+                return Poll::Ready(());
+            }
+            if let Some(timer) = timer.as_mut()
+                && timer.as_mut().poll(cx).is_ready()
+            {
+                return Poll::Ready(());
+            }
+            Poll::Pending
+        })
+        .await;
+        let unfinished: Vec<usize> = runs
+            .iter()
+            .enumerate()
+            .filter(|(_, run)| run.is_some())
+            .map(|(i, _)| i)
+            .collect();
         let mut cosignatures = Vec::new();
         let mut failures = Vec::new();
         for (index, result) in results.into_iter().enumerate() {
             match result {
-                Ok(cosignature) => cosignatures.push((index, cosignature)),
-                Err(error) => failures.push((index, error)),
+                Some(Ok(cosignature)) => cosignatures.push((index, cosignature)),
+                Some(Err(error)) => failures.push((index, error)),
+                None => {}
             }
         }
-        let pinned: Vec<[u8; 32]> = self.witnesses.iter().map(WitnessClient::public).collect();
         let signed: Vec<Cosignature> = cosignatures.iter().map(|(_, c)| c.clone()).collect();
-        let enough = cosigned_enough(&target.hash(), &pinned, &signed, self.threshold);
+        let enough = cosigned_enough(&hash, &pinned, &signed, self.threshold);
         Outcome {
             cosignatures,
             failures,
+            unfinished,
             enough,
         }
     }
@@ -236,11 +336,13 @@ impl Cosigner {
 /// Brings one witness to `target`, head by head from the one it last cosigned (its newest, or
 /// the start), each head carrying at most [`crate::MAX_ENTRIES`] entries. A witness already on `target`
 /// is asked to cosign it again, with its time now: that is how an idle log stays fresh. A witness
-/// past `target` is asked anyway: it refuses, and the refusal is evidence.
+/// past `target` is asked anyway: it refuses, and the refusal is evidence. Only the request that
+/// ends the walk is answered with a cosignature; each head before it is accepted and unsigned.
 async fn catch_up(
     witness: &WitnessClient,
     source: &dyn RequestSource,
     target: &UnsignedHead,
+    max_steps: usize,
 ) -> Result<Cosignature, ClientError> {
     let newest = witness.newest().await?;
     if let Some(newest) = &newest
@@ -253,7 +355,7 @@ async fn catch_up(
             entries: Vec::new(),
             intermediate: false,
         };
-        return witness.cosign(&again).await;
+        return witness.cosign_final(&again).await;
     }
     let mut after = newest.map(|newest| newest.head);
     // A catch-up that was cut short (a timeout, a 503, a restart) leaves the witness's chain ahead
@@ -263,10 +365,10 @@ async fn catch_up(
     let mut steps = 0usize;
     loop {
         let mut request = source.next(after.as_ref()).await?;
-        // Only the head that ends the catch-up is held to the clock.
+        // Only the head that ends the catch-up is held to the clock, and signed.
         request.intermediate = request.head.hash() != target.hash();
-        let cosignature = match witness.cosign(&request).await {
-            Ok(cosignature) => cosignature,
+        let answer = match witness.cosign(&request).await {
+            Ok(answer) => answer,
             Err(ClientError::Refused(refusal))
                 if refusal.reason == Reason::Rollback && !resumed =>
             {
@@ -284,10 +386,12 @@ async fn catch_up(
                         entries: Vec::new(),
                         intermediate: false,
                     };
-                    return witness.cosign(&again).await;
+                    return witness.cosign_final(&again).await;
                 }
-                // Past the target, or nowhere new to go: the refusal stands.
-                if held.head.size >= target.size {
+                // Past the target: the refusal stands. (A held head at the target's size is not
+                // past it: idle heads have the size of the head before them, so the walk goes on
+                // from the head the witness stands on, whatever its size.)
+                if held.head.size > target.size {
                     return Err(ClientError::Refused(refusal));
                 }
                 after = Some(held.head);
@@ -296,7 +400,7 @@ async fn catch_up(
             Err(error) => return Err(error),
         };
         if request.head.hash() == target.hash() {
-            return Ok(cosignature);
+            return answer.ok_or(ClientError::Invalid);
         }
         // A request that does not move along the chain would loop for ever, and one past the
         // target is not on the way to it. **Size is not progress**: the chain has idle heads (the
@@ -304,7 +408,7 @@ async fn catch_up(
         // still a step on the way to it; the head named by `prev_head_hash` is what moves.
         steps += 1;
         if request.head.size > target.size
-            || steps > MAX_CATCH_UP_STEPS
+            || steps > max_steps
             || after
                 .as_ref()
                 .is_some_and(|a| a.hash() == request.head.hash())
@@ -313,34 +417,4 @@ async fn catch_up(
         }
         after = Some(request.head);
     }
-}
-
-/// The most heads one catch-up walks (a witness away for a long time on a chain with a head every
-/// ten minutes: this is over two years of them). Past it the source is taken to be going nowhere.
-const MAX_CATCH_UP_STEPS: usize = 100_000;
-
-/// Runs every future to completion together, in order of the input.
-async fn join_all<T>(futures: Vec<impl Future<Output = T> + Send>) -> Vec<T> {
-    let mut pending: Vec<Option<Pin<Box<dyn Future<Output = T> + Send + '_>>>> = futures
-        .into_iter()
-        .map(|f| Some(Box::pin(f) as Pin<Box<dyn Future<Output = T> + Send + '_>>))
-        .collect();
-    let mut done: Vec<Option<T>> = pending.iter().map(|_| None).collect();
-    std::future::poll_fn(|cx| {
-        let mut all = true;
-        for (slot, out) in pending.iter_mut().zip(done.iter_mut()) {
-            if let Some(future) = slot {
-                match future.as_mut().poll(cx) {
-                    Poll::Ready(value) => {
-                        *out = Some(value);
-                        *slot = None;
-                    }
-                    Poll::Pending => all = false,
-                }
-            }
-        }
-        if all { Poll::Ready(()) } else { Poll::Pending }
-    })
-    .await;
-    done.into_iter().flatten().collect()
 }

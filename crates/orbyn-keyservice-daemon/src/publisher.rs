@@ -37,6 +37,14 @@ pub const MAX_INTERVAL_SECS: u64 = 900;
 pub const ALERT_AFTER_MS: u64 = 30 * 60 * 1000;
 pub const ALERT_EVERY_MS: u64 = 60 * 60 * 1000;
 
+/// How long one publish cycle may take in all. Past it the witnesses that have not answered are
+/// let go (and asked again next cycle), so one slow witness cannot hold the others back or stop the
+/// cycle for good. The cycle returns earlier as soon as enough witnesses have cosigned.
+pub const CYCLE_DEADLINE: Duration = Duration::from_secs(120);
+
+/// How often the alert clock is looked at, independently of any cycle in flight.
+pub const ALERT_TICK: Duration = Duration::from_secs(60);
+
 /// A stored head older than this is too old to be cosigned as a request's final head: a witness
 /// accepts one within [`MAX_SKEW_MS`] of its clock, and a minute is left for the trip.
 pub const FRESH_FOR_MS: u64 = MAX_SKEW_MS - 60 * 1000;
@@ -268,6 +276,44 @@ pub fn alert_due(now: u64, last_published: u64, last_alert: Option<u64>) -> bool
         && last_alert.is_none_or(|at| now.saturating_sub(at) >= ALERT_EVERY_MS)
 }
 
+/// What the operator is told. The default [`LogAlerts`] writes structured log lines.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Alert {
+    /// No head has been published for `seconds` (30 minutes at first, then hourly).
+    Unpublished { seconds: u64 },
+    /// A head was published again after an alert.
+    Recovered,
+}
+
+pub trait AlertSink: Send + Sync {
+    fn alert(&self, alert: &Alert);
+}
+
+/// Alerts as structured log lines (`head_unpublished`, `head_published`): machine-only.
+pub struct LogAlerts;
+
+impl AlertSink for LogAlerts {
+    fn alert(&self, alert: &Alert) {
+        match alert {
+            Alert::Unpublished { seconds } => {
+                tracing::error!(event = "head_unpublished", seconds = *seconds);
+            }
+            Alert::Recovered => tracing::info!(event = "head_published", recovered = true),
+        }
+    }
+}
+
+/// Why a publisher could not be made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PublisherError {
+    /// A witness address that is not a valid https one (http only on a loopback address).
+    #[error("a witness address is not valid")]
+    BadUrl,
+    /// A threshold at or below half of the witnesses, or a key pinned twice.
+    #[error("the witnesses cannot be pinned: {0}")]
+    Pin(orbyn_witness::client::PinError),
+}
+
 pub struct Publisher<H: Hsm> {
     state: Arc<State<H>>,
     cosigner: Cosigner,
@@ -275,33 +321,65 @@ pub struct Publisher<H: Hsm> {
     source: StoreSource,
     log_key_version: u32,
     max_request_bytes: usize,
+    deadline: Duration,
+    alert_tick: Duration,
+    alerts: Arc<dyn AlertSink>,
+    /// When a head was last published, in the state's clock (the newest published head's time at
+    /// the start), which the alert clock counts from.
+    last_published: std::sync::atomic::AtomicU64,
 }
 
 impl<H: Hsm + Send + Sync + 'static> Publisher<H> {
-    /// A publisher for `witnesses`, pinned by key, with `threshold`. Refuses what `Cosigner` does
-    /// (a threshold at or below half, a key pinned twice).
+    /// A publisher for `witnesses`, pinned by key, with `threshold`. A bad address is
+    /// [`PublisherError::BadUrl`]; a threshold at or below half and a key pinned twice are what
+    /// `Cosigner` refuses.
     pub fn new(
         state: Arc<State<H>>,
         witnesses: &[(String, [u8; 32])],
         threshold: usize,
         log_key_version: u32,
-    ) -> Result<Self, orbyn_witness::client::PinError> {
+    ) -> Result<Self, PublisherError> {
+        if witnesses.iter().any(|(url, _)| !valid_witness_url(url)) {
+            return Err(PublisherError::BadUrl);
+        }
         let clients = witnesses
             .iter()
             .map(|(url, key)| {
                 WitnessClient::new(url, *key, Duration::from_secs(60))
-                    .map_err(|_| orbyn_witness::client::PinError::Threshold)
+                    .map_err(|_| PublisherError::BadUrl)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let source = StoreSource::new(state.store.clone());
         Ok(Self {
-            cosigner: Cosigner::new(clients, threshold)?,
+            cosigner: Cosigner::new(clients, threshold).map_err(PublisherError::Pin)?,
             keys: witnesses.iter().map(|(_, key)| *key).collect(),
             source,
+            last_published: std::sync::atomic::AtomicU64::new((state.now_ms)()),
             state,
             log_key_version,
             max_request_bytes: wire::MAX_REQUEST_BYTES,
+            deadline: CYCLE_DEADLINE,
+            alert_tick: ALERT_TICK,
+            alerts: Arc::new(LogAlerts),
         })
+    }
+
+    /// The most one cycle may take in all (the default is [`CYCLE_DEADLINE`]).
+    pub fn with_cycle_deadline(mut self, deadline: Duration) -> Self {
+        self.deadline = deadline;
+        self
+    }
+
+    /// How often the alert clock is looked at (the default is [`ALERT_TICK`]).
+    pub fn with_alert_tick(mut self, tick: Duration) -> Self {
+        self.alert_tick = tick;
+        self
+    }
+
+    /// Where alerts go (the default is [`LogAlerts`]).
+    pub fn with_alerts(mut self, alerts: Arc<dyn AlertSink>) -> Self {
+        self.alerts = alerts;
+        self
     }
 
     /// Lowers the largest request a head may need, for tests of the size cap.
@@ -377,13 +455,20 @@ impl<H: Hsm + Send + Sync + 'static> Publisher<H> {
                 }
             }
         };
-        let outcome = self.cosigner.cosign(&self.source, &head).await;
+        // Publishes as soon as enough witnesses have cosigned, without waiting for the rest, and
+        // lets go of whoever is still answering when the deadline comes.
+        let outcome = self
+            .cosigner
+            .cosign_within(&self.source, &head, self.deadline)
+            .await;
         for (index, cosignature) in &outcome.cosignatures {
             store
                 .add_cosignature(head_id, &self.keys[*index], &cosignature.encode())
                 .await?;
         }
-        let (mut refused, mut unreachable) = (0, 0);
+        // A witness still working when the run ended is one that was too slow: it is asked again
+        // next cycle, and counts as not reachable.
+        let (mut refused, mut unreachable) = (0, outcome.unfinished.len());
         for (index, failure) in &outcome.failures {
             match failure {
                 ClientError::Refused(refusal) => {
@@ -413,6 +498,8 @@ impl<H: Hsm + Send + Sync + 'static> Publisher<H> {
         }
         if outcome.enough {
             store.publish_head(head_id).await?;
+            self.last_published
+                .store((self.state.now_ms)(), std::sync::atomic::Ordering::SeqCst);
             return Ok(Cycle::Published {
                 size: head.size,
                 head_id,
@@ -426,49 +513,57 @@ impl<H: Hsm + Send + Sync + 'static> Publisher<H> {
         })
     }
 
-    /// Runs forever: a cycle every `interval`, at once again while entries are still waiting for a
-    /// head, with the operator alerts (as structured log lines) after 30 minutes without a
-    /// published head and every hour after.
+    /// Runs forever: a cycle every `interval` (at once again while entries are still waiting for a
+    /// head), and **beside it, independently of any cycle in flight**, the operator alerts: after 30
+    /// minutes without a published head and every hour after, and once when heads come back.
+    ///
+    /// The alert clock counts from the **newest published head's time**, not from this process's
+    /// start, so a restart does not hide an outage that began before it.
     pub async fn run(&self, interval: Duration) {
-        let mut last_published = (self.state.now_ms)();
-        let mut last_alert: Option<u64> = None;
+        let started = (self.state.now_ms)();
+        let since = match self.state.store.latest_published_head().await {
+            Ok(Some(head)) => head.head.time_ms,
+            _ => started,
+        };
+        self.last_published
+            .store(since, std::sync::atomic::Ordering::SeqCst);
+        tokio::join!(self.publish_loop(interval), self.alert_loop());
+    }
+
+    async fn publish_loop(&self, interval: Duration) {
         loop {
-            let outcome = self.publish_once().await;
-            let now = (self.state.now_ms)();
             let mut more = false;
-            match &outcome {
+            match self.publish_once().await {
                 Ok(Cycle::Published { size, .. }) => {
-                    if last_alert.take().is_some() {
-                        tracing::info!(event = "head_published", size = *size, recovered = true);
-                    }
-                    last_published = now;
-                    more = self.state.store.size().await.is_ok_and(|log| log > *size);
+                    more = self.state.store.size().await.is_ok_and(|log| log > size);
                 }
                 Ok(Cycle::Unpublished { .. } | Cycle::ClockBehind | Cycle::Superseded) => {}
                 Err(error) => tracing::error!(event = "head_cycle_failed", error = %error),
             }
-            let silent_for = now.saturating_sub(last_published);
-            let due = last_alert.is_none_or(|at| now.saturating_sub(at) >= ALERT_EVERY_MS);
-            if !matches!(outcome, Ok(Cycle::Published { .. }))
-                && silent_for >= ALERT_AFTER_MS
-                && due
-            {
-                last_alert = Some(now);
-                let (answered, refused) = match &outcome {
-                    Ok(Cycle::Unpublished {
-                        answered, refused, ..
-                    }) => (*answered, *refused),
-                    _ => (0, 0),
-                };
-                tracing::error!(
-                    event = "head_unpublished",
-                    seconds = silent_for / 1000,
-                    answered,
-                    refused,
-                );
-            }
             if !more {
                 tokio::time::sleep(interval).await;
+            }
+        }
+    }
+
+    async fn alert_loop(&self) {
+        let mut last_alert: Option<u64> = None;
+        loop {
+            tokio::time::sleep(self.alert_tick).await;
+            let now = (self.state.now_ms)();
+            let published = self
+                .last_published
+                .load(std::sync::atomic::Ordering::SeqCst);
+            // Heads are being published again after an alert.
+            if last_alert.is_some_and(|at| published > at) {
+                last_alert = None;
+                self.alerts.alert(&Alert::Recovered);
+            }
+            if alert_due(now, published, last_alert) {
+                last_alert = Some(now);
+                self.alerts.alert(&Alert::Unpublished {
+                    seconds: now.saturating_sub(published) / 1000,
+                });
             }
         }
     }

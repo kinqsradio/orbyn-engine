@@ -31,6 +31,8 @@ pub struct W {
     pub up: Arc<AtomicBool>,
     /// How many cosign requests reached this witness while it was up.
     pub cosign_posts: Arc<AtomicUsize>,
+    /// Milliseconds this witness holds each cosign request before it looks at it.
+    pub delay_ms: Arc<AtomicU64>,
     pub clock: TestClock,
     pub service: Arc<Service<Arc<orbyn_witness::MemoryStore>, TestClock>>,
     task: tokio::task::JoinHandle<()>,
@@ -111,6 +113,8 @@ impl Chain {
         let gate = up.clone();
         let posts = Arc::new(AtomicUsize::new(0));
         let counted = posts.clone();
+        let delay = Arc::new(AtomicU64::new(0));
+        let delayed = delay.clone();
         let app = service
             .clone()
             .router()
@@ -118,10 +122,15 @@ impl Chain {
                 move |req: Request, next: Next| {
                     let gate = gate.clone();
                     let counted = counted.clone();
+                    let delayed = delayed.clone();
                     async move {
                         if gate.load(Ordering::SeqCst) {
                             if req.uri().path() == "/v1/cosign" {
                                 counted.fetch_add(1, Ordering::SeqCst);
+                                let wait = delayed.load(Ordering::SeqCst);
+                                if wait > 0 {
+                                    tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+                                }
                             }
                             next.run(req).await
                         } else {
@@ -143,6 +152,7 @@ impl Chain {
             public,
             up,
             cosign_posts: posts,
+            delay_ms: delay,
             clock,
             service,
             task,

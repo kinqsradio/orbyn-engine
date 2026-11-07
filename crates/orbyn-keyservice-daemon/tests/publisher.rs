@@ -452,3 +452,149 @@ async fn nothing_publishes_a_head_older_than_the_witness_window() {
     c.assert_one_chain().await;
     c.finish().await;
 }
+
+/// Records the alerts a publisher raises.
+#[derive(Default)]
+struct Recorded(std::sync::Mutex<Vec<orbyn_keyservice_daemon::publisher::Alert>>);
+
+impl orbyn_keyservice_daemon::publisher::AlertSink for Recorded {
+    fn alert(&self, alert: &orbyn_keyservice_daemon::publisher::Alert) {
+        self.0.lock().expect("lock").push(alert.clone());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs ORBYN_KEYSERVICE_DATABASE_URL"]
+async fn one_slow_witness_does_not_stall_publishing_and_is_asked_again_next_cycle() {
+    use std::sync::atomic::Ordering;
+    let c = Chain::new(3).await;
+    c.key_for(1).await;
+    // The third witness holds every request for a minute.
+    c.witnesses[2].delay_ms.store(60_000, Ordering::SeqCst);
+    let publisher = c.publisher(2).with_cycle_deadline(Duration::from_secs(30));
+    let started = std::time::Instant::now();
+    let (size, id) = published(&publisher.publish_once().await.expect("cycle"));
+    // Published as soon as two had cosigned, without waiting for the slow one.
+    assert!(started.elapsed() < Duration::from_secs(10), "waited {:?}", started.elapsed());
+    assert_eq!(size, 1);
+    assert_eq!(c.state.store.cosignatures(id).await.expect("read").len(), 2);
+    assert!(c.covered(1).await);
+    // Next cycle it answers (the delay is gone) and is brought up to date.
+    c.witnesses[2].delay_ms.store(0, Ordering::SeqCst);
+    c.advance(MIN);
+    c.key_for(2).await;
+    let (size, id) = published(&publisher.publish_once().await.expect("cycle"));
+    assert_eq!(size, 2);
+    let signers: Vec<[u8; 32]> = c.state.store.cosignatures(id).await.expect("read").into_iter().map(|(k, _)| k).collect();
+    assert_eq!(signers.len(), 3, "the slow witness was asked again and cosigned");
+    c.assert_one_chain().await;
+    // When every witness is needed, the deadline ends the cycle: unpublished, the slow one
+    // counted as not reachable, and the head is kept for the next cycle.
+    c.witnesses[2].delay_ms.store(60_000, Ordering::SeqCst);
+    c.advance(MIN);
+    c.key_for(3).await;
+    let all = c.publisher(3).with_cycle_deadline(Duration::from_millis(1500));
+    let started = std::time::Instant::now();
+    let cycle = all.publish_once().await.expect("cycle");
+    assert!(started.elapsed() < Duration::from_secs(10), "waited {:?}", started.elapsed());
+    assert!(
+        matches!(cycle, Cycle::Unpublished { answered: 2, unreachable: 1, refused: 0, .. }),
+        "{cycle:?}"
+    );
+    c.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs ORBYN_KEYSERVICE_DATABASE_URL"]
+async fn the_alert_keeps_running_while_a_cosign_is_in_flight() {
+    use orbyn_keyservice_daemon::publisher::Alert;
+    use std::sync::atomic::Ordering;
+    let c = Chain::new(3).await;
+    c.key_for(1).await;
+    for w in &c.witnesses {
+        w.delay_ms.store(60_000, Ordering::SeqCst);
+    }
+    let sink = Arc::new(Recorded::default());
+    let publisher = Arc::new(
+        c.publisher(2)
+            .with_cycle_deadline(Duration::from_secs(20))
+            .with_alert_tick(Duration::from_millis(100))
+            .with_alerts(sink.clone()),
+    );
+    let runner = publisher.clone();
+    let task = tokio::spawn(async move { runner.run(Duration::from_secs(3600)).await });
+    // Past the 30 minutes while the first cycle is stuck waiting on witnesses that hold it.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    c.advance(31 * MIN);
+    let started = std::time::Instant::now();
+    loop {
+        if sink.0.lock().expect("lock").iter().any(|a| matches!(a, Alert::Unpublished { .. })) {
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(10), "no alert while the cosign was in flight");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // The cycle had not ended: the deadline is 20 seconds.
+    assert!(c.state.store.latest_published_head().await.expect("read").is_none());
+    assert!(started.elapsed() < Duration::from_secs(15));
+    task.abort();
+    c.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs ORBYN_KEYSERVICE_DATABASE_URL"]
+async fn after_a_restart_the_alert_counts_from_the_newest_published_head() {
+    use orbyn_keyservice_daemon::publisher::Alert;
+    let c = Chain::new(3).await;
+    c.key_for(1).await;
+    published(&c.publisher(2).publish_once().await.expect("cycle"));
+    // The service stops, the witnesses stay away, and 40 minutes pass. A new process starts.
+    for w in &c.witnesses {
+        w.down();
+    }
+    c.advance(40 * MIN);
+    let sink = Arc::new(Recorded::default());
+    let restarted = Arc::new(
+        c.publisher(2)
+            .with_cycle_deadline(Duration::from_secs(5))
+            .with_alert_tick(Duration::from_millis(100))
+            .with_alerts(sink.clone()),
+    );
+    let runner = restarted.clone();
+    let task = tokio::spawn(async move { runner.run(Duration::from_secs(3600)).await });
+    let started = std::time::Instant::now();
+    let seconds = loop {
+        if let Some(Alert::Unpublished { seconds }) = sink.0.lock().expect("lock").first().cloned() {
+            break seconds;
+        }
+        assert!(started.elapsed() < Duration::from_secs(10), "the restart hid the outage");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(seconds >= 40 * 60, "counted from the published head: {seconds} s");
+    task.abort();
+    c.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs ORBYN_KEYSERVICE_DATABASE_URL"]
+async fn a_bad_witness_address_has_its_own_error_and_not_the_thresholds() {
+    use orbyn_keyservice_daemon::publisher::{Publisher, PublisherError};
+    use orbyn_witness::client::PinError;
+    let c = Chain::new(0).await;
+    let witness = |url: &str, key: u8| (url.to_owned(), [key; 32]);
+    let make = |witnesses: &[(String, [u8; 32])], threshold| {
+        Publisher::new(c.state.clone(), witnesses, threshold, 1).err()
+    };
+    // A bad address, even with a bad threshold beside it: the address is what is wrong.
+    for url in ["ftp://w.example", "http://w.example", "w.example", "https://", "https://w.example/x"] {
+        assert_eq!(make(&[witness(url, 1)], 1), Some(PublisherError::BadUrl), "{url}");
+        assert_eq!(make(&[witness(url, 1)], 0), Some(PublisherError::BadUrl), "{url}");
+    }
+    // Good addresses with a bad threshold or a key pinned twice are the pinning's errors.
+    let two = [witness("https://a.example", 1), witness("https://b.example", 2)];
+    assert_eq!(make(&two, 1), Some(PublisherError::Pin(PinError::Threshold)));
+    let twice = [witness("https://a.example", 1), witness("https://b.example", 1)];
+    assert_eq!(make(&twice, 2), Some(PublisherError::Pin(PinError::DuplicateKeys)));
+    assert_eq!(make(&two, 2), None);
+    c.finish().await;
+}

@@ -19,7 +19,7 @@ fn witness() -> (TestWitness, Arc<MemoryStore>, TestClock) {
     test_witness(7, vec![(LOG_VERSION, public)], T0).expect("witness")
 }
 
-fn refused(result: Result<orbyn_witness::Cosignature, CosignError>) -> orbyn_witness::Refusal {
+fn refused<T: std::fmt::Debug>(result: Result<T, CosignError>) -> orbyn_witness::Refusal {
     match result {
         Err(CosignError::Refused(r)) => r,
         other => panic!("expected a refusal, got {other:?}"),
@@ -747,7 +747,9 @@ fn a_head_on_the_way_may_be_old_but_the_one_that_ends_the_catch_up_must_be_near_
                 "head {i}"
             );
         }
-        w.cosign(&request).expect("on the way or at the end");
+        let answer = w.accept(&request).expect("on the way or at the end");
+        // A head on the way is accepted and not signed; only the end of the request is.
+        assert_eq!(answer.is_some(), ends, "head {i}");
         prev = request.head.hash();
     }
     assert_eq!(w.state().size, 30);
@@ -757,14 +759,14 @@ fn a_head_on_the_way_may_be_old_but_the_one_that_ends_the_catch_up_must_be_near_
     let (w, _, clock) = test_witness(8, vec![(LOG_VERSION, public)], T0).expect("witness");
     let mut ahead = svc.request(0, 10, [0; 32], T0 + 10 * 60 * 1000);
     ahead.intermediate = true;
-    assert_eq!(refused(w.cosign(&ahead)).reason, Reason::ClockSkew);
+    assert_eq!(refused(w.accept(&ahead)).reason, Reason::ClockSkew);
     let mut first = svc.request(0, 10, [0; 32], T0);
     first.intermediate = true;
-    w.cosign(&first).expect("first");
+    assert_eq!(w.accept(&first).expect("first"), None);
     clock.set(T0 + 3 * 60 * 1000);
     let mut back = svc.request(10, 20, first.head.hash(), T0 - 1);
     back.intermediate = true;
-    assert_eq!(refused(w.cosign(&back)).reason, Reason::Rollback);
+    assert_eq!(refused(w.accept(&back)).reason, Reason::Rollback);
 }
 
 /// The key service's signer and the witness agree: a head signed through `KeyService::sign_head`
@@ -802,15 +804,16 @@ fn a_head_accepted_only_as_intermediate_is_never_served_or_cosigned_again() {
     clock.set(T0 + day);
     let mut old = svc.request(0, 10, [0; 32], T0);
     old.intermediate = true;
-    w.cosign(&old).expect("accepted on the way");
+    assert_eq!(w.accept(&old).expect("accepted on the way"), None);
     assert_eq!(w.state().size, 10, "kept for the chain's linkage");
     assert!(w.newest().is_none(), "never served as newest");
     assert!(
         w.recosign_latest().is_none(),
         "never cosigned again on the schedule"
     );
-    // Asked again as intermediate, the old head is cosigned again but never promoted to final.
-    w.cosign(&old).expect("re-asked on the way");
+    // Asked again as intermediate, the old head is accepted again, still unsigned, and never
+    // promoted to final.
+    assert_eq!(w.accept(&old).expect("re-asked on the way"), None);
     assert!(
         w.state().final_head.is_none(),
         "an intermediate re-ask promotes nothing"
@@ -831,7 +834,7 @@ fn a_head_accepted_only_as_intermediate_is_never_served_or_cosigned_again() {
     assert_eq!(cosignature.head_hash, last.head.hash());
     let mut next = svc.request(20, 30, last.head.hash(), T0 + day + 1000);
     next.intermediate = true;
-    w.cosign(&next).expect("another stop");
+    assert_eq!(w.accept(&next).expect("another stop"), None);
     assert_eq!(w.state().size, 30);
     let (signed, _) = w.newest().expect("still the final one");
     assert_eq!(
@@ -969,4 +972,51 @@ fn a_state_file_of_another_format_is_older_or_newer_and_a_bad_checksum_is_damage
     damaged[30] ^= 1;
     assert_eq!(State::decode(&damaged), Err(StoreError::Corrupt));
     assert_eq!(State::decode(&current), Ok(state));
+}
+
+/// **A witness gives no cosignature for a head on the way.** It checks the head in full, saves its
+/// state, and answers nothing: it signs only the head that ends a request, and only within its
+/// window. `cosign` refuses an intermediate request outright, so nothing can ask it to sign one.
+#[test]
+fn an_intermediate_head_never_yields_a_signature() {
+    let public = log_key().verifying_key().to_bytes();
+    let (w, store, _) = test_witness(7, vec![(LOG_VERSION, public)], T0).expect("witness");
+    let mut svc = Svc::new();
+    svc.fill(30);
+    // On the way: accepted, state moved and saved, no signature, and nothing served.
+    let mut first = svc.request(0, 10, [0; 32], T0);
+    first.intermediate = true;
+    assert_eq!(w.accept(&first).expect("accepted"), None);
+    assert_eq!(w.state().size, 10, "the state moved forward");
+    assert_eq!(store.saved().expect("saved").size, 10, "and was saved");
+    assert!(w.newest().is_none(), "no cosignature was kept");
+    assert!(
+        w.recosign_latest().is_none(),
+        "none is made on the schedule"
+    );
+    // The one-call form refuses an intermediate request: there is no signature to give.
+    let mut second = svc.request(10, 20, first.head.hash(), T0 + 1000);
+    second.intermediate = true;
+    assert_eq!(refused(w.cosign(&second)).reason, Reason::BadRequest);
+    assert_eq!(w.state().size, 10, "and changed nothing");
+    // The same head asked for again as intermediate (a retry): still no signature.
+    assert_eq!(w.accept(&first).expect("again"), None);
+    // The head that ends the request is signed, and only that one.
+    let mut last = svc.request(10, 20, first.head.hash(), T0 + 1000);
+    last.intermediate = false;
+    let signed = w.accept(&last).expect("final").expect("a signature");
+    assert_eq!(signed.head_hash, last.head.hash());
+    assert!(signed.verify(&w.public()));
+    assert_eq!(w.newest().expect("newest").0.head, last.head);
+    // A final head asked again as intermediate gets none either: asking for a signature is the
+    // end of the request's job, not a property of the head.
+    assert_eq!(
+        w.accept(&{
+            let mut again = last.clone();
+            again.intermediate = true;
+            again
+        })
+        .expect("again"),
+        None
+    );
 }

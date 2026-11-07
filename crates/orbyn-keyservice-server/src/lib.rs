@@ -495,8 +495,11 @@ impl Store {
         Ok(allowed)
     }
 
-    /// The newest stored head.
-    pub async fn latest_head(&self) -> Result<Option<StoredHead>> {
+    /// The newest **stored** head, which may not be published: it can be waiting for its
+    /// cosignatures, or be a stale link of the chain that never will be. **Never serve it.** What
+    /// is public is [`Store::latest_published_head`]; this is for the publisher's own bookkeeping
+    /// and for tests.
+    pub async fn latest_stored_head(&self) -> Result<Option<StoredHead>> {
         let mut conn = self.pool.acquire().await?;
         head::latest(&mut conn).await
     }

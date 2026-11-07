@@ -12,7 +12,7 @@ use orbyn_keyservice_client::hex;
 use orbyn_keyservice_server::{RoleProblem, Store, StoreError};
 use sqlx::postgres::PgPoolOptions;
 
-use crate::publisher::{Publisher, PublisherSettings};
+use crate::publisher::{Publisher, PublisherError, PublisherSettings};
 use crate::tls::{Reloadable, TlsFiles};
 use crate::{State, TracingAudit, api, messages, system_now_ms, tls};
 
@@ -212,7 +212,13 @@ async fn serve(env: Env<'_>) -> Result<(), String> {
             settings.threshold,
             settings.log_key_version,
         )
-        .map_err(|_| messages::witness_threshold())?;
+        .map_err(|error| match error {
+            PublisherError::BadUrl => messages::witness_url_invalid(),
+            PublisherError::Pin(orbyn_witness::client::PinError::DuplicateKeys) => {
+                messages::witness_key_twice()
+            }
+            PublisherError::Pin(_) => messages::witness_threshold(),
+        })?;
         let interval = settings.interval;
         tokio::spawn(async move { publisher.run(interval).await });
     }

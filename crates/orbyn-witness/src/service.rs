@@ -230,7 +230,7 @@ where
     // The checks hash and the state is written with fsync: neither belongs on the async threads.
     let worker = service.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let result = worker.witness.cosign(&request);
+        let result = worker.witness.accept(&request);
         (request, result)
     })
     .await;
@@ -242,10 +242,12 @@ where
         );
     };
     match result {
-        Ok(cosignature) => {
+        Ok(Some(cosignature)) => {
             tracing::info!("{}", messages::cosigned(request.head.size));
             octets(cosignature.encode().to_vec(), StatusCode::OK)
         }
+        // A head on the way to the final one was accepted and signed for nothing: 204, no body.
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
         Err(CosignError::Refused(refusal)) => {
             tracing::warn!("{}", messages::refused(refusal.reason.code()));
             let status = match refusal.reason {

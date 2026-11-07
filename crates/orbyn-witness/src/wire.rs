@@ -10,6 +10,10 @@
 //! request  = 0x01 ‖ intermediate (0 or 1) ‖ head (165) ‖ log signature (64) ‖ n_proof u16 ‖ n_proof × hash (32)
 //!            ‖ n_entries u16 ‖ n_entries × (entry_len u32 ‖ entry ‖ chain_len u64 ‖ path_len u32 ‖ path)
 //! newest   = 0x01 ‖ head (165) ‖ log signature (64) ‖ cosignature (104)
+//!
+//! The answer to a request is the 104-byte cosignature (200) when the request ends the catch-up,
+//! and **nothing at all (204)** when it is `intermediate`: the witness checks such a head and moves
+//! its state forward but signs only the head that ends a request, and only within its window.
 //! ```
 
 use orbyn_translog::{Cosignature, Entry, Proof, UnsignedHead};
