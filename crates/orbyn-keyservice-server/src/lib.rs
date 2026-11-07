@@ -16,16 +16,19 @@
 //! writes new nodes along one path, so every old head's roots still have proofs.
 //!
 //! **Heads.** [`Store::build_head`] applies the pending entries to both maps and returns the
-//! unsigned head; [`Store::commit_head`] stores it with its signature once it is signed (and
-//! cosigned), and marks the entries it covers.
+//! unsigned head; [`Store::commit_head`] stores it once it is signed, and marks the entries it
+//! covers. A stored head is **published** once enough witnesses have cosigned it: the cosignatures
+//! and the publication are rows of their own ([`Store::add_cosignature`], [`Store::publish_head`]).
 
 mod head;
 mod log;
 mod map;
+mod publish;
 mod service_keys;
 
 pub use head::StoredHead;
 pub use log::Appended;
+pub use publish::{CosignEntryData, CosignMaterial};
 pub use service_keys::{
     CreateError, NewServiceKey, ServiceKeyOutcome, ServiceKeyRecord, ServiceKeyState,
 };
@@ -194,7 +197,7 @@ pub async fn migrate(owner: &PgPool, runtime_role: &str) -> Result<()> {
         format!("GRANT USAGE ON SCHEMA public TO {role}"),
         format!(
             "GRANT SELECT, INSERT ON service_keys, retired_accounts, log_entries, log_nodes, map_nodes, \
-             heads TO {role}"
+             heads, head_cosignatures, published_heads TO {role}"
         ),
         // The one change an entry ever gets: the head that covers it.
         format!("GRANT UPDATE (included_in_head) ON log_entries TO {role}"),
@@ -234,7 +237,7 @@ pub async fn migrate(owner: &PgPool, runtime_role: &str) -> Result<()> {
 }
 
 /// The tables the key service owns, by name.
-const TABLES: [&str; 7] = [
+const TABLES: [&str; 9] = [
     "service_keys",
     "retired_accounts",
     "log_entries",
@@ -242,6 +245,8 @@ const TABLES: [&str; 7] = [
     "map_nodes",
     "heads",
     "rate_events",
+    "head_cosignatures",
+    "published_heads",
 ];
 
 /// Why a role may not be the runtime role.
@@ -423,18 +428,14 @@ impl Store {
         Ok(built)
     }
 
-    /// Stores a head that was built here and signed, with its cosignatures, and marks the entries
-    /// it covers as included. It replays the entries the head covers onto the last head's roots
-    /// and refuses a head whose log root or either map root differs, so a head that could never
-    /// be extended is never stored. Refused if another head was stored since it was built.
-    pub async fn commit_head(
-        &self,
-        head: &UnsignedHead,
-        log_signature: &[u8; 64],
-        cosignatures: &[u8],
-    ) -> Result<i64> {
+    /// Stores a head that was built here and signed, and marks the entries it covers as covered.
+    /// It replays the entries the head covers onto the last head's roots and refuses a head whose
+    /// log root or either map root differs, so a head that could never be extended is never
+    /// stored. Refused if another head was stored since it was built. **Stored is not published**:
+    /// a head is published when enough witnesses have cosigned it ([`Store::publish_head`]).
+    pub async fn commit_head(&self, head: &UnsignedHead, log_signature: &[u8; 64]) -> Result<i64> {
         let mut tx = begin_write(&self.pool, &self.timeouts).await?;
-        let id = head::commit(&mut tx, head, log_signature, cosignatures).await?;
+        let id = head::commit(&mut tx, head, log_signature).await?;
         tx.commit().await?;
         Ok(id)
     }

@@ -12,6 +12,7 @@ use orbyn_keyservice_client::hex;
 use orbyn_keyservice_server::{RoleProblem, Store, StoreError};
 use sqlx::postgres::PgPoolOptions;
 
+use crate::publisher::{Publisher, PublisherSettings};
 use crate::tls::{Reloadable, TlsFiles};
 use crate::{State, TracingAudit, api, messages, system_now_ms, tls};
 
@@ -152,6 +153,19 @@ async fn serve(env: Env<'_>) -> Result<(), String> {
         Err(KeyServiceError::Hsm(e)) => return Err(hsm_message(&e)),
         Err(_) => return Err(messages::hsm_unreachable()),
     }
+    // The head publisher's settings are checked before anything is opened or bound; with no
+    // witnesses configured there is no publisher, and the service runs without publishing heads.
+    let publisher = PublisherSettings::parse(env)?;
+    if let Some(settings) = &publisher {
+        match keys.log_key_public(settings.log_key_version) {
+            Ok(_) => {}
+            Err(KeyServiceError::Hsm(HsmError::NotFound)) => {
+                return Err(messages::log_key_missing());
+            }
+            Err(KeyServiceError::Hsm(e)) => return Err(hsm_message(&e)),
+            Err(_) => return Err(messages::hsm_unreachable()),
+        }
+    }
     let url = get(env, "ORBYN_KEYSERVICE_DATABASE_URL")
         .ok_or_else(|| messages::not_set("ORBYN_KEYSERVICE_DATABASE_URL"))?;
     let pool = PgPoolOptions::new()
@@ -190,6 +204,18 @@ async fn serve(env: Env<'_>) -> Result<(), String> {
         audit: Arc::new(TracingAudit),
         now_ms: Arc::new(system_now_ms),
     });
+    // The publisher runs beside the API, in this process.
+    if let Some(settings) = publisher {
+        let publisher = Publisher::new(
+            state.clone(),
+            &settings.witnesses,
+            settings.threshold,
+            settings.log_key_version,
+        )
+        .map_err(|_| messages::witness_threshold())?;
+        let interval = settings.interval;
+        tokio::spawn(async move { publisher.run(interval).await });
+    }
     let server = tls::serve(listener, tls.clone(), api::router(state))
         .map_err(|_| messages::cannot_listen(&bind_text))?;
     wait_for_shutdown(&tls).await?;

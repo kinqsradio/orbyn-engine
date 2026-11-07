@@ -163,7 +163,7 @@ fn error(status: StatusCode, code: &str) -> Response {
 }
 
 /// Runs a call that blocks on the HSM without stalling the runtime's other work.
-fn blocking<T>(f: impl FnOnce() -> T) -> T {
+pub(crate) fn blocking<T>(f: impl FnOnce() -> T) -> T {
     match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
         Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
         _ => f(),
