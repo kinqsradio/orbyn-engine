@@ -16,7 +16,8 @@
 //! A device **holds keys** if it was ever trusted and has made a proof of its key after sign-up:
 //! a sign-in (the session sign-up itself issues is a bearer token and proves nothing), a signed
 //! deletion or second-factor request, an approval as the device or the approver, a key envelope,
-//! or an approver of its own. A pending device never counts.
+//! an approver of its own, a signed protection setting, or a signed device removal. A pending
+//! device never counts.
 
 use super::{AccountError, Accounts, AuditAction, Client, Result, limits};
 use crate::jobs::{self, Job};
@@ -56,6 +57,8 @@ const ELIGIBLE: &str = "
                            WHERE ap.device_id = d.id OR ap.approver_id = d.id)
                 OR EXISTS (SELECT 1 FROM key_envelopes e
                            WHERE e.sender_device_id = d.id OR e.recipient_device_id = d.id)
+                OR EXISTS (SELECT 1 FROM protection_settings ps WHERE ps.signer_device_id = d.id)
+                OR EXISTS (SELECT 1 FROM devices r WHERE r.removed_by = d.id)
             )
         )
     )

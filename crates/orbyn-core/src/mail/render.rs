@@ -258,7 +258,7 @@ fn delete_unused_email(to: &str, link: Option<&str>) -> Rendered {
                 "You asked to delete the Orbyn account {} so you can sign up again. It has nothing stored in it.",
                 escape(to)
             ));
-            html.button(link, "Delete this account");
+            html.danger_button(link, "Delete this account");
             html.quiet(&format!(
                 "The button works once and expires in {lasts}. It doesn’t need you to sign in. It only deletes an account with nothing stored in it. If the account has anything in it, nothing is deleted."
             ));
@@ -352,6 +352,17 @@ impl Html {
         self.body.push_str(&format!(
             "<p style=\"margin:4px 0 16px;font-family:{MONO};font-size:30px;letter-spacing:.18em\">{}</p>\n",
             escape(spaced)
+        ));
+    }
+
+    /// The same button in the design's danger colour, for an action that deletes: the light-theme
+    /// danger fill `#d42a2a` with white text. It has no class, so the dark-mode rule that flips
+    /// the ordinary button leaves it red.
+    fn danger_button(&mut self, link: &str, label: &str) {
+        self.body.push_str(&format!(
+            "<p style=\"margin:4px 0 16px\"><a href=\"{}\" style=\"display:inline-block;padding:11px 18px;border-radius:10px;background:#d42a2a;color:#ffffff;font-weight:500;text-decoration:none\">{}</a></p>\n",
+            escape(link),
+            escape(label)
         ));
     }
 
@@ -701,6 +712,17 @@ mod tests {
         assert!(
             r.html.contains(&format!("href=\"{link}\""))
                 && r.html.contains(">Delete this account</a>")
+        );
+        // Red, as drawn; the other emails' buttons stay as they were.
+        assert!(r.html.contains("background:#d42a2a;color:#ffffff"));
+        assert!(!r.html.contains("background:#111111"));
+        assert!(
+            rendered(
+                Kind::SignUpAttempt,
+                "2026-11-14T12:00:00Z\nhttps://account.example.com/sign-in"
+            )
+            .html
+            .contains("background:#111111")
         );
         assert!(r.html.contains("The button works once and expires in 24 hours. It doesn’t need you to sign in. It only deletes an account with nothing stored in it. If the account has anything in it, nothing is deleted."));
         assert!(r.html.contains("If you didn’t ask for this, ignore this email. Nothing happens unless the button is pressed."));

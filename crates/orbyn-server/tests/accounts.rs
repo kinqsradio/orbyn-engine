@@ -5490,6 +5490,10 @@ fn unused_limits() -> Limits {
         delete_unused_per_address: Limit::new(1000, Duration::from_secs(3600)),
         delete_unused_mail_per_account: Limit::new(1000, Duration::from_secs(3600)),
         delete_unused_wrong_per_prefix: Limit::new(1000, Duration::from_secs(3600)),
+        // Many sign-ins from one test address.
+        login_per_ip: Limit::new(100_000, Duration::from_secs(3600)),
+        register_per_ip: Limit::new(100_000, Duration::from_secs(3600)),
+        login_per_email_and_ip: Limit::new(100_000, Duration::from_secs(3600)),
         ..Limits::default()
     }
 }
@@ -5878,71 +5882,270 @@ async fn a_zone_the_purge_removed_still_counts_as_stored() {
 
 #[tokio::test]
 #[ignore = "needs DATABASE_URL"]
-async fn a_device_that_proved_its_key_or_was_approved_means_no_link_and_a_refusal() {
+async fn every_proof_of_a_key_and_every_stored_thing_means_a_refusal_and_no_new_link() {
     let _turn = TURN.lock().await;
     let server = server_with(unused_limits()).await;
 
     // A pending device that signed in does not count: the person locked out can still ask.
     let p = pair(&server).await;
-    let pending_email: String =
-        orbyn_core::sqlx::query_scalar("SELECT email FROM accounts WHERE id = $1")
-            .bind(p.account_id)
-            .fetch_one(server.db.pool())
-            .await
-            .expect("email");
+    let pending_email = server.email_of(p.account_id).await;
     server.ask_unused(&pending_email).await;
     server.decide_requests(unused_limits()).await;
     assert_eq!(server.unused_tokens(&pending_email).await.len(), 1);
-    // The sign-up session alone proves nothing, and the pending sign-in is not the first
-    // device's own: so far the account is unused. Now the first device signs in again.
-    let token = server.unused_tokens(&pending_email).await.remove(0);
-    server.login(&pending_email, b"correct horse", &p.a).await;
-    let (status, body) = server.confirm_unused(&token).await;
-    assert_eq!(
-        (status, &body["code"]),
-        (StatusCode::CONFLICT, &json!("delete_unused_not_possible")),
-        "a sign-in of the trusted device is a proof of its key"
-    );
-    assert!(server.account_exists(&pending_email).await);
 
-    // Approving a device is a proof too, and so is a signed request the server accepted.
-    for kind in ["approval", "delete_seen", "totp_seen"] {
+    let pool = server.db.pool();
+    for kind in [
+        "login",
+        "approval",
+        "delete_seen",
+        "totp_seen",
+        "envelope_sender",
+        "envelope_recipient",
+        "approved_by",
+        "protection",
+        "removal",
+        "zone_participant",
+        "approval_row_as_device",
+        "approval_row_as_approver",
+        "zone_row_without_the_flag",
+    ] {
         let p = pair(&server).await;
-        let email: String =
-            orbyn_core::sqlx::query_scalar("SELECT email FROM accounts WHERE id = $1")
-                .bind(p.account_id)
-                .fetch_one(server.db.pool())
-                .await
-                .expect("email");
+        let email = server.email_of(p.account_id).await;
+        let a_id = uuid_of(&p.a_session["device_id"]);
+        let b_id = uuid_of(&p.b_session["device_id"]);
+        // A link goes out while the account is unused (a pending device signed in beside the
+        // trusted one, which proves nothing).
+        server.ask_unused(&email).await;
+        server.decide_requests(unused_limits()).await;
+        let tokens = server.unused_tokens(&email).await;
+        assert_eq!(tokens.len(), 1, "{kind}: a link goes out first");
         match kind {
+            "login" => {
+                server.login(&email, b"correct horse", &p.a).await;
+            }
             "approval" => {
                 server.approve_fully(&p).await;
             }
             "delete_seen" => {
                 orbyn_core::sqlx::query(
-                    "INSERT INTO account_delete_seen (device_id, signed_at)
-                     SELECT id, 1 FROM devices WHERE account_id = $1 AND state = 'trusted'",
+                    "INSERT INTO account_delete_seen (device_id, signed_at) VALUES ($1, 1)",
+                )
+                .bind(a_id)
+                .execute(pool)
+                .await
+                .expect(kind);
+            }
+            "totp_seen" => {
+                orbyn_core::sqlx::query(
+                    "INSERT INTO totp_manage_seen (device_id, action, signed_at) VALUES ($1, 'enrol', 1)",
+                )
+                .bind(a_id)
+                .execute(pool)
+                .await
+                .expect(kind);
+            }
+            "envelope_sender" | "envelope_recipient" => {
+                let (sender, recipient) = if kind == "envelope_sender" {
+                    (a_id, b_id)
+                } else {
+                    (b_id, a_id)
+                };
+                orbyn_core::sqlx::query(
+                    "INSERT INTO key_envelopes (account_id, recipient_device_id, sender_device_id, zone, key_id, envelope)
+                     VALUES ($1, $2, $3, 'list:inbox', decode('00112233445566778899aabbccddeeff', 'hex'), decode('01', 'hex'))",
                 )
                 .bind(p.account_id)
-                .execute(server.db.pool())
+                .bind(recipient)
+                .bind(sender)
+                .execute(pool)
                 .await
-                .expect("seen");
+                .expect(kind);
+            }
+            "approved_by" => {
+                orbyn_core::sqlx::query("UPDATE devices SET approved_by = $2 WHERE id = $1")
+                    .bind(a_id)
+                    .bind(b_id)
+                    .execute(pool)
+                    .await
+                    .expect(kind);
+            }
+            "protection" => {
+                // The sign-up session can sign `advanced`: a signature by the first device.
+                orbyn_core::sqlx::query(
+                    "INSERT INTO protection_settings (account_id, seq, level, prev, hash, signed_at, signer_device_id, signature)
+                     VALUES ($1, 1, 'advanced', decode(repeat('00', 32), 'hex'), decode(repeat('11', 32), 'hex'), 1, $2, decode(repeat('22', 64), 'hex'))",
+                )
+                .bind(p.account_id)
+                .bind(a_id)
+                .execute(pool)
+                .await
+                .expect(kind);
+            }
+            "removal" => {
+                // The first device signed another device's removal.
+                orbyn_core::sqlx::query(
+                    "UPDATE devices SET state = 'removed', removed_at = now(), removed_by = $2,
+                            removal_signature = decode(repeat('33', 64), 'hex'), removal_sequence = 1
+                     WHERE id = $1",
+                )
+                .bind(b_id)
+                .bind(a_id)
+                .execute(pool)
+                .await
+                .expect(kind);
+            }
+            "approval_row_as_device" | "approval_row_as_approver" => {
+                // An approval row alone, naming the trusted device on one side.
+                let (device, approver) = if kind == "approval_row_as_device" {
+                    (a_id, b_id)
+                } else {
+                    (b_id, a_id)
+                };
+                orbyn_core::sqlx::query(
+                    "INSERT INTO device_approvals (id, account_id, device_id, approver_id, expires_at)
+                     VALUES ($1, $2, $3, $4, now() + interval '10 minutes')",
+                )
+                .bind(Uuid::new_v4())
+                .bind(p.account_id)
+                .bind(device)
+                .bind(approver)
+                .execute(pool)
+                .await
+                .expect(kind);
+            }
+            "zone_row_without_the_flag" => {
+                // A zone from before the flag existed: the row is there, the flag is not.
+                server.store_zone(p.account_id).await;
+                orbyn_core::sqlx::query("UPDATE accounts SET stored_at = NULL WHERE id = $1")
+                    .bind(p.account_id)
+                    .execute(pool)
+                    .await
+                    .expect(kind);
             }
             _ => {
+                // A zone of another account is shared with this one.
+                let (_, _, other) = unused_account(&server).await;
+                let zone = Uuid::new_v4();
                 orbyn_core::sqlx::query(
-                    "INSERT INTO totp_manage_seen (device_id, action, signed_at)
-                     SELECT id, 'enrol', 1 FROM devices WHERE account_id = $1 AND state = 'trusted'",
+                    "INSERT INTO zones (id, owner_id, name) VALUES ($1, $2, 'shared')",
                 )
-                .bind(p.account_id)
-                .execute(server.db.pool())
+                .bind(zone)
+                .bind(uuid_of(&other["account_id"]))
+                .execute(pool)
                 .await
-                .expect("seen");
+                .expect(kind);
+                orbyn_core::sqlx::query(
+                    "INSERT INTO zone_participants (zone_id, account_id, role) VALUES ($1, $2, 'read')",
+                )
+                .bind(zone)
+                .bind(p.account_id)
+                .execute(pool)
+                .await
+                .expect(kind);
             }
         }
+        // The old link now refuses, and deletes nothing.
+        let (status, body) = server.confirm_unused(&tokens[0]).await;
+        assert_eq!(
+            (status, &body["code"]),
+            (StatusCode::CONFLICT, &json!("delete_unused_not_possible")),
+            "{kind}"
+        );
+        assert!(server.account_exists(&email).await, "{kind}");
+        // And a new request gets no new link.
         server.ask_unused(&email).await;
         server.decide_requests(unused_limits()).await;
-        assert!(server.unused_tokens(&email).await.is_empty(), "{kind}");
+        assert_eq!(
+            server.unused_tokens(&email).await.len(),
+            1,
+            "{kind}: no new link"
+        );
     }
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn two_confirms_with_one_token_at_once_delete_once() {
+    let _turn = TURN.lock().await;
+    let server = server_with(unused_limits()).await;
+    for _ in 0..3 {
+        let (email, _, _) = unused_account(&server).await;
+        server.ask_unused(&email).await;
+        server.decide_requests(unused_limits()).await;
+        let token = server.unused_tokens(&email).await.remove(0);
+        let barrier = tokio::sync::Barrier::new(2);
+        let go = async {
+            barrier.wait().await;
+            server.confirm_unused(&token).await
+        };
+        let ((one, _), (two, body)) = tokio::join!(go, async {
+            barrier.wait().await;
+            server.confirm_unused(&token).await
+        });
+        let mut statuses = [one, two];
+        statuses.sort();
+        assert_eq!(
+            statuses,
+            [StatusCode::NO_CONTENT, StatusCode::BAD_REQUEST],
+            "exactly one deletes ({body})"
+        );
+        assert!(!server.account_exists(&email).await);
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_zone_insert_racing_a_confirm_is_stored_and_refused_or_deleted_and_failed() {
+    let _turn = TURN.lock().await;
+    let server = server_with(unused_limits()).await;
+    let (mut stored, mut deleted) = (0, 0);
+    for _ in 0..8 {
+        let (email, _, session) = unused_account(&server).await;
+        let account = uuid_of(&session["account_id"]);
+        server.ask_unused(&email).await;
+        server.decide_requests(unused_limits()).await;
+        let token = server.unused_tokens(&email).await.remove(0);
+        let barrier = tokio::sync::Barrier::new(2);
+        let confirm = async {
+            barrier.wait().await;
+            server.confirm_unused(&token).await
+        };
+        let insert = async {
+            barrier.wait().await;
+            orbyn_core::sqlx::query(
+                "INSERT INTO zones (id, owner_id, name) VALUES ($1, $2, 'raced')",
+            )
+            .bind(Uuid::new_v4())
+            .bind(account)
+            .execute(server.db.pool())
+            .await
+        };
+        let ((status, body), inserted) = tokio::join!(confirm, insert);
+        let exists = server.account_exists(&email).await;
+        match (inserted.is_ok(), status) {
+            // Stored first: refused, and nothing is deleted.
+            (true, StatusCode::CONFLICT) => {
+                assert!(exists, "{body}");
+                assert_eq!(body["code"], "delete_unused_not_possible");
+                stored += 1;
+            }
+            // Deleted first: the insert fails (the account is gone), and no zone is left.
+            (false, StatusCode::NO_CONTENT) => {
+                assert!(!exists);
+                let zones: i64 = orbyn_core::sqlx::query_scalar(
+                    "SELECT count(*) FROM zones WHERE owner_id = $1",
+                )
+                .bind(account)
+                .fetch_one(server.db.pool())
+                .await
+                .expect("zones");
+                assert_eq!(zones, 0);
+                deleted += 1;
+            }
+            other => panic!("neither or both: {other:?} {body}"),
+        }
+    }
+    eprintln!("raced: {stored} stored first, {deleted} deleted first");
 }
 
 #[tokio::test]
