@@ -6,4 +6,12 @@ import type { PendingApproval } from "./PendingApproval";
  * `GET /v1/devices/current`: the device making the request, and the approval it
  * can answer, if a trusted device started one.
  */
-export type CurrentDevice = { device: Device, approval: PendingApproval | null, };
+export type CurrentDevice = { device: Device, approval: PendingApproval | null, 
+/**
+ * Sign-in asks for a second factor.
+ */
+totp_enabled: boolean, 
+/**
+ * Enrolled but not yet confirmed with a code.
+ */
+totp_pending: boolean, };

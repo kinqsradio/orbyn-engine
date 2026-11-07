@@ -47,6 +47,8 @@ pub const DEVICE_LOGIN_CONTEXT: &str = "orbyn/device-login/v1";
 pub const DEVICE_APPROVAL_CONTEXT: &str = "orbyn/device-approval/v1";
 /// Context for [`trusted_start_message`].
 pub const TRUSTED_START_CONTEXT: &str = "orbyn/trusted-login-start/v1";
+/// Context for [`totp_manage_message`].
+pub const TOTP_MANAGE_CONTEXT: &str = "orbyn/totp-manage/v1";
 
 /// Argon2id with 64 MiB, 3 passes and one lane, the same cost as the recovery key.
 pub fn ksf() -> Argon2<'static> {
@@ -250,6 +252,27 @@ pub fn trusted_start_message(email: &str, credential_request: &[u8], signed_at: 
     let mut out = Vec::with_capacity(24 + email.len() + credential_request.len());
     push_len_prefixed(&mut out, email.as_bytes());
     push_len_prefixed(&mut out, credential_request);
+    out.extend_from_slice(&signed_at.to_be_bytes());
+    out
+}
+
+/// What a trusted device signs, under [`TOTP_MANAGE_CONTEXT`], to change the account's second
+/// factor: the account and device ids, the action (`enrol`, `confirm` or `disable`), the code for
+/// `confirm` (empty for the others) and the time in Unix seconds. A bearer token alone cannot
+/// change it; the server checks this against the device's registered signing key and accepts it
+/// for five minutes either side of its own clock.
+pub fn totp_manage_message(
+    account_id: &[u8; 16],
+    device_id: &[u8; 16],
+    action: &str,
+    code: &str,
+    signed_at: i64,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(48 + action.len() + code.len());
+    out.extend_from_slice(account_id);
+    out.extend_from_slice(device_id);
+    push_len_prefixed(&mut out, action.as_bytes());
+    push_len_prefixed(&mut out, code.as_bytes());
     out.extend_from_slice(&signed_at.to_be_bytes());
     out
 }
@@ -499,5 +522,29 @@ mod pairing_tests {
             ..pairing
         };
         assert_ne!(c, approval_commitment(&other, &[4; 32]));
+    }
+}
+
+#[cfg(test)]
+mod totp_manage_tests {
+    use super::*;
+
+    #[test]
+    fn a_manage_message_binds_the_account_the_device_the_action_the_code_and_the_time() {
+        let base = totp_manage_message(&[1; 16], &[2; 16], "confirm", "123456", 1_800_000_000);
+        for other in [
+            totp_manage_message(&[9; 16], &[2; 16], "confirm", "123456", 1_800_000_000),
+            totp_manage_message(&[1; 16], &[9; 16], "confirm", "123456", 1_800_000_000),
+            totp_manage_message(&[1; 16], &[2; 16], "disable", "123456", 1_800_000_000),
+            totp_manage_message(&[1; 16], &[2; 16], "confirm", "654321", 1_800_000_000),
+            totp_manage_message(&[1; 16], &[2; 16], "confirm", "123456", 1_800_000_001),
+        ] {
+            assert_ne!(base, other);
+        }
+        // Moving a character between the action and the code cannot give the same bytes.
+        assert_ne!(
+            totp_manage_message(&[1; 16], &[2; 16], "enrol", "x", 0),
+            totp_manage_message(&[1; 16], &[2; 16], "enro", "lx", 0)
+        );
     }
 }

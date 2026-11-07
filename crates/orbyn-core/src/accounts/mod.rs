@@ -17,10 +17,13 @@
 
 mod devices;
 pub mod limits;
+mod second_factor;
 pub mod secrets;
 mod sessions;
+pub mod totp;
 
 pub use limits::{Limit, Limits};
+pub use second_factor::{ManageProof, TotpEnrolment};
 pub use secrets::{AuthSecrets, SecretsError};
 
 use chrono::{DateTime, Utc};
@@ -61,6 +64,21 @@ pub enum AccountError {
     LoginFailed,
     #[error("too many attempts; try again later")]
     TooManyAttempts,
+    /// The password was right and the account has a second factor: nothing is signed in yet. Send
+    /// the code and this login id to the second-factor step.
+    #[error("a second factor is required")]
+    SecondFactorRequired { login_id: Uuid },
+    /// A wrong code, a code already used and a used recovery code all look alike.
+    #[error("the code is wrong")]
+    SecondFactorFailed,
+    /// A change to the second factor needs a signature from the device's own key; a bearer
+    /// token alone is not enough.
+    #[error("a signature from this device is needed")]
+    DeviceProofRequired,
+    #[error("a second factor is already on for this account")]
+    TotpAlreadyEnabled,
+    #[error("no second factor is on for this account")]
+    TotpNotEnabled,
     #[error("the session is not valid")]
     Unauthorized,
     #[error("only a trusted device can do this")]
@@ -122,7 +140,7 @@ fn unix_now_secs() -> i64 {
 }
 
 /// A sign-in state as read back: account, email digest, whether the start was trusted, sealed state.
-type LoginStateRow = (Option<Uuid>, Vec<u8>, bool, Vec<u8>);
+type LoginStateRow = (Option<Uuid>, Vec<u8>, bool, Vec<u8>, Option<Vec<u8>>);
 
 /// The most devices an account may have waiting for approval at once.
 const MAX_PENDING_DEVICES: i64 = 20;
@@ -311,6 +329,11 @@ enum AuditAction {
     ApprovalCodeWrong,
     DeviceApproved,
     DeviceRemoved,
+    TotpEnrolled,
+    TotpDisabled,
+    TotpPassed,
+    TotpFailed,
+    TotpRecoveryUsed,
 }
 
 impl AuditAction {
@@ -325,6 +348,11 @@ impl AuditAction {
             Self::ApprovalCodeWrong => "device.approval_code_wrong",
             Self::DeviceApproved => "device.approved",
             Self::DeviceRemoved => "device.removed",
+            Self::TotpEnrolled => "totp.enrolled",
+            Self::TotpDisabled => "totp.disabled",
+            Self::TotpPassed => "totp.passed",
+            Self::TotpFailed => "totp.failed",
+            Self::TotpRecoveryUsed => "totp.recovery_used",
         }
     }
 }
@@ -335,6 +363,18 @@ pub struct Accounts {
     pool: PgPool,
     secrets: Arc<AuthSecrets>,
     limits: Limits,
+    clock: Clock,
+}
+
+/// The time a TOTP code or a device's signature is judged against, in Unix seconds. The system
+/// clock, unless a test sets one, so a test cannot cross a 30-second step by accident.
+#[derive(Clone)]
+struct Clock(Arc<dyn Fn() -> u64 + Send + Sync>);
+
+impl std::fmt::Debug for Clock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Clock")
+    }
 }
 
 impl Accounts {
@@ -343,11 +383,18 @@ impl Accounts {
             pool,
             secrets: Arc::new(secrets),
             limits: Limits::default(),
+            clock: Clock(Arc::new(|| u64::try_from(unix_now_secs()).unwrap_or(0))),
         }
     }
 
     pub fn with_limits(mut self, limits: Limits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// Replaces the clock TOTP codes and device signatures are judged against. For tests.
+    pub fn with_clock(mut self, now: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
+        self.clock = Clock(Arc::new(now));
         self
     }
 
@@ -499,10 +546,15 @@ impl Accounts {
         // A start signed by a device already trusted on this account skips the
         // per-email limits, so the owner is never locked out by someone else's
         // guessing. An invalid proof is simply ignored: it tells nobody anything.
-        let trusted = match trusted {
+        let proof = trusted;
+        let trusted = match proof {
             Some(proof) => self.is_trusted_start(&email, request, proof).await?,
             None => false,
         };
+        // The device that proved itself, so that only it can skip the second factor at the finish.
+        let trusted_signer: Option<Vec<u8>> = proof
+            .filter(|_| trusted)
+            .map(|proof| proof.signing_key.to_vec());
         // Trusted starts get their own per-email bucket, so a stranger's
         // guessing cannot use it up, and keep the per-(email, address) limit, so
         // a stolen trusted device still cannot guess quickly.
@@ -576,13 +628,14 @@ impl Accounts {
             )
             .map_err(|_| AccountError::Internal)?;
         sqlx::query(
-            "INSERT INTO login_states (id, account_id, email_subject, trusted_start, sealed, expires_at)
-             VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6))",
+            "INSERT INTO login_states (id, account_id, email_subject, trusted_start, trusted_signer, sealed, expires_at)
+             VALUES ($1, $2, $3, $4, $5, $6, now() + make_interval(secs => $7))",
         )
         .bind(login_id)
         .bind(account_id)
         .bind(email_subject.as_slice())
         .bind(trusted)
+        .bind(trusted_signer)
         .bind(sealed.to_bytes())
         .bind(LOGIN_STATE_TTL.as_secs_f64())
         .execute(&self.pool)
@@ -608,12 +661,12 @@ impl Accounts {
         // Taken and deleted at once: a sign-in state is used at most once.
         let row: Option<LoginStateRow> = sqlx::query_as(
             "DELETE FROM login_states WHERE id = $1 AND expires_at > now()
-             RETURNING account_id, email_subject, trusted_start, sealed",
+             RETURNING account_id, email_subject, trusted_start, sealed, trusted_signer",
         )
         .bind(login_id)
         .fetch_optional(&self.pool)
         .await?;
-        let (account_id, email_subject, trusted_start, sealed) =
+        let (account_id, email_subject, trusted_start, sealed, trusted_signer) =
             row.ok_or(AccountError::LoginFailed)?;
         let state = Sealed::from_bytes(&sealed)
             .and_then(|sealed| {
@@ -663,6 +716,52 @@ impl Accounts {
         )
         .map_err(|_| AccountError::InvalidSignature)?;
 
+        // The password was right. An account with a second factor gets no session and no device
+        // row yet, unless a trusted device proved itself at the start: that device holds a device
+        // key, which is the factor. The start is given back either way, as for any sign-in that
+        // got this far, so the per-email limit counts only passwords that were wrong.
+        // A trusted start skips it only for the device that proved itself: one trusted device's
+        // proof, made at the start, does not carry a different new device past the factor.
+        let skips = trusted_start
+            && trusted_signer.as_deref() == Some(device.keys.signing.as_slice())
+            && self
+                .is_trusted_device(account_id, &device.keys.signing)
+                .await?;
+        let second_factor = !skips && self.totp_enabled(account_id).await?;
+        let give_back = async {
+            if let Ok(subject) = <[u8; 32]>::try_from(email_subject.as_slice()) {
+                let action = if trusted_start {
+                    "login-email-trusted"
+                } else {
+                    "login-email"
+                };
+                limits::give_back(&self.pool, action, &subject).await?;
+            }
+            Ok::<(), AccountError>(())
+        };
+        if second_factor {
+            let login_id = self.begin_second_factor(account_id, device, &name).await?;
+            give_back.await?;
+            return Err(AccountError::SecondFactorRequired { login_id });
+        }
+        let session = self
+            .complete_login(client, account_id, device, &name)
+            .await?;
+        // A sign-in that worked gives back the start it was counted for, to the
+        // same bucket, so the owner's own sign-ins never use up the per-email limit.
+        give_back.await?;
+        Ok(session)
+    }
+
+    /// Adds the device (pending, unless the account already knows it) and signs it in. The step
+    /// shared by a sign-in without a second factor and one that has passed it.
+    async fn complete_login(
+        &self,
+        client: &Client,
+        account_id: Uuid,
+        device: &NewDevice,
+        name: &str,
+    ) -> Result<NewSession> {
         let mut tx = self.pool.begin().await?;
         let existing: Option<(Uuid, Vec<u8>, String)> = sqlx::query_as(
             "SELECT id, agreement_key, state FROM devices
@@ -701,7 +800,7 @@ impl Accounts {
                 )
                 .bind(id)
                 .bind(account_id)
-                .bind(&name)
+                .bind(name)
                 .bind(device.platform.as_str())
                 .bind(device.keys.signing.as_slice())
                 .bind(device.keys.agreement.as_slice())
@@ -720,18 +819,19 @@ impl Accounts {
         )
         .await?;
         tx.commit().await?;
-        // A sign-in that worked gives back the start it was counted for, to the
-        // same bucket, so the
-        // owner's own sign-ins never use up the per-email limit.
-        if let Ok(subject) = <[u8; 32]>::try_from(email_subject.as_slice()) {
-            let action = if trusted_start {
-                "login-email-trusted"
-            } else {
-                "login-email"
-            };
-            limits::give_back(&self.pool, action, &subject).await?;
-        }
         Ok(session)
+    }
+
+    /// Whether the account has a trusted device with this signing key right now.
+    async fn is_trusted_device(&self, account_id: Uuid, signing_key: &[u8; 32]) -> Result<bool> {
+        let found: Option<i32> = sqlx::query_scalar(
+            "SELECT 1 FROM devices WHERE account_id = $1 AND signing_key = $2 AND state = 'trusted'",
+        )
+        .bind(account_id)
+        .bind(signing_key.as_slice())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(found.is_some())
     }
 
     /// Whether `proof` is a fresh signature over this start by a device that is

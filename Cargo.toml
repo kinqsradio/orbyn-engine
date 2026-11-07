@@ -36,6 +36,9 @@ opaque-getrandom = { package = "getrandom", version = "0.2" }
 opaque-rand-core = { package = "rand_core", version = "0.6", features = ["getrandom"] }
 opaque-sha2 = { package = "sha2", version = "0.10", default-features = false }
 hkdf = "0.13"
+# TOTP (RFC 6238) is HMAC-SHA-1. Both are the RustCrypto 0.10 generation, which the OPAQUE stack already brings in.
+hmac = "0.12"
+sha1 = { version = "0.10", default-features = false }
 jiff = { version = "0.2", default-features = false, features = ["std", "serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 serde = { version = "1", features = ["derive"] }

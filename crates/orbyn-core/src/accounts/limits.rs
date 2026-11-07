@@ -37,6 +37,14 @@ pub struct Limits {
     /// Code tries by one pending device.
     pub approval_code_per_device: Limit,
     pub approval_code_per_ip: Limit,
+    /// Second-factor codes tried while signing in: 10 for one account from one address and 30
+    /// for one account from anywhere, in 15 minutes. A right code gives its attempt back.
+    pub totp_per_account_and_ip: Limit,
+    pub totp_per_account: Limit,
+    /// Changes to the second factor (enrol, confirm, disable) by one device. Kept apart from the
+    /// sign-in buckets, so whoever holds a password cannot use them up to lock the owner out of
+    /// managing it.
+    pub totp_manage_per_device: Limit,
 }
 
 impl Default for Limits {
@@ -50,6 +58,9 @@ impl Default for Limits {
             register_per_ip: Limit::new(20, Duration::from_secs(60 * MINUTE)),
             approval_code_per_device: Limit::new(10, Duration::from_secs(10 * MINUTE)),
             approval_code_per_ip: Limit::new(50, Duration::from_secs(10 * MINUTE)),
+            totp_per_account_and_ip: Limit::new(10, Duration::from_secs(15 * MINUTE)),
+            totp_per_account: Limit::new(30, Duration::from_secs(15 * MINUTE)),
+            totp_manage_per_device: Limit::new(10, Duration::from_secs(15 * MINUTE)),
         }
     }
 }
@@ -343,11 +354,13 @@ fn lock_key(action: &str, subject: &[u8; 32]) -> i64 {
 /// it on a schedule.
 pub async fn prune(pool: &PgPool) -> Result<u64, sqlx::Error> {
     const BATCH: u64 = 5000;
-    const STATEMENTS: [&str; 3] = [
+    const STATEMENTS: [&str; 4] = [
         "DELETE FROM auth_attempts WHERE id IN (
              SELECT id FROM auth_attempts WHERE at < now() - interval '1 day' LIMIT 5000)",
         "DELETE FROM login_states WHERE id IN (
              SELECT id FROM login_states WHERE expires_at < now() LIMIT 5000)",
+        "DELETE FROM second_factor_states WHERE id IN (
+             SELECT id FROM second_factor_states WHERE expires_at < now() LIMIT 5000)",
         "DELETE FROM devices WHERE id IN (
              SELECT id FROM devices WHERE state = 'pending' AND created_at < now() - interval '7 days' LIMIT 5000)",
     ];
