@@ -64,7 +64,7 @@ Identities are logged by **email**, the identity people share with, as key-trans
 - **One chain per email.** A first statement for an email that already has a chain is refused. The only way to replace it is a reset for the same account (see *Recovery*).
 - **Changing an email** is a signed **move**: a statement under the old email naming the new one, plus a first statement under the new email, proven like any first statement. Both are logged, and contacts follow the move.
 - **Deleting an account** logs a tombstone under its email, signed by the account key. A later first statement for that email needs the email proven again.
-- **Fresh first statements wait.** Contacts do not seal to a first statement until a cosigned head has included it for 24 hours. A brand-new identity therefore gives its email's owner a day to see it, if they already have an Orbyn account on another server view.
+- **Fresh first statements wait.** Contacts do not seal to a first statement until a cosigned head has included it for 24 hours. This is a margin on top of the email proof: if a proof was ever passed on wrongly, the email's owner has a day to see the new identity before anyone seals to it.
 - **Submitting.** A device submits a statement with `POST /v1/identity/statements`. The key service checks both signatures and the chain, the email proof for a first statement, and the recovery-finish link for a reset, before appending.
 - **Lookup is not public.** `GET /v1/identity/{email}` is answered by the key service, but only with a **lookup capability**.
   - The record server issues a capability only for an **accepted invitation**, bound to the inviter's account, the zone and the email digest, and for an account's **own email**, to its own sessions.
