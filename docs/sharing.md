@@ -96,7 +96,7 @@ Identities are logged by **email**, the identity people share with, as key-trans
 - **The participant statement.** Membership is a chain, `orbyn/zone-participants/v1`, **signed by the owner's account key**. Each statement is length-prefixed over:
   - the owner account and the zone;
   - a sequence and prev;
-  - the full set of (account id, account key statement hash, role);
+  - the full set of (account id, email, identity statement hash, role);
   - the zone's protection level (`standard` or `end-to-end`).
 
   The server stores it and serves it with the zone. It is capped at 1000 statements per zone, and uploads are limited to 30 an hour per zone, counted after the signature verifies. At the cap the owner can still remove people, by compacting the chain to a checkpoint statement the owner signs; it is never a lockout.
@@ -126,7 +126,7 @@ A demoted or removed member therefore cannot write, even with old keys and a coo
 
 - **Sealing.** Only the owner's devices seal zone keys to another account: the `account` envelope suite `orbyn/wrap-account/v1`, following the P-256 suite's pattern in key-service.md but with X25519. It has:
   - its own HKDF info, AEAD context and signature context;
-  - a fully length-prefixed transcript binding the owner account, the zone, the key id, the recipient account and the hash of the recipient's account-key statement;
+  - a fully length-prefixed transcript binding the owner account, the zone, the key id, the recipient account and the hash of the recipient's identity statement;
   - a signature by the owner's account key.
 
   Members' devices accept zone keys only in this form, from the owner. A viewer or a server cannot plant a "first key".
