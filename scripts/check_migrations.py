@@ -27,8 +27,28 @@ def git(*args: str) -> str:
     return run.stdout
 
 
+def ensure_base(base: str) -> None:
+    """Make the base commit available: fetch it when the checkout is shallow and lacks it."""
+    have = subprocess.run(["git", "cat-file", "-e", f"{base}^{{commit}}"], capture_output=True)
+    if have.returncode == 0:
+        return
+    fetched = subprocess.run(
+        ["git", "fetch", "--no-tags", "--quiet", "origin", base], capture_output=True, text=True
+    )
+    have = subprocess.run(["git", "cat-file", "-e", f"{base}^{{commit}}"], capture_output=True)
+    if fetched.returncode != 0 or have.returncode != 0:
+        raise RuntimeError(
+            f"the base commit {base} is not in this checkout and could not be fetched "
+            "(check out with full history, fetch-depth: 0)"
+        )
+
+
 def violations(base: str) -> list[str]:
     """One line per changed existing migration file, between the merge base and HEAD."""
+    ensure_base(base)
+    if subprocess.run(["git", "merge-base", base, "HEAD"], capture_output=True).returncode != 0:
+        # A shallow checkout can hold both commits and still not their fork point: deepen it.
+        subprocess.run(["git", "fetch", "--no-tags", "--quiet", "--unshallow", "origin"], capture_output=True)
     fork = git("merge-base", base, "HEAD").strip()
     raw = git("diff", "--raw", "-z", "-M", "--no-abbrev", fork, "HEAD").split("\0")
     found: list[str] = []

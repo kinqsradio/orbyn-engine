@@ -92,8 +92,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          # The migration check compares with the base, so it needs the history.
-          fetch-depth: ${{ needs.changes.outputs.migrations == 'true' && 0 || 1 }}
+          # The migration check compares with the base, so it needs the history ('0', a string: the number 0 is false in an
+          # expression and would fall through to 1).
+          fetch-depth: ${{ needs.changes.outputs.migrations == 'true' && '0' || '1' }}
       - if: env.RUST == 'true'
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:

@@ -149,6 +149,33 @@ class Check(unittest.TestCase):
         self.assertIn(MIGRATION, bad.stderr)
         self.assertIn("An applied migration is never edited. Add a new migration for the change.", bad.stderr)
 
+    def test_a_base_commit_missing_from_the_checkout_is_a_clear_error(self):
+        missing = "0123456789abcdef0123456789abcdef01234567"
+        run = subprocess.run(["python3", SCRIPT, "--base", missing], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2)
+        self.assertIn(missing, run.stderr)
+        self.assertIn("not in this checkout", run.stderr)
+        self.assertIn("fetch-depth: 0", run.stderr)
+
+    def test_a_missing_base_is_fetched_from_origin(self):
+        # A clone holding only its newest commit, as a shallow CI checkout does, lacks the base.
+        base = subprocess.run(["git", "rev-parse", "main"], cwd=self.repo, capture_output=True, text=True, check=True).stdout.strip()
+        write(self.repo, MIGRATION, "edited\n")
+        self.commit()
+        with tempfile.TemporaryDirectory() as parent:
+            clone = os.path.join(parent, "clone")
+            subprocess.run(
+                ["git", "clone", "-q", "--depth=1", "--no-tags", "--branch", "change", f"file://{self.repo}", clone],
+                check=True,
+                capture_output=True,
+            )
+            os.chdir(clone)
+            self.assertNotEqual(
+                subprocess.run(["git", "cat-file", "-e", f"{base}^{{commit}}"], capture_output=True).returncode, 0
+            )
+            self.assertEqual(len(check_migrations.violations(base)), 1)
+            os.chdir(self.repo)
+
     def test_an_unknown_base_is_an_error_not_a_pass(self):
         script = SCRIPT
         run = subprocess.run(["python3", script, "--base", "nope"], capture_output=True, text=True)
