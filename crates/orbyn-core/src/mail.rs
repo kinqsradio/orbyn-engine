@@ -313,6 +313,38 @@ impl Sender for LogOnly {
     }
 }
 
+/// The warning logged once at start-up when `ORBYN_MAIL=log-codes` is on (Account Designs v55,
+/// frame `em-ops-log-codes`).
+pub const LOG_CODES_WARNING: &str = "ORBYN_MAIL=log-codes: codes are written to this log with the address they belong to, and no email is sent. This is for staging only.";
+
+/// The line logged with each verification code in `log-codes` mode (Account Designs v55).
+pub fn staging_code_line(code: &str, to: &str) -> String {
+    format!("staging only, not emailed: code {code} for {to}")
+}
+
+/// **Staging only** (`ORBYN_MAIL=log-codes`): logs each verification code with the address it
+/// belongs to, as a warning, and sends nothing, so sign-up on staging can be finished. Every other
+/// message is logged as not sent, like [`LogOnly`], with its kind and account and nothing else:
+/// links and tokens are never written. The configuration refuses this mode anywhere but staging
+/// with invite-only sign-up and no production address; plain `log` mode never logs a code or an
+/// address.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LogCodes;
+
+impl Sender for LogCodes {
+    fn send<'a>(&'a self, mail: &'a Mail) -> SendFuture<'a> {
+        Box::pin(async move {
+            match (&mail.kind, &mail.code) {
+                (Kind::VerifyEmail, Some(code)) => {
+                    tracing::warn!("{}", staging_code_line(code, &mail.to));
+                }
+                _ => log_not_sent(mail.kind.as_str(), mail.account),
+            }
+            Ok(())
+        })
+    }
+}
+
 /// A sender that keeps what it is given, for tests.
 #[derive(Clone, Debug, Default)]
 pub struct Capture(Arc<Mutex<Vec<Mail>>>);
@@ -785,5 +817,115 @@ mod tests {
             "account deletion notice"
         );
         assert_eq!(kind_in_words("anything else"), "email");
+    }
+
+    // ---- ORBYN_MAIL=log-codes ----
+
+    #[derive(Clone, Default)]
+    struct Logs(std::sync::Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
+        type Writer = Logs;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl Logs {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap_or_else(PoisonError::into_inner))
+                .into_owned()
+        }
+    }
+
+    /// What `sender` logs for `mail`, one line per event, without colours or time.
+    async fn logged(sender: &dyn Sender, mail: &Mail) -> String {
+        let logs = Logs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        sender.send(mail).await.expect("sent");
+        logs.text()
+    }
+
+    fn verify(code: &str, to: &str) -> Mail {
+        Mail {
+            kind: Kind::VerifyEmail,
+            account: Some(Uuid::nil()),
+            to: to.to_owned(),
+            code: Some(code.to_owned()),
+        }
+    }
+
+    #[test]
+    fn the_designed_log_codes_lines_are_exact() {
+        assert_eq!(
+            LOG_CODES_WARNING,
+            "ORBYN_MAIL=log-codes: codes are written to this log with the address they belong to, and no email is sent. This is for staging only."
+        );
+        assert_eq!(
+            staging_code_line("482913", "sam@example.com"),
+            "staging only, not emailed: code 482913 for sam@example.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn log_codes_writes_the_code_and_the_address_as_a_warning_and_nothing_else() {
+        let text = logged(&LogCodes, &verify("482913", "sam@example.com")).await;
+        assert_eq!(
+            text.trim_end(),
+            " WARN orbyn_core::mail: staging only, not emailed: code 482913 for sam@example.com"
+        );
+        // Messages that are not a verification code are logged as not sent: a link or a token
+        // never reaches the log, and neither does the address.
+        for (kind, code) in [
+            (
+                Kind::SignUpAttempt,
+                "2026-11-08T00:00:00+00:00\nhttps://account.example.com/sign-in",
+            ),
+            (
+                Kind::DeleteUnused,
+                "https://account.example.com/delete-unused#TOKENTOKEN",
+            ),
+        ] {
+            let mail = Mail {
+                kind,
+                account: Some(Uuid::nil()),
+                to: "sam@example.com".to_owned(),
+                code: Some(code.to_owned()),
+            };
+            let text = logged(&LogCodes, &mail).await;
+            assert!(text.contains("an email was not sent"), "{text}");
+            assert!(
+                !text.contains("sam@example.com") && !text.contains("TOKENTOKEN"),
+                "{text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn plain_log_mode_never_writes_an_address_or_a_code() {
+        let text = logged(&LogOnly, &verify("482913", "sam@example.com")).await;
+        assert!(text.contains("an email was not sent"), "{text}");
+        assert!(
+            !text.contains("482913") && !text.contains("sam@example.com"),
+            "{text}"
+        );
     }
 }
