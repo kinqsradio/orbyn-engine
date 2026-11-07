@@ -209,6 +209,7 @@ The threat model gains:
 - which account wrote each version, from the signatures;
 - invitation timing, under keyed, expiring email digests;
 - the owner's device ids in cross-account notices;
+- witness fetches: a witness sees the addresses of devices that fetch its cosignatures;
 - identity lookups: the key service sees which emails a device looks up, and when, and both servers learn whether an email has an entry when an accepted invitation's lookup is made.
 
 Contents stay sealed.
