@@ -18,7 +18,7 @@ Options:
   --key-file <FILE>          File holding the signing key (64 hex digits)
   --log-keys <KEYS>          Public keys of the logs this witness cosigns for
   --recosign-secs <SECONDS>  How often to cosign the newest head again [default: 600]
-  --newest-per-hour <COUNT>  Most reads of the newest cosignature per address per hour [default: 60]
+  --newest-per-hour <COUNT>  Most cosignatures of the newest head per hour [default: 60]
   --bootstrap-empty          First start with an empty log
   --bootstrap-replay <FILE>  First start by replaying the entries in FILE
   --pin-size <COUNT>         Size the replayed log must have
