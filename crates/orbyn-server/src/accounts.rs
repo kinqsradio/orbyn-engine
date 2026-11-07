@@ -35,6 +35,12 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/v1/accounts/totp", post(totp_enrol))
         .route("/v1/accounts/totp/confirm", post(totp_confirm))
         .route("/v1/accounts/totp/disable", post(totp_disable))
+        .route("/v1/accounts/delete", post(delete_account))
+        .route("/v1/accounts/delete/cancel", post(cancel_deletion))
+        .route(
+            "/v1/accounts/delete/cancel-by-mail",
+            post(cancel_deletion_by_mail),
+        )
         .route("/v1/sessions/current", delete(revoke_current))
         .route("/v1/sessions", delete(revoke_all))
         .route("/v1/devices", get(list_devices))
@@ -110,6 +116,11 @@ impl IntoResponse for Failure {
                 (StatusCode::UNAUTHORIZED, "second_factor_required")
             }
             AccountError::SecondFactorFailed => (StatusCode::UNAUTHORIZED, "second_factor_failed"),
+            AccountError::ReauthenticationRequired => {
+                (StatusCode::UNAUTHORIZED, "reauthentication_required")
+            }
+            AccountError::DeletionScheduled => (StatusCode::CONFLICT, "deletion_scheduled"),
+            AccountError::InvalidCancelToken => (StatusCode::BAD_REQUEST, "invalid_cancel_token"),
             AccountError::TotpAlreadyEnabled => (StatusCode::CONFLICT, "totp_already_enabled"),
             AccountError::TotpNotEnabled => (StatusCode::CONFLICT, "totp_not_enabled"),
             AccountError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
@@ -494,6 +505,10 @@ async fn current_device(
         approval: approval.map(wire_approval),
         totp_enabled,
         totp_pending,
+        deletion_scheduled_at: accounts
+            .deletion_scheduled_at(session.account_id)
+            .await?
+            .map(time),
     }))
 }
 
@@ -688,6 +703,54 @@ async fn totp_disable(
     let proof = manage_proof(body.device_signature.as_deref(), body.signed_at)?;
     service(&state)?
         .totp_disable(&client, &session, proof.as_ref())
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_account(
+    State(state): State<AppState>,
+    Caller(client): Caller,
+    Authed(session): Authed,
+    Body(body): Body<wire::DeleteAccount>,
+) -> Answer<(StatusCode, Json<wire::DeletionScheduled>)> {
+    let proof = manage_proof(body.device_signature.as_deref(), body.signed_at)?;
+    let at = service(&state)?
+        .schedule_deletion(
+            &client,
+            &session,
+            body.code.as_deref(),
+            body.recovery_code.as_deref(),
+            proof.as_ref(),
+        )
+        .await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(wire::DeletionScheduled {
+            deletes_at: time(at),
+        }),
+    ))
+}
+
+async fn cancel_deletion(
+    State(state): State<AppState>,
+    Caller(client): Caller,
+    Authed(session): Authed,
+    Body(body): Body<wire::CancelAccountDeletion>,
+) -> Answer<StatusCode> {
+    let proof = manage_proof(body.device_signature.as_deref(), body.signed_at)?;
+    service(&state)?
+        .cancel_deletion(&client, &session, proof.as_ref())
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn cancel_deletion_by_mail(
+    State(state): State<AppState>,
+    Caller(client): Caller,
+    Body(body): Body<wire::CancelDeletionByMail>,
+) -> Answer<StatusCode> {
+    service(&state)?
+        .cancel_deletion_by_mail(&client, &body.token)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }

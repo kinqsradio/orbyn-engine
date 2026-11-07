@@ -154,6 +154,7 @@ impl IntoResponse for Refusal {
             StoreError::BatchTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "batch_too_large"),
             StoreError::DuplicateRecord => (StatusCode::BAD_REQUEST, "duplicate_record"),
             StoreError::DeviceNotTrusted => (StatusCode::FORBIDDEN, "device_not_trusted"),
+            StoreError::DeletionScheduled => (StatusCode::CONFLICT, "deletion_scheduled"),
             StoreError::ZoneNotFound => (StatusCode::NOT_FOUND, "zone_not_found"),
             StoreError::ZoneDeleted => (StatusCode::CONFLICT, "zone_deleted"),
             StoreError::ZonePurging => (StatusCode::CONFLICT, "zone_purging"),

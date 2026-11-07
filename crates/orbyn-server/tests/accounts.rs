@@ -3929,3 +3929,1291 @@ async fn verifying_a_real_sign_up_and_a_decoy_takes_about_the_same_time() {
         "real {r:?} against decoy {d:?}"
     );
 }
+
+// ---- Deleting an account ----
+
+/// The body of a deletion request, signed by `keys`, the device of `session`, with the second
+/// factor if any.
+fn delete_body(
+    session: &Value,
+    keys: &DeviceKeys,
+    code: Option<&str>,
+    recovery: Option<&str>,
+) -> Value {
+    let at = next_signed_at();
+    let message = auth::account_delete_message(
+        uuid_of(&session["account_id"]).as_bytes(),
+        uuid_of(&session["device_id"]).as_bytes(),
+        at,
+    );
+    let signature = keys.sign(auth::ACCOUNT_DELETE_CONTEXT, &message);
+    json!({
+        "device_signature": b64(&signature),
+        "signed_at": at,
+        "code": code,
+        "recovery_code": recovery,
+    })
+}
+
+/// The body that cancels a scheduled deletion, signed by `keys`.
+fn cancel_body(session: &Value, keys: &DeviceKeys) -> Value {
+    let at = next_signed_at();
+    let message = auth::account_delete_message(
+        uuid_of(&session["account_id"]).as_bytes(),
+        uuid_of(&session["device_id"]).as_bytes(),
+        at,
+    );
+    json!({
+        "device_signature": b64(&keys.sign(auth::ACCOUNT_DELETE_CANCEL_CONTEXT, &message)),
+        "signed_at": at,
+    })
+}
+
+/// Many requests from one device in a test, so the hourly cap does not get in the way.
+fn roomy() -> Limits {
+    Limits {
+        account_delete_per_device: Limit::new(100, Duration::from_secs(3600)),
+        ..Limits::default()
+    }
+}
+
+impl Server {
+    async fn delete_account(&self, session: &Value, body: Value) -> (StatusCode, Value) {
+        self.call(
+            Method::POST,
+            "/v1/accounts/delete",
+            Some(token(session)),
+            Some(body),
+        )
+        .await
+    }
+
+    async fn cancel_deletion(&self, session: &Value, body: Value) -> (StatusCode, Value) {
+        self.call(
+            Method::POST,
+            "/v1/accounts/delete/cancel",
+            Some(token(session)),
+            Some(body),
+        )
+        .await
+    }
+
+    /// The account service as the worker runs it, over the same database.
+    fn worker(&self) -> Accounts {
+        let secrets = AuthSecrets::from_encoded(SETUP.get().expect("setup")).expect("setup");
+        Accounts::new(self.db.pool().clone(), secrets)
+    }
+
+    async fn scheduled_at(&self, account: Uuid) -> Option<chrono::DateTime<chrono::Utc>> {
+        orbyn_core::sqlx::query_scalar("SELECT deletion_scheduled_at FROM accounts WHERE id = $1")
+            .bind(account)
+            .fetch_one(self.db.pool())
+            .await
+            .expect("scheduled")
+    }
+
+    async fn make_due(&self, account: Uuid) {
+        orbyn_core::sqlx::query(
+            "UPDATE accounts SET deletion_scheduled_at = now() - interval '1 minute' WHERE id = $1",
+        )
+        .bind(account)
+        .execute(self.db.pool())
+        .await
+        .expect("due");
+    }
+
+    /// Makes a session look like it signed in `minutes` ago.
+    async fn age_session(&self, device: &Value, minutes: i32) {
+        orbyn_core::sqlx::query(
+            "UPDATE sessions SET authenticated_at = now() - make_interval(mins => $2)
+             WHERE device_id = $1",
+        )
+        .bind(uuid_of(device))
+        .bind(minutes)
+        .execute(self.db.pool())
+        .await
+        .expect("age");
+    }
+
+    /// The cancel tokens in the deletion emails sent to `email`, oldest first (from the link's
+    /// fragment, or the token alone when the deployment has no app URL).
+    async fn cancel_tokens(&self, email: &str) -> Vec<String> {
+        let to = normalized(email);
+        self.mailbox()
+            .await
+            .sent()
+            .into_iter()
+            .filter(|m| m.to == to && m.kind == Kind::DeletionScheduled)
+            .map(|m| {
+                let value = m.code.expect("the notice carries a value");
+                let link = value.split_once('\n').expect("date and link").1.to_owned();
+                link.rsplit('#').next().expect("token").to_owned()
+            })
+            .collect()
+    }
+
+    async fn cancel_by_mail(&self, token: &str) -> (StatusCode, Value) {
+        self.call(
+            Method::POST,
+            "/v1/accounts/delete/cancel-by-mail",
+            None,
+            Some(json!({"token": token})),
+        )
+        .await
+    }
+
+    async fn email_of(&self, account: Uuid) -> String {
+        orbyn_core::sqlx::query_scalar("SELECT email FROM accounts WHERE id = $1")
+            .bind(account)
+            .fetch_one(self.db.pool())
+            .await
+            .expect("email")
+    }
+
+    async fn exists(&self, account: Uuid) -> bool {
+        let n: i64 = orbyn_core::sqlx::query_scalar("SELECT count(*) FROM accounts WHERE id = $1")
+            .bind(account)
+            .fetch_one(self.db.pool())
+            .await
+            .expect("count");
+        n == 1
+    }
+
+    /// How many rows any table holds for the account or one of its devices: every table with an
+    /// `account_id`, `owner_id` or `device_id` column, found from the schema, so a table added
+    /// later is counted too.
+    async fn rows_for(&self, account: Uuid, devices: &[Uuid]) -> Vec<(String, i64)> {
+        let columns: Vec<(String, String)> = orbyn_core::sqlx::query_as(
+            "SELECT table_name::text, column_name::text FROM information_schema.columns
+             WHERE table_schema = 'public' AND column_name IN ('account_id', 'owner_id', 'device_id')
+             ORDER BY 1, 2",
+        )
+        .fetch_all(self.db.pool())
+        .await
+        .expect("columns");
+        let mut found = vec![("accounts".to_owned(), i64::from(self.exists(account).await))];
+        for (table, column) in columns {
+            let key = if column == "device_id" {
+                devices
+            } else {
+                std::slice::from_ref(&account)
+            };
+            let sql = format!("SELECT count(*) FROM {table} WHERE {column} = ANY($1)");
+            let n: i64 = orbyn_core::sqlx::query_scalar(orbyn_core::sqlx::AssertSqlSafe(sql))
+                .bind(key)
+                .fetch_one(self.db.pool())
+                .await
+                .expect("count");
+            found.push((format!("{table}.{column}"), n));
+        }
+        found
+    }
+
+    /// Every uuid column in the schema, and every text and jsonb column read as text, that still
+    /// names one of `ids` or contains one of `texts`: the places something of a deleted account
+    /// could survive, found from the schema so a column added later is looked at too.
+    async fn residue(&self, ids: &[Uuid], texts: &[String]) -> Vec<(String, i64)> {
+        let columns: Vec<(String, String, String)> = orbyn_core::sqlx::query_as(
+            "SELECT table_name::text, column_name::text, data_type::text FROM information_schema.columns
+             WHERE table_schema = 'public' AND table_name <> '_sqlx_migrations'
+               AND data_type IN ('uuid', 'text', 'jsonb') ORDER BY 1, 2",
+        )
+        .fetch_all(self.db.pool())
+        .await
+        .expect("columns");
+        let patterns: Vec<String> = ids
+            .iter()
+            .map(Uuid::to_string)
+            .chain(texts.iter().cloned())
+            .map(|t| format!("%{t}%"))
+            .collect();
+        let mut hits = Vec::new();
+        for (table, column, kind) in columns {
+            let n: i64 = if kind == "uuid" {
+                let sql = format!("SELECT count(*) FROM {table} WHERE {column} = ANY($1)");
+                orbyn_core::sqlx::query_scalar(orbyn_core::sqlx::AssertSqlSafe(sql))
+                    .bind(ids)
+                    .fetch_one(self.db.pool())
+                    .await
+                    .expect("count")
+            } else {
+                let sql =
+                    format!("SELECT count(*) FROM {table} WHERE {column}::text ILIKE ANY($1)");
+                orbyn_core::sqlx::query_scalar(orbyn_core::sqlx::AssertSqlSafe(sql))
+                    .bind(&patterns)
+                    .fetch_one(self.db.pool())
+                    .await
+                    .expect("count")
+            };
+            if n > 0 {
+                hits.push((format!("{table}.{column}"), n));
+            }
+        }
+        hits
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn scheduling_needs_the_devices_signature_trust_a_recent_sign_in_and_each_signature_once() {
+    let _turn = TURN.lock().await;
+    let server = server_with(roomy()).await;
+    let email = email();
+    let laptop = DeviceKeys::generate().expect("keys");
+    let session = server.register(&email, b"correct horse", &laptop).await;
+    let account = uuid_of(&session["account_id"]);
+    let laptop_id = uuid_of(&session["device_id"]);
+    let refused = |(status, body): &(StatusCode, Value), code: &str, expected: StatusCode| {
+        assert_eq!((*status, &body["code"]), (expected, &json!(code)), "{body}");
+    };
+
+    // A bare token is not a request; neither is a signature for another action, key or time.
+    for body in [
+        json!({}),
+        {
+            let mut b = proof(&session, &laptop, "disable", ""); // another action's signature
+            b["code"] = Value::Null;
+            b
+        },
+        delete_body(&session, &DeviceKeys::generate().expect("keys"), None, None),
+        {
+            let mut late = delete_body(&session, &laptop, None, None);
+            let at = next_signed_at() - 3600;
+            let message =
+                auth::account_delete_message(account.as_bytes(), laptop_id.as_bytes(), at);
+            late["signed_at"] = json!(at);
+            late["device_signature"] =
+                json!(b64(&laptop.sign(auth::ACCOUNT_DELETE_CONTEXT, &message)));
+            late
+        },
+        cancel_body(&session, &laptop), // the cancel context is not the schedule's
+    ] {
+        let answer = server.delete_account(&session, body).await;
+        refused(&answer, "device_proof_required", StatusCode::UNAUTHORIZED);
+    }
+    assert_eq!(server.scheduled_at(account).await, None);
+
+    // A device that is not trusted cannot, even with its own valid signature.
+    let phone = DeviceKeys::generate().expect("keys");
+    let phone_session = server.login(&email, b"correct horse", &phone).await;
+    let answer = server
+        .delete_account(
+            &phone_session,
+            delete_body(&phone_session, &phone, None, None),
+        )
+        .await;
+    refused(&answer, "device_not_trusted", StatusCode::FORBIDDEN);
+
+    // A session that signed in more than ten minutes ago is asked to sign in again, and the
+    // signature is not used up by that: the same request works after a fresh sign-in.
+    server.age_session(&session["device_id"], 11).await;
+    let body = delete_body(&session, &laptop, None, None);
+    let answer = server.delete_account(&session, body.clone()).await;
+    refused(
+        &answer,
+        "reauthentication_required",
+        StatusCode::UNAUTHORIZED,
+    );
+    assert_eq!(server.scheduled_at(account).await, None);
+    server.age_session(&session["device_id"], 9).await;
+    let (status, answer) = server.delete_account(&session, body).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{answer}");
+    let (status, _) = server
+        .cancel_deletion(&session, cancel_body(&session, &laptop))
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // With a second factor on, a request that fails on its code still uses its signature up.
+    let (secret, _) = server.enable_totp(&session, &laptop).await;
+    let spent = delete_body(&session, &laptop, Some(&wrong_code(&secret)), None);
+    let answer = server.delete_account(&session, spent.clone()).await;
+    refused(&answer, "second_factor_failed", StatusCode::UNAUTHORIZED);
+    let mut replay = spent;
+    replay["code"] = json!(code_for(&secret, 1)); // the right code now, on the same signature
+    let answer = server.delete_account(&session, replay).await;
+    refused(&answer, "device_proof_required", StatusCode::UNAUTHORIZED);
+    assert_eq!(server.scheduled_at(account).await, None);
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn bad_signatures_do_not_use_up_the_five_an_hour() {
+    let _turn = TURN.lock().await;
+    let server = server().await;
+    let email = email();
+    let laptop = DeviceKeys::generate().expect("keys");
+    let session = server.register(&email, b"correct horse", &laptop).await;
+    let stranger = DeviceKeys::generate().expect("keys");
+    for _ in 0..8 {
+        let (status, _) = server
+            .delete_account(&session, delete_body(&session, &stranger, None, None))
+            .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    let (status, body) = server
+        .delete_account(&session, delete_body(&session, &laptop, None, None))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn with_two_factor_on_a_missing_or_wrong_code_schedules_nothing_and_a_recovery_code_works_once()
+ {
+    let _turn = TURN.lock().await;
+    let server = server().await;
+    let p = protected(&server).await;
+    let account = uuid_of(&p.session["account_id"]);
+
+    for (code, recovery) in [
+        (None, None),
+        (Some(wrong_code(&p.secret)), None),
+        (None, Some("AAAAA-AAAAA".to_owned())),
+        (Some(code_for(&p.secret, 1)), Some(p.recovery[0].clone())), // exactly one of the two
+    ] {
+        let (status, body) = server
+            .delete_account(
+                &p.session,
+                delete_body(&p.session, &p.laptop, code.as_deref(), recovery.as_deref()),
+            )
+            .await;
+        assert_eq!(
+            (status, &body["code"]),
+            (StatusCode::UNAUTHORIZED, &json!("second_factor_failed")),
+            "{code:?} {recovery:?}"
+        );
+        assert_eq!(server.scheduled_at(account).await, None);
+    }
+    // An unused recovery code schedules it.
+    let (status, body) = server
+        .delete_account(
+            &p.session,
+            delete_body(&p.session, &p.laptop, None, Some(&p.recovery[0])),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert!(server.scheduled_at(account).await.is_some());
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn deletion_requests_are_limited_to_five_an_hour_per_device() {
+    let _turn = TURN.lock().await;
+    let server = server().await;
+    let p = protected(&server).await;
+    for _ in 0..5 {
+        let (status, _) = server
+            .delete_account(
+                &p.session,
+                delete_body(&p.session, &p.laptop, Some(&wrong_code(&p.secret)), None),
+            )
+            .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    let (status, body) = server
+        .delete_account(
+            &p.session,
+            delete_body(&p.session, &p.laptop, Some(&code_for(&p.secret, 1)), None),
+        )
+        .await;
+    assert_eq!(
+        (status, &body["code"]),
+        (StatusCode::TOO_MANY_REQUESTS, &json!("too_many_attempts"))
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn asking_again_keeps_the_time_and_the_one_email_and_a_new_schedule_is_limited_to_three_a_day()
+ {
+    let _turn = TURN.lock().await;
+    let server = server_with(roomy()).await;
+    let email = email();
+    let laptop = DeviceKeys::generate().expect("keys");
+    let session = server.register(&email, b"correct horse", &laptop).await;
+    let account = uuid_of(&session["account_id"]);
+
+    let (status, first) = server
+        .delete_account(&session, delete_body(&session, &laptop, None, None))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{first}");
+    let deletes_at =
+        chrono::DateTime::parse_from_rfc3339(first["deletes_at"].as_str().expect("at"))
+            .expect("rfc3339");
+    let in_days = (deletes_at.timestamp() - chrono_now()) as f64 / 86_400.0;
+    assert!((6.99..=7.01).contains(&in_days), "{in_days} days");
+    assert_eq!(
+        server
+            .scheduled_at(account)
+            .await
+            .map(|t| t.timestamp_millis()),
+        Some(deletes_at.timestamp_millis())
+    );
+
+    // Again: the same time, the clock is not restarted, and nothing more is sent.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let (status, again) = server
+        .delete_account(&session, delete_body(&session, &laptop, None, None))
+        .await;
+    assert_eq!(
+        (status, &again["deletes_at"]),
+        (StatusCode::ACCEPTED, &first["deletes_at"])
+    );
+    let to = normalized(&email);
+    let sent = server.mailbox().await.count(&to, Kind::DeletionScheduled);
+    assert_eq!(sent, 1, "one email per schedule");
+
+    // Three schedules a day: cancel and ask again twice more, and the fourth is refused.
+    for _ in 0..2 {
+        let (status, _) = server
+            .cancel_deletion(&session, cancel_body(&session, &laptop))
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, body) = server
+            .delete_account(&session, delete_body(&session, &laptop, None, None))
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    }
+    let (status, _) = server
+        .cancel_deletion(&session, cancel_body(&session, &laptop))
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, body) = server
+        .delete_account(&session, delete_body(&session, &laptop, None, None))
+        .await;
+    assert_eq!(
+        (status, &body["code"]),
+        (StatusCode::TOO_MANY_REQUESTS, &json!("too_many_attempts"))
+    );
+    assert_eq!(server.scheduled_at(account).await, None);
+    assert_eq!(
+        server.mailbox().await.count(&to, Kind::DeletionScheduled),
+        3,
+        "one email for each of the three schedules"
+    );
+    let notice = server
+        .mailbox()
+        .await
+        .sent()
+        .into_iter()
+        .find(|m| m.to == to && m.kind == Kind::DeletionScheduled)
+        .expect("notice");
+    assert!(
+        notice
+            .body()
+            .contains(&deletes_at.format("%Y-%m-%d").to_string())
+    );
+    assert!(notice.body().contains("cancel"));
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn two_requests_at_once_schedule_once() {
+    let _turn = TURN.lock().await;
+    let server = server_with(roomy()).await;
+    let email = email();
+    let laptop = DeviceKeys::generate().expect("keys");
+    let session = server.register(&email, b"correct horse", &laptop).await;
+    let account = uuid_of(&session["account_id"]);
+    let mut hold = server.db.pool().begin().await.expect("tx");
+    orbyn_core::sqlx::query("SELECT id FROM accounts WHERE id = $1 FOR UPDATE")
+        .bind(account)
+        .execute(&mut *hold)
+        .await
+        .expect("lock");
+    let (one, two) = (
+        delete_body(&session, &laptop, None, None),
+        delete_body(&session, &laptop, None, None),
+    );
+    let release = async {
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        hold.commit().await.expect("release");
+    };
+    let ((s1, a), (s2, b), ()) = tokio::join!(
+        server.delete_account(&session, one),
+        server.delete_account(&session, two),
+        release
+    );
+    // Each signature is accepted only if newer than the last, so the later-signed one may lose
+    // the race to the mark; whichever are accepted agree on the time.
+    for (status, body) in [(s1, &a), (s2, &b)] {
+        assert!(
+            status == StatusCode::ACCEPTED
+                || (status, &body["code"])
+                    == (StatusCode::UNAUTHORIZED, &json!("device_proof_required")),
+            "{status} {body}"
+        );
+    }
+    assert!(s1 == StatusCode::ACCEPTED || s2 == StatusCode::ACCEPTED);
+    if s1 == StatusCode::ACCEPTED && s2 == StatusCode::ACCEPTED {
+        assert_eq!(a["deletes_at"], b["deletes_at"]);
+    }
+    assert_eq!(
+        server
+            .mailbox()
+            .await
+            .count(&normalized(&email), Kind::DeletionScheduled),
+        1
+    );
+    let scheduled = server
+        .audit_actions(account)
+        .await
+        .iter()
+        .filter(|a| *a == "account.deletion_scheduled")
+        .count();
+    assert_eq!(scheduled, 1);
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn while_a_deletion_is_scheduled_the_account_works_but_cannot_be_locked_out() {
+    let _turn = TURN.lock().await;
+    let server = server_with(roomy()).await;
+    let p = pair(&server).await;
+    server.approve_fully(&p).await; // both devices are trusted now
+    let (secret, _) = server.enable_totp(&p.a_session, &p.a).await;
+    let b_id = uuid_of(&p.b_session["device_id"]);
+    let (status, body) = server
+        .delete_account(
+            &p.a_session,
+            delete_body(&p.a_session, &p.a, Some(&code_for(&secret, 1)), None),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+
+    // Every device sees the date, and the account works as usual (the person can still export).
+    for session in [&p.a_session, &p.b_session] {
+        let (status, current) = server
+            .call(
+                Method::GET,
+                "/v1/devices/current",
+                Some(token(session)),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(current["deletion_scheduled_at"], body["deletes_at"]);
+    }
+    let (status, _) = server
+        .call(Method::GET, "/v1/devices", Some(token(&p.a_session)), None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Removing a device and turning the second factor off wait.
+    let (status, refused) = server
+        .remove(token(&p.a_session), &p.a, p.account_id, b_id, &p.b.public())
+        .await;
+    assert_eq!(
+        (status, &refused["code"]),
+        (StatusCode::CONFLICT, &json!("deletion_scheduled"))
+    );
+    let disable = || async {
+        server
+            .call(
+                Method::POST,
+                "/v1/accounts/totp/disable",
+                Some(token(&p.a_session)),
+                Some(proof(&p.a_session, &p.a, "disable", "")),
+            )
+            .await
+    };
+    let (status, refused) = disable().await;
+    assert_eq!(
+        (status, &refused["code"]),
+        (StatusCode::CONFLICT, &json!("deletion_scheduled"))
+    );
+
+    // Enrolling or confirming a second factor, and signing every device out, wait too.
+    let enrol = server
+        .call(
+            Method::POST,
+            "/v1/accounts/totp",
+            Some(token(&p.a_session)),
+            Some(proof(&p.a_session, &p.a, "enrol", "")),
+        )
+        .await;
+    let confirm = server
+        .call(
+            Method::POST,
+            "/v1/accounts/totp/confirm",
+            Some(token(&p.a_session)),
+            Some(confirm_body(&p.a_session, &p.a, &code_for(&secret, 2))),
+        )
+        .await;
+    let sign_out_everywhere = server
+        .call(
+            Method::DELETE,
+            "/v1/sessions",
+            Some(token(&p.a_session)),
+            None,
+        )
+        .await;
+    for (status, refused) in [enrol, confirm, sign_out_everywhere] {
+        assert_eq!(
+            (status, &refused["code"]),
+            (StatusCode::CONFLICT, &json!("deletion_scheduled"))
+        );
+    }
+    let (status, _) = server
+        .call(Method::GET, "/v1/devices", Some(token(&p.b_session)), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "no session was ended");
+
+    // Cancelled, both work again.
+    let (status, _) = server
+        .cancel_deletion(&p.a_session, cancel_body(&p.a_session, &p.a))
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, body) = disable().await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (status, body) = server
+        .remove(token(&p.a_session), &p.a, p.account_id, b_id, &p.b.public())
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn any_trusted_device_cancels_with_its_signature_and_a_new_device_with_a_recent_sign_in() {
+    let _turn = TURN.lock().await;
+    let server = server_with(roomy()).await;
+    let p = pair(&server).await;
+    server.approve_fully(&p).await; // both devices are trusted now
+    let account = p.account_id;
+    let (status, body) = server
+        .delete_account(&p.a_session, delete_body(&p.a_session, &p.a, None, None))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+
+    // The other trusted device cancels, with its own signature and nothing less.
+    let b_bad = [
+        json!({}),
+        delete_body(&p.b_session, &p.b, None, None), // the schedule's context
+        cancel_body(&p.b_session, &p.a),             // another device's key
+    ];
+    for body in b_bad {
+        let (status, answer) = server.cancel_deletion(&p.b_session, body).await;
+        assert_eq!(
+            (status, &answer["code"]),
+            (StatusCode::UNAUTHORIZED, &json!("device_proof_required"))
+        );
+        assert!(server.scheduled_at(account).await.is_some());
+    }
+    let (status, _) = server
+        .cancel_deletion(&p.b_session, cancel_body(&p.b_session, &p.b))
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(server.scheduled_at(account).await, None);
+    // Cancelling when nothing is scheduled does nothing.
+    let (status, _) = server
+        .cancel_deletion(&p.b_session, cancel_body(&p.b_session, &p.b))
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // A new device, pending after a password sign-in: it cancels while that sign-in is recent
+    // and for nothing else.
+    let (status, _) = server
+        .delete_account(&p.a_session, delete_body(&p.a_session, &p.a, None, None))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let email = server.email_of(account).await;
+    let new = DeviceKeys::generate().expect("keys");
+    let new_session = server.login(&email, b"correct horse", &new).await;
+    assert_eq!(new_session["device_state"], "pending");
+    let (status, answer) = server
+        .delete_account(&new_session, delete_body(&new_session, &new, None, None))
+        .await;
+    assert_eq!(
+        (status, &answer["code"]),
+        (StatusCode::FORBIDDEN, &json!("device_not_trusted"))
+    );
+    let (status, _) = server
+        .call(Method::GET, "/v1/devices", Some(token(&new_session)), None)
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    server.age_session(&new_session["device_id"], 11).await;
+    let (status, answer) = server
+        .cancel_deletion(&new_session, cancel_body(&new_session, &new))
+        .await;
+    assert_eq!(
+        (status, &answer["code"]),
+        (
+            StatusCode::UNAUTHORIZED,
+            &json!("reauthentication_required")
+        )
+    );
+    assert!(server.scheduled_at(account).await.is_some());
+    server.age_session(&new_session["device_id"], 1).await;
+    let (status, answer) = server
+        .cancel_deletion(&new_session, cancel_body(&new_session, &new))
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{answer}");
+    assert_eq!(server.scheduled_at(account).await, None);
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn the_worker_deletes_a_due_account_and_nothing_of_it_remains() {
+    let _turn = TURN.lock().await;
+    let server = server_with(roomy()).await;
+    let p = pair(&server).await;
+    server.approve_fully(&p).await;
+    let account = p.account_id;
+    let a_id = uuid_of(&p.a_session["device_id"]);
+    let b_id = uuid_of(&p.b_session["device_id"]);
+    let email = server.email_of(account).await;
+    let started =
+        orbyn_core::sqlx::query_scalar::<_, i64>("SELECT coalesce(max(id), 0) FROM auth_attempts")
+            .fetch_one(server.db.pool())
+            .await
+            .expect("mark");
+
+    // Things in many tables: a zone with a record, a key envelope, a subscription, a pending
+    // sign-up for the address, a failed sign-in, and queued work that names the account.
+    let zone = Uuid::new_v4();
+    let pool = server.db.pool();
+    orbyn_core::sqlx::query("INSERT INTO zones (id, owner_id, name) VALUES ($1, $2, 'list:inbox')")
+        .bind(zone)
+        .bind(account)
+        .execute(pool)
+        .await
+        .expect("zone");
+    orbyn_core::sqlx::query(
+        "INSERT INTO records (zone_id, record_id, record_type, version, ciphertext, wrapped_key, author_device_id)
+         VALUES ($1, 'r1', 'task', 1, decode('01', 'hex'), decode('02', 'hex'), $2)",
+    )
+    .bind(zone)
+    .bind(a_id)
+    .execute(pool)
+    .await
+    .expect("record");
+    orbyn_core::sqlx::query(
+        "INSERT INTO key_envelopes (account_id, recipient_device_id, sender_device_id, zone, key_id, envelope)
+         VALUES ($1, $2, $3, 'list:inbox', decode('00112233445566778899aabbccddeeff', 'hex'), decode('01', 'hex'))",
+    )
+    .bind(account)
+    .bind(b_id)
+    .bind(a_id)
+    .execute(pool)
+    .await
+    .expect("envelope");
+    orbyn_core::sqlx::query(
+        "INSERT INTO subscriptions (id, account_id, device_id, zone_id) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(account)
+    .bind(b_id)
+    .bind(zone)
+    .execute(pool)
+    .await
+    .expect("subscription");
+    orbyn_core::sqlx::query(
+        "INSERT INTO protection_settings (account_id, seq, level, prev, hash, signed_at, signer_device_id, signature)
+         VALUES ($1, 1, 'advanced', decode(repeat('00', 32), 'hex'), decode(repeat('11', 32), 'hex'), 1, $2, decode(repeat('22', 64), 'hex'))",
+    )
+    .bind(account)
+    .bind(a_id)
+    .execute(pool)
+    .await
+    .expect("protection");
+    let signup = Uuid::new_v4();
+    orbyn_core::sqlx::query(
+        "INSERT INTO pending_signups (id, email, password_file, device_name, device_platform,
+             device_signing_key, device_agreement_key, code_digest, expires_at)
+         VALUES ($1, $2, decode('01', 'hex'), 'Phone', 'web', $3, $3, $3, now() + interval '30 minutes')",
+    )
+    .bind(signup)
+    .bind(normalized(&email))
+    .bind(rand32().as_slice())
+    .execute(pool)
+    .await
+    .expect("signup");
+    let jobs = [
+        // What the write path queues for a subscribed device.
+        json!({"account_id": account, "zone_id": zone, "zone": "list:inbox", "token": "t", "author_device_id": a_id}),
+        // Ids anywhere in a payload, nested or in a list.
+        json!({"deep": {"devices": [b_id]}}),
+        // A queued verification mail for a sign-up of the address.
+        json!({"kind": "verify_email", "account": signup}),
+    ];
+    for (n, payload) in jobs.into_iter().enumerate() {
+        orbyn_core::jobs::enqueue(
+            pool,
+            "zone_changed",
+            payload,
+            Some(&format!("k-{account}-{n}")),
+        )
+        .await
+        .expect("job");
+    }
+    let unrelated = orbyn_core::jobs::enqueue(pool, "noop", json!({"for": "someone else"}), None)
+        .await
+        .expect("job");
+    let _ = server.login_start(&email, b"wrong").await; // counted against the address's limits
+    let (secret, _) = server.enable_totp(&p.a_session, &p.a).await;
+
+    let (status, body) = server
+        .delete_account(
+            &p.a_session,
+            delete_body(&p.a_session, &p.a, Some(&code_for(&secret, 1)), None),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let before = server.rows_for(account, &[a_id, b_id]).await;
+    assert!(before.iter().map(|(_, n)| n).sum::<i64>() > 8, "{before:?}");
+    let attempts = |after: bool| {
+        let pool = server.db.pool().clone();
+        async move {
+            let rows: Vec<(String, i64)> = orbyn_core::sqlx::query_as(
+                "SELECT action, count(*) FROM auth_attempts WHERE id > $1 AND action = ANY($2)
+                 GROUP BY 1 ORDER BY 1",
+            )
+            .bind(started)
+            .bind(vec![
+                "login-email",
+                "login",
+                "totp-account",
+                "totp-manage",
+                "account-delete",
+                "account-delete-schedule",
+                "approval-code",
+                "signup-codes-hour",
+                "signup-codes-day",
+                "email-verify-address",
+            ])
+            .fetch_all(&pool)
+            .await
+            .expect("attempts");
+            if after {
+                assert!(
+                    rows.is_empty(),
+                    "this account's limiter rows remain: {rows:?}"
+                );
+            }
+            rows
+        }
+    };
+    let counted = attempts(false).await;
+    assert!(
+        counted.len() >= 4,
+        "its own attempts are counted: {counted:?}"
+    );
+
+    // Not due yet: the worker leaves it. It is due: the worker deletes it.
+    let worker = server.worker();
+    assert!(
+        !worker
+            .due_for_deletion(1000)
+            .await
+            .expect("due")
+            .contains(&account)
+    );
+    assert!(!worker.delete_if_due(account).await.expect("worker"));
+    assert!(server.exists(account).await);
+    server.make_due(account).await;
+    assert!(worker.delete_if_due(account).await.expect("worker"));
+
+    attempts(true).await;
+    for (table, n) in server.rows_for(account, &[a_id, b_id]).await {
+        assert_eq!(n, 0, "{table} still has rows for the deleted account");
+    }
+    // Nothing in any uuid, text or jsonb column names it, its devices, its zone or its address.
+    let texts = vec![normalized(&email)];
+    let left = server
+        .residue(&[account, a_id, b_id, zone, signup], &texts)
+        .await;
+    assert!(
+        left.is_empty(),
+        "something of the account survives: {left:?}"
+    );
+    // Other people's queued work is untouched.
+    let kept: i64 = orbyn_core::sqlx::query_scalar("SELECT count(*) FROM jobs WHERE id = $1")
+        .bind(unrelated)
+        .fetch_one(pool)
+        .await
+        .expect("job");
+    assert_eq!(kept, 1);
+
+    // Every device's session ended with it.
+    for session in [&p.a_session, &p.b_session] {
+        let (status, _) = server
+            .call(Method::GET, "/v1/devices", Some(token(session)), None)
+            .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    // The audit log keeps its history, with no id, no address digest and no way back: its rows
+    // share a random value made for this deletion and kept nowhere else.
+    type Kept = (
+        Option<Uuid>,
+        Option<Uuid>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        String,
+    );
+    let kept: Vec<Kept> = orbyn_core::sqlx::query_as(
+        "SELECT account_id, device_id, ip_hash, subject, action FROM audit_log
+         WHERE subject = (SELECT subject FROM audit_log WHERE action = 'account.deleted' ORDER BY id DESC LIMIT 1)
+         ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("audit");
+    for action in [
+        "account.deleted",
+        "account.registered",
+        "account.deletion_scheduled",
+    ] {
+        assert!(kept.iter().any(|k| k.4 == action), "{action} is kept");
+    }
+    for (a, d, ip, subject, action) in &kept {
+        assert_eq!(
+            (a, d, ip),
+            (&None, &None, &None),
+            "{action} can still be linked"
+        );
+        assert_eq!(subject.as_ref().map(Vec::len), Some(32));
+    }
+    // The address is free: it can be used to sign up again, as a new account.
+    let again = DeviceKeys::generate().expect("keys");
+    let new_session = server.register(&email, b"another password", &again).await;
+    assert_ne!(uuid_of(&new_session["account_id"]), account);
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_cancel_that_gets_the_lock_first_beats_the_worker() {
+    let _turn = TURN.lock().await;
+    let server = server_with(roomy()).await;
+    let email = email();
+    let laptop = DeviceKeys::generate().expect("keys");
+    let session = server.register(&email, b"correct horse", &laptop).await;
+    let account = uuid_of(&session["account_id"]);
+    let worker = server.worker();
+
+    // The worker has listed the account as due, then a cancel lands: it finds the schedule gone.
+    let (status, _) = server
+        .delete_account(&session, delete_body(&session, &laptop, None, None))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    server.make_due(account).await;
+    assert_eq!(
+        worker.due_for_deletion(100).await.expect("due"),
+        vec![account]
+    );
+    let (status, _) = server
+        .cancel_deletion(&session, cancel_body(&session, &laptop))
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(!worker.delete_if_due(account).await.expect("worker"));
+    assert!(server.exists(account).await);
+
+    // Both want the account at once, and one workers' pair too: either the cancel wins and
+    // nothing goes, or one worker deletes it once and the cancel finds nobody to cancel.
+    let (status, _) = server
+        .delete_account(&session, delete_body(&session, &laptop, None, None))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    server.make_due(account).await;
+    let mut hold = server.db.pool().begin().await.expect("tx");
+    orbyn_core::sqlx::query("SELECT id FROM accounts WHERE id = $1 FOR UPDATE")
+        .bind(account)
+        .execute(&mut *hold)
+        .await
+        .expect("lock");
+    let cancel = cancel_body(&session, &laptop);
+    let release = async {
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        hold.commit().await.expect("release");
+    };
+    let ((cancelled, _), one, two, ()) = tokio::join!(
+        server.cancel_deletion(&session, cancel),
+        worker.delete_if_due(account),
+        worker.delete_if_due(account),
+        release
+    );
+    let deleted = [one.expect("worker"), two.expect("worker")];
+    let exists = server.exists(account).await;
+    match cancelled {
+        StatusCode::NO_CONTENT => {
+            assert!(exists && deleted == [false, false], "{deleted:?} {exists}");
+            assert_eq!(server.scheduled_at(account).await, None);
+        }
+        other => {
+            assert_eq!(other, StatusCode::UNAUTHORIZED);
+            assert!(
+                !exists && deleted.iter().filter(|d| **d).count() == 1,
+                "{deleted:?}"
+            );
+            let rows: i64 = orbyn_core::sqlx::query_scalar(
+                "SELECT count(*) FROM audit_log WHERE action = 'account.deleted'
+                   AND subject IN (SELECT subject FROM audit_log WHERE action = 'account.registered' AND account_id IS NULL AND subject IS NOT NULL)",
+            )
+            .fetch_one(server.db.pool())
+            .await
+            .expect("rows");
+            assert!(rows >= 1);
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_device_removed_while_it_asks_cannot_schedule() {
+    let _turn = TURN.lock().await;
+    let server = server_with(roomy()).await;
+    let p = pair(&server).await;
+    server.approve_fully(&p).await;
+    let account = p.account_id;
+    let a_id = uuid_of(&p.a_session["device_id"]);
+    let b_id = uuid_of(&p.b_session["device_id"]);
+    // The other device takes the account lock and removes A, as removing a device does.
+    let mut owner = server.db.pool().begin().await.expect("tx");
+    orbyn_core::sqlx::query("SELECT id FROM accounts WHERE id = $1 FOR UPDATE")
+        .bind(account)
+        .execute(&mut *owner)
+        .await
+        .expect("lock");
+    let body = delete_body(&p.a_session, &p.a, None, None);
+    let remove = async {
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        orbyn_core::sqlx::query(
+            "UPDATE devices SET state = 'removed', removed_at = now(), removed_by = $2 WHERE id = $1",
+        )
+        .bind(a_id)
+        .bind(b_id)
+        .execute(&mut *owner)
+        .await
+        .expect("remove");
+        owner.commit().await.expect("commit");
+    };
+    let ((status, body), ()) = tokio::join!(server.delete_account(&p.a_session, body), remove);
+    assert_eq!(
+        (status, &body["code"]),
+        (StatusCode::FORBIDDEN, &json!("device_not_trusted"))
+    );
+    assert_eq!(server.scheduled_at(account).await, None);
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn audit_rows_written_while_the_worker_deletes_are_scrubbed_too() {
+    let _turn = TURN.lock().await;
+    let server = server_with(roomy()).await;
+    let p = pair(&server).await;
+    server.approve_fully(&p).await;
+    let account = p.account_id;
+    let (status, _) = server
+        .delete_account(&p.a_session, delete_body(&p.a_session, &p.a, None, None))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    server.make_due(account).await;
+    let worker = server.worker();
+    let mut hold = server.db.pool().begin().await.expect("tx");
+    orbyn_core::sqlx::query("SELECT id FROM accounts WHERE id = $1 FOR UPDATE")
+        .bind(account)
+        .execute(&mut *hold)
+        .await
+        .expect("lock");
+    let other = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // The other device signs out meanwhile: an ordinary audited call. Its audit row waits for
+        // the account lock like the deletion does; whichever goes first, nothing names the account
+        // afterwards.
+        server
+            .call(
+                Method::DELETE,
+                "/v1/sessions/current",
+                Some(token(&p.b_session)),
+                None,
+            )
+            .await
+    };
+    let release = async {
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        hold.commit().await.expect("release");
+    };
+    let (deleted, (status, _), ()) = tokio::join!(worker.delete_if_due(account), other, release);
+    assert!(deleted.expect("worker"));
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(!server.exists(account).await);
+    let named: i64 = orbyn_core::sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log WHERE account_id = $1 OR device_id = ANY($2)",
+    )
+    .bind(account)
+    .bind(vec![
+        uuid_of(&p.a_session["device_id"]),
+        uuid_of(&p.b_session["device_id"]),
+    ])
+    .fetch_one(server.db.pool())
+    .await
+    .expect("named");
+    assert_eq!(
+        named, 0,
+        "an audit row written during the deletion still names the account"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn finished_jobs_are_pruned_after_a_week_and_unfinished_ones_stay() {
+    let _turn = TURN.lock().await;
+    let server = server().await;
+    let pool = server.db.pool();
+    let mut ids = Vec::new();
+    for (state, days) in [("done", 8), ("failed", 8), ("done", 6), ("queued", 30)] {
+        let id = orbyn_core::jobs::enqueue(pool, "noop", json!({"for": "prune"}), None)
+            .await
+            .expect("job");
+        orbyn_core::sqlx::query(
+            "UPDATE jobs SET state = $2, updated_at = now() - make_interval(days => $3) WHERE id = $1",
+        )
+        .bind(id)
+        .bind(state)
+        .bind(days)
+        .execute(pool)
+        .await
+        .expect("age");
+        ids.push(id);
+    }
+    let removed = orbyn_core::jobs::prune_finished(pool, Duration::from_secs(7 * 86_400), 1000)
+        .await
+        .expect("prune");
+    assert!(removed >= 2);
+    let left: Vec<Uuid> = orbyn_core::sqlx::query_scalar("SELECT id FROM jobs WHERE id = ANY($1)")
+        .bind(&ids)
+        .fetch_all(pool)
+        .await
+        .expect("left");
+    let mut left_sorted = left.clone();
+    left_sorted.sort();
+    let mut expect = vec![ids[2], ids[3]];
+    expect.sort();
+    assert_eq!(left_sorted, expect);
+    orbyn_core::sqlx::query("DELETE FROM jobs WHERE id = ANY($1)")
+        .bind(&ids)
+        .execute(pool)
+        .await
+        .expect("clean");
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn the_email_link_cancels_once_without_a_sign_in_and_a_repeat_request_keeps_it_alive() {
+    let _turn = TURN.lock().await;
+    let server = server_with(roomy()).await;
+    let email = email();
+    let laptop = DeviceKeys::generate().expect("keys");
+    let session = server.register(&email, b"correct horse", &laptop).await;
+    let account = uuid_of(&session["account_id"]);
+    let schedule = || async {
+        server
+            .delete_account(&session, delete_body(&session, &laptop, None, None))
+            .await
+    };
+
+    let (status, first) = schedule().await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{first}");
+    let tokens = server.cancel_tokens(&email).await;
+    assert_eq!(tokens.len(), 1);
+    // The link carries the token in its fragment, which no server or scanner request sends.
+    let notice = server
+        .mailbox()
+        .await
+        .sent()
+        .into_iter()
+        .rev()
+        .find(|m| m.kind == Kind::DeletionScheduled)
+        .expect("notice");
+    assert!(notice.body().contains("Cancel deletion"));
+
+    // A repeat request (a thief's, say) neither voids the link nor sends another email.
+    let (status, again) = schedule().await;
+    assert_eq!(
+        (status, &again["deletes_at"]),
+        (StatusCode::ACCEPTED, &first["deletes_at"])
+    );
+    assert_eq!(server.cancel_tokens(&email).await, tokens);
+
+    // A scanner's GET acts on nothing; wrong tokens fail alike and do not burn the right one.
+    let (status, _) = server
+        .call(
+            Method::GET,
+            &format!("/v1/accounts/delete/cancel-by-mail?token={}", tokens[0]),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    let mut answers = Vec::new();
+    for wrong in ["", "not base64!", &b64(&[1; 7]), &b64(&rand32())] {
+        answers.push(server.cancel_by_mail(wrong).await);
+    }
+    for (status, body) in &answers {
+        assert_eq!(
+            (*status, &body["code"]),
+            (StatusCode::BAD_REQUEST, &json!("invalid_cancel_token"))
+        );
+        assert_eq!(body, &answers[0].1, "every wrong token answers the same");
+    }
+    assert!(server.scheduled_at(account).await.is_some());
+
+    // The right one cancels, with no session, and once.
+    let (status, body) = server.cancel_by_mail(&tokens[0]).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert_eq!(server.scheduled_at(account).await, None);
+    let (status, body) = server.cancel_by_mail(&tokens[0]).await;
+    assert_eq!(
+        (status, &body["code"]),
+        (StatusCode::BAD_REQUEST, &json!("invalid_cancel_token"))
+    );
+    // It did nothing else: the account and its session work.
+    let (status, _) = server
+        .call(Method::GET, "/v1/devices", Some(token(&session)), None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        server
+            .audit_actions(account)
+            .await
+            .contains(&"account.deletion_cancelled".to_owned())
+    );
+
+    // A new schedule makes a new token and a new email, and voids the old token.
+    let (status, _) = schedule().await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let tokens = server.cancel_tokens(&email).await;
+    assert_eq!(tokens.len(), 2);
+    assert_ne!(tokens[0], tokens[1]);
+    let (status, _) = server.cancel_by_mail(&tokens[0]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(server.scheduled_at(account).await.is_some());
+
+    // Wrong tokens are limited to 10 an hour per address, and a right token is never refused.
+    for _ in 0..8 {
+        let _ = server.cancel_by_mail(&b64(&rand32())).await; // 5 so far plus these 8 is over
+    }
+    let (status, body) = server.cancel_by_mail(&b64(&rand32())).await;
+    assert_eq!(
+        (status, &body["code"]),
+        (StatusCode::TOO_MANY_REQUESTS, &json!("too_many_attempts"))
+    );
+    let (status, body) = server.cancel_by_mail(&tokens[1]).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    // Past its time the token is as wrong as any other: the worker, not a cancel, decides then.
+    let (status, _) = schedule().await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let tokens = server.cancel_tokens(&email).await;
+    server.make_due(account).await;
+    let (status, _) = server
+        .call_from(
+            random_ip(),
+            Method::POST,
+            "/v1/accounts/delete/cancel-by-mail",
+            None,
+            Some(json!({"token": tokens.last().expect("token")})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(server.exists(account).await);
+}

@@ -88,6 +88,19 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         require_trusted(&mut *tx, session, true).await?;
+        // Rotating a zone key waits while the account's deletion is scheduled: a stolen device
+        // could otherwise re-key the data away from its owner during the grace period.
+        if envelopes.iter().any(|e| e.rotation.is_some()) {
+            let scheduled: Option<bool> = sqlx::query_scalar(
+                "SELECT deletion_scheduled_at IS NOT NULL FROM accounts WHERE id = $1",
+            )
+            .bind(session.account_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if scheduled == Some(true) {
+                return Err(StoreError::DeletionScheduled);
+            }
+        }
         let recipients: BTreeSet<Uuid> = envelopes.iter().map(|e| e.recipient_device_id).collect();
         for recipient in &recipients {
             let found: Option<i32> = sqlx::query_scalar(

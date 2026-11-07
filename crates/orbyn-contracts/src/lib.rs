@@ -265,6 +265,58 @@ pub struct TotpDisable {
     pub signed_at: Option<i64>,
 }
 
+/// `POST /v1/accounts/delete`, from a trusted device: schedules the deletion of the whole account
+/// and everything in it, seven days from now (answer 202 [`DeletionScheduled`]). The device signs
+/// the request (`orbyn/account-delete/v1`) from a session that signed in in the last ten minutes,
+/// and when the account has a second factor exactly one of a current `code` and an unused
+/// `recovery_code` is needed as well.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct DeleteAccount {
+    #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
+    pub recovery_code: Option<String>,
+    #[serde(default)]
+    pub device_signature: Option<String>,
+    /// Unix seconds, as the device signed them (within five minutes of the server's clock).
+    #[serde(default)]
+    pub signed_at: Option<i64>,
+}
+
+/// The answer to `POST /v1/accounts/delete`: when the account will be deleted unless it is
+/// cancelled first. Asking again while a deletion is scheduled answers the same time.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct DeletionScheduled {
+    /// RFC 3339.
+    pub deletes_at: String,
+}
+
+/// `POST /v1/accounts/delete/cancel`: cancels a scheduled deletion. A trusted device signs it
+/// (`orbyn/account-delete-cancel/v1`); a pending device whose session signed in (password and
+/// second factor) in the last ten minutes may too. Answer 204, also when nothing was scheduled.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct CancelAccountDeletion {
+    #[serde(default)]
+    pub device_signature: Option<String>,
+    /// Unix seconds, as the device signed them (within five minutes of the server's clock).
+    #[serde(default)]
+    pub signed_at: Option<i64>,
+}
+
+/// `POST /v1/accounts/delete/cancel-by-mail`: the token from the cancel link in the deletion email.
+/// No sign-in; it cancels the scheduled deletion and does nothing else. The planner's page opens
+/// from the link, shows a "Cancel deletion" button and posts the token only when it is pressed (a
+/// mail scanner that opens the link changes nothing). Answer 204, or 400 `invalid_cancel_token`
+/// for any wrong, used, voided or expired token.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct CancelDeletionByMail {
+    pub token: String,
+}
+
 /// A device of the account.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
@@ -378,6 +430,11 @@ pub struct CurrentDevice {
     pub totp_enabled: bool,
     /// Enrolled but not yet confirmed with a code.
     pub totp_pending: bool,
+    /// RFC 3339: when the account will be deleted, if its deletion is scheduled. Show it on every
+    /// device, with a way to cancel.
+    #[serde(default)]
+    #[ts(optional)]
+    pub deletion_scheduled_at: Option<String>,
 }
 
 /// `POST /v1/devices/approvals`, step 1, from a trusted device.

@@ -41,6 +41,10 @@ pub struct Config {
     pub mail_log_only: bool,
     /// The address email is sent from. Required with `smtp_url`.
     pub mail_from: Option<String>,
+    /// Where the planner is served (`ORBYN_APP_URL`, `https://` or a localhost address): the
+    /// deletion email's cancel link points to `<url>/cancel-deletion#<token>`. Without it the email
+    /// carries the token alone.
+    pub app_url: Option<String>,
 }
 
 impl std::fmt::Debug for Config {
@@ -57,6 +61,7 @@ impl std::fmt::Debug for Config {
             .field("database_pool_size", &self.database_pool_size)
             .field("smtp_url", &self.smtp_url.as_ref().map(|_| "(hidden)"))
             .field("mail_from", &self.mail_from)
+            .field("app_url", &self.app_url)
             .finish()
     }
 }
@@ -79,6 +84,8 @@ pub enum ConfigError {
     MissingMailFrom,
     #[error("ORBYN_MAIL can only be `log`")]
     InvalidMailMode,
+    #[error("ORBYN_APP_URL must be an https:// address (http:// only for localhost)")]
+    InvalidAppUrl,
 }
 
 impl Config {
@@ -158,6 +165,15 @@ impl Config {
             Some("log") => true,
             Some(_) => return Err(ConfigError::InvalidMailMode),
         };
+        let app_url = optional("ORBYN_APP_URL");
+        if let Some(url) = &app_url {
+            let local = ["http://localhost", "http://127.0.0.1", "http://[::1]"]
+                .iter()
+                .any(|p| url.starts_with(p));
+            if !(url.starts_with("https://") || local) || url.contains(char::is_whitespace) {
+                return Err(ConfigError::InvalidAppUrl);
+            }
+        }
         Ok(Self {
             database_url,
             bind,
@@ -171,6 +187,7 @@ impl Config {
             smtp_url,
             mail_log_only,
             mail_from,
+            app_url,
         })
     }
 }
@@ -266,6 +283,30 @@ mod tests {
         ])?;
         assert!(set.smtp_url.is_some());
         assert!(!format!("{set:?}").contains("hunter2"));
+        Ok(())
+    }
+
+    #[test]
+    fn the_app_url_is_https_or_localhost() -> Result<(), ConfigError> {
+        let with = |value: &str| {
+            Config::from_lookup(lookup(&[
+                ("DATABASE_URL", "postgres://x"),
+                ("ORBYN_APP_URL", value),
+            ]))
+        };
+        assert_eq!(
+            with("https://app.example.com")?.app_url.as_deref(),
+            Some("https://app.example.com")
+        );
+        assert!(with("http://localhost:5173").is_ok());
+        for bad in [
+            "http://app.example.com",
+            "app.example.com",
+            "javascript:x",
+            "https://a b",
+        ] {
+            assert_eq!(with(bad).err(), Some(ConfigError::InvalidAppUrl), "{bad}");
+        }
         Ok(())
     }
 

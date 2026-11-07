@@ -802,3 +802,55 @@ async fn a_socket_closed_for_silence_gives_its_place_back() {
     }
     drop(silent);
 }
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_key_rotation_waits_while_the_accounts_deletion_is_scheduled() {
+    let server = server().await;
+    let (email, token) = server.sign_up().await;
+    let (_, phone) = server.sign_in_new_device(&email).await;
+    server.trust(phone).await;
+    let envelope = |rotation: bool| {
+        let mut e = json!({
+            "recipient_device_id": phone,
+            "zone": "list:inbox",
+            "key_id": b64(&Uuid::new_v4().into_bytes()),
+            "envelope": b64(&[7; 60]),
+        });
+        if rotation {
+            e["rotation"] = json!({
+                "previous_key_id": b64(&Uuid::new_v4().into_bytes()),
+                "signer_device_id": Uuid::new_v4(),
+                "signature": b64(&[9; 64]),
+            });
+        }
+        json!({"envelopes": [e]})
+    };
+    let put = |rotation: bool| {
+        server.call(
+            Method::POST,
+            "/v1/keychain/envelopes",
+            Some(&token),
+            Some(envelope(rotation)),
+        )
+    };
+    let schedule = |on: bool| {
+        orbyn_core::sqlx::query(
+            "UPDATE accounts SET deletion_scheduled_at = CASE WHEN $2 THEN now() + interval '7 days' END
+             WHERE email = $1",
+        )
+        .bind(email.to_lowercase())
+        .bind(on)
+        .execute(server.db.pool())
+    };
+    schedule(true).await.expect("schedule");
+    // A plain envelope (sharing a key with a device the owner trusts) still goes through.
+    assert_eq!(put(false).await.0, StatusCode::NO_CONTENT);
+    let (status, body) = put(true).await;
+    assert_eq!(
+        (status, &body["code"]),
+        (StatusCode::CONFLICT, &json!("deletion_scheduled"))
+    );
+    schedule(false).await.expect("cancel");
+    assert_eq!(put(true).await.0, StatusCode::NO_CONTENT);
+}

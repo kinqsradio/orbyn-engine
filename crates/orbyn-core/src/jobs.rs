@@ -222,6 +222,26 @@ pub async fn abandon(
     Ok(changed.rows_affected() == 1)
 }
 
+/// Removes finished jobs (done or failed) not touched for `older_than`, at most `batch` of them,
+/// and says how many went. Payloads name accounts, devices and zones, so they are not kept long.
+pub async fn prune_finished(
+    pool: &PgPool,
+    older_than: Duration,
+    batch: i64,
+) -> Result<u64, sqlx::Error> {
+    let removed = sqlx::query(
+        "DELETE FROM jobs WHERE id IN (
+             SELECT id FROM jobs
+             WHERE state IN ('done', 'failed') AND updated_at < now() - make_interval(secs => $1)
+             ORDER BY updated_at LIMIT $2)",
+    )
+    .bind(older_than.as_secs_f64())
+    .bind(batch)
+    .execute(pool)
+    .await?;
+    Ok(removed.rows_affected())
+}
+
 /// The wait before retry `attempt` (1-based): 2, 4, 8 … seconds, at most 10 minutes.
 pub fn backoff(attempt: i32) -> Duration {
     let exp = attempt.clamp(1, 20) as u32;

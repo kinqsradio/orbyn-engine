@@ -85,7 +85,7 @@ impl Accounts {
         self.secrets.digest("email-code", &data)
     }
 
-    fn address_digest(&self, label: &str, email: &str) -> [u8; 32] {
+    pub(super) fn address_digest(&self, label: &str, email: &str) -> [u8; 32] {
         self.secrets.digest(label, email.as_bytes())
     }
 

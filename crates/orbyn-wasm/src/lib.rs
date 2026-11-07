@@ -274,6 +274,41 @@ impl DeviceKeys {
         Ok(self.sign(auth::TOTP_MANAGE_CONTEXT, &message))
     }
 
+    /// The `signature` that lets this device schedule the deletion of the whole account, under
+    /// `orbyn/account-delete/v1`, over the account id, the device id and `signedAt` (Unix seconds,
+    /// within five minutes of the server's clock). Each signature is accepted once.
+    #[wasm_bindgen(js_name = signAccountDelete)]
+    pub fn sign_account_delete(
+        &self,
+        account_id: &str,
+        device_id: &str,
+        signed_at: f64,
+    ) -> Result<Vec<u8>> {
+        let message = auth::account_delete_message(
+            &uuid_bytes(account_id)?,
+            &uuid_bytes(device_id)?,
+            signed_at as i64,
+        );
+        Ok(self.sign(auth::ACCOUNT_DELETE_CONTEXT, &message))
+    }
+
+    /// The `signature` that lets this device cancel a scheduled account deletion, under
+    /// `orbyn/account-delete-cancel/v1`, over the account id, the device id and `signedAt`.
+    #[wasm_bindgen(js_name = signAccountDeleteCancel)]
+    pub fn sign_account_delete_cancel(
+        &self,
+        account_id: &str,
+        device_id: &str,
+        signed_at: f64,
+    ) -> Result<Vec<u8>> {
+        let message = auth::account_delete_message(
+            &uuid_bytes(account_id)?,
+            &uuid_bytes(device_id)?,
+            signed_at as i64,
+        );
+        Ok(self.sign(auth::ACCOUNT_DELETE_CANCEL_CONTEXT, &message))
+    }
+
     fn copy(&self) -> Result<orbyn_crypto::DeviceKeys> {
         Ok(orbyn_crypto::DeviceKeys::from_bytes(
             self.keys.to_bytes().as_slice(),

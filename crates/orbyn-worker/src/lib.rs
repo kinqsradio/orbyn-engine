@@ -21,6 +21,13 @@ const PURGE_EVERY: Duration = Duration::from_secs(10 * 60);
 /// Rows removed per purge step, and steps per run, so a run is bounded and a
 /// backlog drains over several runs instead of holding the database.
 const PURGE_BATCH: i64 = 1000;
+/// How often accounts whose deletion is due are deleted, and how many in one run.
+const DELETE_EVERY: Duration = Duration::from_secs(60);
+const DELETE_BATCH: i64 = 20;
+/// Finished jobs are kept this long (their payloads name accounts and devices), and removed in
+/// batches on the prune schedule.
+const FINISHED_JOBS_KEPT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const FINISHED_JOBS_BATCH: i64 = 1000;
 const PURGE_STEPS: usize = 50;
 
 /// What a handler decided about a job.
@@ -107,6 +114,45 @@ where
     }
 }
 
+/// Deletes the accounts whose scheduled deletion is due, each re-checked under its own lock. Needs
+/// the auth setup, which the digests that key the account's rate-limit rows come from: without it
+/// nothing is deleted, and that is logged.
+///
+/// Returns false when deletions are due and this worker cannot do them (no auth setup): it is not
+/// healthy, and says so by stopping, which the process reports as a failure.
+async fn delete_due_accounts(db: &Database, mailer: &Mailer) -> bool {
+    let Some(secrets) = mailer.secrets.clone() else {
+        let due: Result<bool, _> = orbyn_core::sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM accounts WHERE deletion_scheduled_at <= now())",
+        )
+        .fetch_one(db.pool())
+        .await;
+        if due.unwrap_or(false) {
+            tracing::error!(
+                "account deletions are due, but this worker has no ORBYN_AUTH_SETUP to delete them"
+            );
+            return false;
+        }
+        return true;
+    };
+    let accounts = orbyn_core::Accounts::with_shared_secrets(db.pool().clone(), secrets);
+    match accounts.due_for_deletion(DELETE_BATCH).await {
+        Ok(due) => {
+            for id in due {
+                match accounts.delete_if_due(id).await {
+                    Ok(true) => tracing::info!(account = %id, "deleted an account"),
+                    Ok(false) => {}
+                    Err(err) => {
+                        tracing::error!(account = %id, error = %err, "could not delete an account")
+                    }
+                }
+            }
+        }
+        Err(err) => tracing::warn!(error = %err, "could not look for accounts due for deletion"),
+    }
+    true
+}
+
 /// Claims and runs jobs until `stop` turns true.
 ///
 /// `retention` is how long tombstones and deleted zones are kept before the
@@ -121,6 +167,7 @@ pub async fn run(
     tracing::info!(worker = %worker_id, "worker started");
     let mut next_prune = tokio::time::Instant::now();
     let mut next_purge = tokio::time::Instant::now();
+    let mut next_delete = tokio::time::Instant::now();
     while !*stop.borrow() {
         // Housekeeping on a schedule, not on requests, so a flood of refused
         // requests can never stop it. Every replica may run it; deletes are batched.
@@ -130,7 +177,18 @@ pub async fn run(
                 Ok(_) => {}
                 Err(err) => tracing::warn!(error = %err, "could not prune sign-in data"),
             }
+            match jobs::prune_finished(db.pool(), FINISHED_JOBS_KEPT, FINISHED_JOBS_BATCH).await {
+                Ok(n) if n > 0 => tracing::info!(removed = n, "pruned finished jobs"),
+                Ok(_) => {}
+                Err(err) => tracing::warn!(error = %err, "could not prune finished jobs"),
+            }
             next_prune = tokio::time::Instant::now() + PRUNE_EVERY;
+        }
+        if tokio::time::Instant::now() >= next_delete {
+            next_delete = tokio::time::Instant::now() + DELETE_EVERY;
+            if !delete_due_accounts(&db, &mailer).await {
+                return;
+            }
         }
         if tokio::time::Instant::now() >= next_purge {
             match orbyn_store::purge(db.pool(), retention, PURGE_BATCH, PURGE_STEPS).await {
@@ -304,5 +362,44 @@ mod tests {
         };
         let out = supervise(work, Duration::from_secs(3), || async { Ok(false) }).await;
         assert_eq!(out, None);
+    }
+
+    /// With deletions due and no auth setup the worker cannot do its job, so it stops, which the
+    /// process reports as a failure, instead of idling as if it were well.
+    #[tokio::test]
+    #[ignore = "needs DATABASE_URL"]
+    async fn a_worker_that_cannot_delete_due_accounts_stops() {
+        let url =
+            std::env::var("DATABASE_URL").expect("set DATABASE_URL to run the Postgres tests");
+        let db = Database::connect(&url).await.expect("connect");
+        db.migrate().await.expect("migrate");
+        let id = uuid::Uuid::new_v4();
+        orbyn_core::sqlx::query(
+            "INSERT INTO accounts (id, email, password_file, deletion_scheduled_at)
+             VALUES ($1, $2, decode('01', 'hex'), now() - interval '1 minute')",
+        )
+        .bind(id)
+        .bind(format!("worker-{id}@example.com"))
+        .execute(db.pool())
+        .await
+        .expect("account");
+        let (_stop, rx) = watch::channel(false);
+        let ended = tokio::time::timeout(
+            Duration::from_secs(20),
+            run(
+                db.clone(),
+                "worker-test".into(),
+                Duration::from_secs(86_400),
+                Mailer::log_only(),
+                rx,
+            ),
+        )
+        .await;
+        orbyn_core::sqlx::query("DELETE FROM accounts WHERE id = $1")
+            .bind(id)
+            .execute(db.pool())
+            .await
+            .expect("clean");
+        assert!(ended.is_ok(), "the worker kept running with deletions due");
     }
 }

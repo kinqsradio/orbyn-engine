@@ -14,4 +14,9 @@ totp_enabled: boolean,
 /**
  * Enrolled but not yet confirmed with a code.
  */
-totp_pending: boolean, };
+totp_pending: boolean, 
+/**
+ * RFC 3339: when the account will be deleted, if its deletion is scheduled. Show it on every
+ * device, with a way to cancel.
+ */
+deletion_scheduled_at?: string, };
