@@ -1882,6 +1882,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "orbyn-keyservice-server"
+version = "0.1.0"
+dependencies = [
+ "orbyn-translog",
+ "sqlx",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "orbyn-planner"
 version = "0.1.0"
 dependencies = [

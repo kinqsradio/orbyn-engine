@@ -8,15 +8,20 @@
 //! so the two check each other.
 //!
 //! It runs on the key service and on devices (native and WebAssembly): a device verifies with the
-//! very code the key service builds with. What an entry or a head holds is not here yet.
+//! very code the key service builds with. [`entry`] and [`head`] are what an entry and an unsigned
+//! head are, as canonical bytes.
 //!
 //! [`map`] is the path-compressed sparse Merkle map that holds the key service's two maps (the
 //! service-key map and the identity map): membership and non-membership proofs, their verifier,
 //! and the update function a witness replays (an old path plus a new value gives the new root).
 
+pub mod entry;
+pub mod head;
 pub mod map;
 pub mod merkle;
 
+pub use entry::{Entry, EntryError, MapId, map_value};
+pub use head::UnsignedHead;
 pub use map::{End, Lookup, Map, MapError, Proof, Step};
 pub use merkle::{
     Accumulator, Hash, Subtrees, consistency_proof, empty_root, inclusion_proof, leaf_hash,
