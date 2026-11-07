@@ -256,6 +256,20 @@ fn an_identity_signs_only_service_key_statements() {
     suite::an_identity_signs_only_service_key_statements(hsm);
 }
 
+#[test]
+#[ignore = "needs SoftHSM"]
+fn a_log_key_signs_heads_and_nothing_else() {
+    let Some(hsm) = new_hsm() else { return };
+    suite::a_log_key_signs_heads_and_nothing_else(&KeyService::new(hsm));
+}
+
+#[test]
+#[ignore = "needs SoftHSM"]
+fn the_hsm_is_asked_to_sign_only_what_the_kind_allows() {
+    let Some(hsm) = new_hsm() else { return };
+    suite::the_hsm_is_asked_to_sign_only_what_the_kind_allows(hsm);
+}
+
 /// The names of the usage flags among `attrs` that are true, and a check that every flag in
 /// `all` was reported at all (a token that leaves one to its default would be caught).
 fn flags_on(attrs: &[Attribute], all: &[&str], label: &str) -> Vec<&'static str> {
@@ -335,6 +349,12 @@ fn every_key_allows_only_what_it_is_for() {
         flags_on(&public_key, &public, "identity public"),
         ["verify"]
     );
+    // The log key signs and verifies, and nothing else, like the identity.
+    svc.init_log_key(1).expect("log key");
+    let log_private = attrs_of(ObjectClass::PRIVATE_KEY, b"orbyn-log-v1", &USAGE_TYPES);
+    assert_eq!(flags_on(&log_private, &private, "log private"), ["sign"]);
+    let log_public = attrs_of(ObjectClass::PUBLIC_KEY, b"orbyn-log-v1", &USAGE_TYPES);
+    assert_eq!(flags_on(&log_public, &public, "log public"), ["verify"]);
     // An account key, once unwrapped, only derives.
     let key = svc.new_account_key(1, &[3; 16]).expect("account key");
     let unwrapped = svc.hsm().unwrap_account_key(&key.wrapped).expect("unwrap");

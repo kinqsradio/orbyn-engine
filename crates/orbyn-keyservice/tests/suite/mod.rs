@@ -347,3 +347,70 @@ pub fn an_identity_signs_only_service_key_statements<H: Hsm>(inner: H) {
         ]
     );
 }
+
+fn head(version: u32) -> orbyn_translog::UnsignedHead {
+    orbyn_translog::UnsignedHead {
+        size: 7,
+        log_root: [1; 32],
+        service_map_root: [2; 32],
+        identity_map_root: [3; 32],
+        time_ms: 1_700_000_000_000,
+        prev_head_hash: [4; 32],
+        log_key_version: version,
+    }
+}
+
+/// The log key signs heads, and only the log key does: the identities and the log key are separate
+/// sets, a head is never signed by an identity, and a statement never by the log key.
+pub fn a_log_key_signs_heads_and_nothing_else<H: Hsm>(svc: &KeyService<H>) {
+    let identity = svc.init().expect("init");
+    // Identity 1 exists, but a head names a log key, and there is none yet: not found, however the
+    // version numbers happen to line up.
+    assert_eq!(
+        svc.sign_head(&head(1)),
+        Err(KeyServiceError::Hsm(HsmError::NotFound))
+    );
+    assert!(!svc.hsm().log_key_exists(1).expect("exists"));
+    let public = svc.init_log_key(1).expect("log key");
+    assert!(svc.hsm().log_key_exists(1).expect("exists"));
+    assert_eq!(svc.log_key_public(1).expect("public"), public);
+    assert_ne!(public, identity, "a different key from the identity");
+    // Making it again changes nothing and says why.
+    assert_eq!(
+        svc.init_log_key(1),
+        Err(KeyServiceError::Hsm(HsmError::AlreadyExists))
+    );
+    assert_eq!(svc.log_key_public(1).expect("public"), public);
+
+    // The signature is the log key's over the head's canonical bytes, and nobody else's.
+    let signed = head(1);
+    let signature = svc.sign_head(&signed).expect("sign");
+    assert!(signed.verify(&public, &signature));
+    assert!(!signed.verify(&identity, &signature), "not the identity's");
+    let mut other = signed.clone();
+    other.size += 1;
+    assert!(!other.verify(&public, &signature), "a different head");
+    // A head naming a log key version that does not exist is refused.
+    assert_eq!(
+        svc.sign_head(&head(2)),
+        Err(KeyServiceError::Hsm(HsmError::NotFound))
+    );
+    // A service-key statement is still signed by the identity and does not verify under the log key.
+    let key = svc.new_account_key(1, &ACCOUNT).expect("account key");
+    verify_service_key_statement(&identity, &key.statement, &key.signature)
+        .expect("the identity's");
+    assert!(verify_service_key_statement(&public, &key.statement, &key.signature).is_err());
+}
+
+/// What each kind of message is signed with, recorded: a head only ever by the log key set.
+pub fn the_hsm_is_asked_to_sign_only_what_the_kind_allows<H: Hsm>(inner: H) {
+    let svc = KeyService::new(Spy::new(inner, false));
+    svc.init().expect("init");
+    svc.init_log_key(1).expect("log key");
+    svc.new_account_key(1, &ACCOUNT).expect("account key");
+    svc.sign_head(&head(1)).expect("head");
+    assert_eq!(
+        *svc.hsm().signed.lock().expect("signed"),
+        [MessageKind::ServiceKeyStatement, MessageKind::LogHead]
+    );
+}

@@ -5,11 +5,16 @@
 //!   leaves it, account P-256 keys that come out only wrapped under the KEK, and an ECDH derive
 //!   with such a key after it was unwrapped into a session object. There is no operation that
 //!   exports a private key, and none that takes a key to sign.
-//! - **No signing oracle.** An identity signs only an [`IdentityMessage`], a closed set of messages
-//!   this crate builds itself ([`MessageKind`]); the type cannot be constructed outside the crate, so
-//!   no caller can have an identity sign bytes it chose. Today the only message is the
-//!   service-key statement; the transparency-log head and the recovery approval join the enum when
-//!   they exist.
+//! - **No signing oracle.** The HSM signs only an [`HsmMessage`], a closed set of messages this
+//!   crate builds itself ([`MessageKind`]); the type cannot be constructed outside the crate, so no
+//!   caller can have a key sign bytes it chose. **The key follows the kind**: a service-key
+//!   statement is signed by an identity, a log head by the log key, and the two key sets are
+//!   separate (an identity cannot sign a head, nor the log key a statement). The recovery approval
+//!   joins the enum when it exists.
+//! - **The log key** is a second Ed25519 key in the HSM ([`Hsm::generate_log_key`]), used only by
+//!   [`KeyService::sign_head`] for the heads of the transparency log. It signs any head the key
+//!   service builds, including a dishonest one, so it is not the control: a witness that checks
+//!   each head is.
 //! - [`KeyService`] is the API on top: [`KeyService::init`], [`KeyService::new_account_key`]
 //!   (which generates an account's service key **and** certifies it in the same call) and
 //!   [`KeyService::open_envelope`] (validate, derive in the HSM, HKDF in memory, open). It has no
@@ -32,6 +37,7 @@ use orbyn_crypto::{
     open_with_shared_secret, service_key_signed_bytes, service_key_statement,
     service_key_statement_hash, verify_wrap_sender,
 };
+use orbyn_translog::UnsignedHead;
 use zeroize::Zeroizing;
 
 /// What went wrong. Never carries key material.
@@ -60,31 +66,33 @@ pub enum KeyServiceError {
     Crypto(#[from] CryptoError),
 }
 
-/// What kind of message an [`IdentityMessage`] is. Closed: a new kind is a change to this crate.
+/// What kind of message an [`HsmMessage`] is. Closed: a new kind is a change to this crate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum MessageKind {
-    /// An account service key's certification (`orbyn/service-key/v1`).
+    /// An account service key's certification (`orbyn/service-key/v1`), signed by an identity.
     ServiceKeyStatement,
+    /// A transparency-log head (`orbyn/log-head/v1`), signed by the log key.
+    LogHead,
 }
 
-/// A message an identity may sign. Only this crate can make one, and only of a [`MessageKind`] it
+/// A message the HSM may sign. Only this crate can make one, and only of a [`MessageKind`] it
 /// builds itself, so an [`Hsm`] is never asked to sign bytes a caller chose.
 ///
-/// A caller outside the crate has no way to call [`Hsm::sign_with_identity`]:
+/// A caller outside the crate has no way to call [`Hsm::sign`]:
 ///
 /// ```compile_fail
 /// use orbyn_keyservice::Hsm;
 /// fn oracle(hsm: &impl Hsm) {
-///     let _ = hsm.sign_with_identity(1, b"any bytes at all");
+///     let _ = hsm.sign(1, b"any bytes at all");
 /// }
 /// ```
 ///
 /// nor build the message that method takes:
 ///
 /// ```compile_fail
-/// use orbyn_keyservice::{IdentityMessage, MessageKind};
-/// let _ = IdentityMessage { kind: MessageKind::ServiceKeyStatement, bytes: vec![1, 2, 3] };
+/// use orbyn_keyservice::{HsmMessage, MessageKind};
+/// let _ = HsmMessage { kind: MessageKind::ServiceKeyStatement, bytes: vec![1, 2, 3] };
 /// ```
 ///
 /// and the control, which does compile: the same trait, used for what is allowed.
@@ -94,17 +102,26 @@ pub enum MessageKind {
 /// fn kinds(_: &impl Hsm) -> MessageKind { MessageKind::ServiceKeyStatement }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IdentityMessage {
+pub struct HsmMessage {
     kind: MessageKind,
     bytes: Vec<u8>,
 }
 
-impl IdentityMessage {
+impl HsmMessage {
     /// The certification of a service key: the statement under its context.
     pub(crate) fn service_key_statement(statement: &[u8]) -> Self {
         Self {
             kind: MessageKind::ServiceKeyStatement,
             bytes: service_key_signed_bytes(statement),
+        }
+    }
+
+    /// A head: its canonical bytes, which start with the head context, so no head's bytes can be
+    /// a service-key statement's, nor the reverse.
+    pub(crate) fn log_head(head: &UnsignedHead) -> Self {
+        Self {
+            kind: MessageKind::LogHead,
+            bytes: head.encode(),
         }
     }
 
@@ -149,7 +166,7 @@ mod sealed {
 ///
 /// ```compile_fail,E0277
 /// use orbyn_crypto::P256Point;
-/// use orbyn_keyservice::{Hsm, HsmError, IdentityMessage, SessionKey, WrappedAccountKey};
+/// use orbyn_keyservice::{Hsm, HsmError, HsmMessage, SessionKey, WrappedAccountKey};
 /// use zeroize::Zeroizing;
 ///
 /// struct Outside;
@@ -159,7 +176,10 @@ mod sealed {
 ///     fn identity_exists(&self, _: u32) -> Result<bool, HsmError> { unimplemented!() }
 ///     fn generate_identity(&self, _: u32) -> Result<[u8; 32], HsmError> { unimplemented!() }
 ///     fn identity_public(&self, _: u32) -> Result<[u8; 32], HsmError> { unimplemented!() }
-///     fn sign_with_identity(&self, _: u32, _: &IdentityMessage) -> Result<[u8; 64], HsmError> {
+///     fn generate_log_key(&self, _: u32) -> Result<[u8; 32], HsmError> { unimplemented!() }
+///     fn log_key_exists(&self, _: u32) -> Result<bool, HsmError> { unimplemented!() }
+///     fn log_key_public(&self, _: u32) -> Result<[u8; 32], HsmError> { unimplemented!() }
+///     fn sign(&self, _: u32, _: &HsmMessage) -> Result<[u8; 64], HsmError> {
 ///         unimplemented!()
 ///     }
 ///     fn generate_account_key(&self) -> Result<WrappedAccountKey, HsmError> { unimplemented!() }
@@ -183,13 +203,18 @@ pub trait Hsm: sealed::Sealed {
     fn generate_identity(&self, version: u32) -> Result<[u8; 32], HsmError>;
     /// The public key of identity `version`.
     fn identity_public(&self, version: u32) -> Result<[u8; 32], HsmError>;
-    /// Signs `message` with identity `version` (pure Ed25519, over [`IdentityMessage::signed_bytes`]).
-    /// The message type cannot be made outside this crate, so nothing else can ask for a signature.
-    fn sign_with_identity(
-        &self,
-        version: u32,
-        message: &IdentityMessage,
-    ) -> Result<[u8; 64], HsmError>;
+    /// Makes Ed25519 log key `version`: non-extractable, for signing only. Returns its public key.
+    /// [`HsmError::AlreadyExists`] if there is one. The log key is separate from the identities.
+    fn generate_log_key(&self, version: u32) -> Result<[u8; 32], HsmError>;
+    /// Whether log key `version` exists.
+    fn log_key_exists(&self, version: u32) -> Result<bool, HsmError>;
+    /// The public key of log key `version`.
+    fn log_key_public(&self, version: u32) -> Result<[u8; 32], HsmError>;
+    /// Signs `message` (pure Ed25519, over [`HsmMessage::signed_bytes`]) with key `version` **of the
+    /// set the message's kind belongs to**: identity `version` for a service-key statement, log key
+    /// `version` for a head. The message type cannot be made outside this crate, so nothing else
+    /// can ask for a signature.
+    fn sign(&self, version: u32, message: &HsmMessage) -> Result<[u8; 64], HsmError>;
 
     /// Makes a P-256 key pair. The private half is returned only wrapped under the KEK and is
     /// gone from the HSM when this returns.
@@ -276,6 +301,26 @@ impl<H: Hsm> KeyService<H> {
         Ok(self.hsm.generate_identity(FIRST_IDENTITY_VERSION)?)
     }
 
+    /// Makes log key `version` and returns its public key, for clients and witnesses to pin.
+    /// Refuses, changing nothing, if it exists.
+    pub fn init_log_key(&self, version: u32) -> Result<[u8; 32], KeyServiceError> {
+        Ok(self.hsm.generate_log_key(version)?)
+    }
+
+    /// The public key of log key `version`.
+    pub fn log_key_public(&self, version: u32) -> Result<[u8; 32], KeyServiceError> {
+        Ok(self.hsm.log_key_public(version)?)
+    }
+
+    /// Signs a head with the log key its `log_key_version` names. This is the only way anything
+    /// is signed with a log key. It signs what it is given: whether the head is honest is for a
+    /// witness to check.
+    pub fn sign_head(&self, head: &UnsignedHead) -> Result<[u8; 64], KeyServiceError> {
+        Ok(self
+            .hsm
+            .sign(head.log_key_version, &HsmMessage::log_head(head))?)
+    }
+
     /// The public key of identity `version`.
     pub fn identity_public(&self, version: u32) -> Result<[u8; 32], KeyServiceError> {
         Ok(self.hsm.identity_public(version)?)
@@ -294,9 +339,9 @@ impl<H: Hsm> KeyService<H> {
         }
         let WrappedAccountKey { wrapped, public } = self.hsm.generate_account_key()?;
         let statement = service_key_statement(identity_version, account_id, &public);
-        let signature = self.hsm.sign_with_identity(
+        let signature = self.hsm.sign(
             identity_version,
-            &IdentityMessage::service_key_statement(&statement),
+            &HsmMessage::service_key_statement(&statement),
         )?;
         Ok(CertifiedServiceKey {
             wrapped,

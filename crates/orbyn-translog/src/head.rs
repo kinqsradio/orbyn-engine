@@ -44,6 +44,19 @@ impl UnsignedHead {
     pub fn hash(&self) -> Hash {
         Sha256::digest(self.encode()).into()
     }
+
+    /// Whether `signature` is the log key `public`'s Ed25519 signature over the canonical bytes.
+    /// Strict: a malleable or small-order signature is refused.
+    pub fn verify(&self, public: &[u8; 32], signature: &[u8; 64]) -> bool {
+        let Ok(key) = ed25519_dalek::VerifyingKey::from_bytes(public) else {
+            return false;
+        };
+        key.verify_strict(
+            &self.encode(),
+            &ed25519_dalek::Signature::from_bytes(signature),
+        )
+        .is_ok()
+    }
 }
 
 #[cfg(test)]

@@ -25,6 +25,7 @@ required-features = ["test-support"]
 cryptoki = { workspace = true, optional = true }
 ed25519-dalek = { workspace = true, optional = true }
 orbyn-crypto.workspace = true
+orbyn-translog.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
 
