@@ -1,2 +1,5 @@
 # Generated wire types: every checkout gets the same bytes on every platform.
 crates/orbyn-contracts/bindings/** text eol=lf
+
+# Shell scripts run on Linux (in containers) and under Git Bash: never CRLF.
+*.sh text eol=lf

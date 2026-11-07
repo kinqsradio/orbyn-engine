@@ -1,0 +1,247 @@
+# Staging for the invite-only beta, on one Docker host behind a Cloudflare tunnel.
+#
+#   api-staging.orbyn.dev      -> cloudflared -> server:8080   (the engine's API)
+#   account-staging.orbyn.dev  -> cloudflared -> planner:8080  (the planner's web app)
+#
+# Deploy with ./scripts/deploy-staging.sh; the steps are in docs/staging.md. Settings come from
+# .env.staging, never from this file: every value here is public. Ports are published on
+# 127.0.0.1 only, and not on the ports orbyn.dev uses on the same host.
+#
+# Profiles (off by default):
+#   tunnel  the Cloudflare tunnel; needs CLOUDFLARE_TUNNEL_TOKEN
+#   smoke   the key service, two witnesses and SoftHSM. A smoke test, not part of the beta.
+name: orbyn-engine-staging
+
+x-hardened: &hardened
+  restart: unless-stopped
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+
+services:
+  postgres:
+    image: postgres:17-bookworm@sha256:665dc7b37ac52a17e298511414c21d23ffa4e6a6ef6225b3e5d59c7afb35e994
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: orbyn
+      POSTGRES_DB: orbyn
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+    # No ports: only this stack's containers reach it.
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orbyn -d orbyn"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  migrate:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: orbyn-engine:staging
+    command: ["migrate"]
+    healthcheck:
+      disable: true
+    environment:
+      DATABASE_URL: postgres://orbyn:${POSTGRES_PASSWORD:-}@postgres:5432/orbyn
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  server:
+    <<: *hardened
+    image: orbyn-engine:staging
+    command: ["serve"]
+    read_only: true
+    environment:
+      DATABASE_URL: postgres://orbyn:${POSTGRES_PASSWORD:-}@postgres:5432/orbyn
+      ORBYN_ALLOWED_ORIGINS: https://account-staging.orbyn.dev
+      # From `docker compose ... run --rm --no-deps server auth-setup`; sign-in answers 503 without it.
+      ORBYN_AUTH_SETUP: ${ORBYN_AUTH_SETUP:-}
+      # Every request comes through the tunnel, and Cloudflare puts the visitor's address here.
+      ORBYN_CLIENT_IP_HEADER: cf-connecting-ip
+      # Where the deletion email's cancel link points: the planner serves /cancel-deletion.
+      ORBYN_ACCOUNT_URL: https://account-staging.orbyn.dev
+      # Staging only: no mail is sent; each address and code is written to the log
+      # (docs/staging.md). Refused unless ORBYN_ENV=staging and ORBYN_SIGNUP=invite.
+      ORBYN_MAIL: log-codes
+      ORBYN_ENV: staging
+      # Sign-up needs an invite code from `orbyn invite create`.
+      ORBYN_SIGNUP: invite
+      ORBYN_LOG: info
+    ports:
+      - "127.0.0.1:${SERVER_PORT:-18080}:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    <<: *hardened
+    image: orbyn-engine:staging
+    command: ["worker"]
+    read_only: true
+    # The worker serves no HTTP, so the image's /health check does not apply.
+    healthcheck:
+      disable: true
+    environment:
+      DATABASE_URL: postgres://orbyn:${POSTGRES_PASSWORD:-}@postgres:5432/orbyn
+      ORBYN_AUTH_SETUP: ${ORBYN_AUTH_SETUP:-}
+      ORBYN_ACCOUNT_URL: https://account-staging.orbyn.dev
+      ORBYN_MAIL: log-codes
+      ORBYN_ENV: staging
+      ORBYN_SIGNUP: invite
+      ORBYN_LOG: info
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  # The planner's web app, built from a checkout of orbyn-planner next to this one
+  # (PLANNER_DIR, default ../orbyn-planner) with the engine's address fixed at build time.
+  planner:
+    <<: *hardened
+    build:
+      context: ${PLANNER_DIR:-../orbyn-planner}/web
+      args:
+        VITE_ENGINE_URL: https://api-staging.orbyn.dev
+        GIT_SHA: ${PLANNER_GIT_SHA:-dev}
+    image: orbyn-planner-web:staging
+    read_only: true
+    tmpfs: [/tmp]
+    ports:
+      - "127.0.0.1:${PLANNER_PORT:-18081}:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # Public access without opening a port. Needs CLOUDFLARE_TUNNEL_TOKEN in .env.staging: the
+  # staging tunnel's own token, not the one orbyn.dev uses.
+  cloudflared:
+    image: ${CLOUDFLARED_IMAGE:-cloudflare/cloudflared:latest}
+    profiles: [tunnel]
+    restart: unless-stopped
+    # The token goes in the environment, not the command line, so it stays out of `docker ps`.
+    command: ["tunnel", "--no-autoupdate", "run"]
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+      TUNNEL_METRICS: 127.0.0.1:2000
+    depends_on:
+      server:
+        condition: service_healthy
+      planner:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------------------
+  # Smoke profile: the key service with SoftHSM, its own Postgres and two witnesses. For trying
+  # the key service, not for the beta: SoftHSM is software, and its PIN and the mutual-TLS keys
+  # live in volumes on this host. A real deployment mounts an HSM's module and keeps the keys
+  # off the host. Nothing here is published on the host or on the tunnel.
+  # ---------------------------------------------------------------------------------------
+  ks-postgres:
+    image: postgres:17-bookworm@sha256:665dc7b37ac52a17e298511414c21d23ffa4e6a6ef6225b3e5d59c7afb35e994
+    profiles: [smoke]
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: orbyn_ks_owner
+      POSTGRES_DB: orbyn_keyservice
+      POSTGRES_PASSWORD: ${KS_OWNER_PASSWORD:-}
+      KS_RUNTIME_PASSWORD: ${KS_RUNTIME_PASSWORD:-}
+    volumes:
+      - ks-postgres:/var/lib/postgresql/data
+      # Makes the runtime role the key service runs as (first start only).
+      - ./docker/ks-postgres-init.sh:/docker-entrypoint-initdb.d/10-runtime-role.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orbyn_ks_owner -d orbyn_keyservice"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # One-shot: the certificates, the SoftHSM token and its keys, the witnesses' keys. Safe to run
+  # again; it changes nothing that exists.
+  ks-setup:
+    build:
+      context: .
+      dockerfile: docker/keyservice.Dockerfile
+    image: orbyn-keyservice:smoke
+    profiles: [smoke]
+    entrypoint: ["/usr/local/bin/smoke-entry.sh"]
+    command: ["setup"]
+    environment:
+      ORBYN_HSM_PIN: ${KS_HSM_PIN:-}
+      KS_HSM_SO_PIN: ${KS_HSM_SO_PIN:-}
+    volumes:
+      - ks-pki:/pki
+      - ks-hsm:/hsm
+      - ks-witness-keys:/witness-keys
+
+  ks-migrate:
+    image: orbyn-keyservice:smoke
+    profiles: [smoke]
+    entrypoint: ["/usr/local/bin/smoke-entry.sh"]
+    command: ["migrate"]
+    environment:
+      ORBYN_KEYSERVICE_MIGRATE_DATABASE_URL: postgres://orbyn_ks_owner:${KS_OWNER_PASSWORD:-}@ks-postgres:5432/orbyn_keyservice
+      ORBYN_KEYSERVICE_RUNTIME_ROLE: orbyn_ks_runtime
+    depends_on:
+      ks-postgres:
+        condition: service_healthy
+
+  keyservice:
+    image: orbyn-keyservice:smoke
+    profiles: [smoke]
+    restart: unless-stopped
+    entrypoint: ["/usr/local/bin/smoke-entry.sh"]
+    command: ["serve"]
+    environment:
+      ORBYN_KEYSERVICE_DATABASE_URL: postgres://orbyn_ks_runtime:${KS_RUNTIME_PASSWORD:-}@ks-postgres:5432/orbyn_keyservice
+      ORBYN_HSM_PIN: ${KS_HSM_PIN:-}
+      ORBYN_KS_INTERNAL_BIND: 0.0.0.0:8443
+      # Witness settings are read by the head publisher; a build without it ignores them.
+      ORBYN_KS_WITNESS_THRESHOLD: "2"
+      ORBYN_KS_LOG_KEY_VERSION: "1"
+      ORBYN_KS_HEAD_INTERVAL_SECS: "60"
+    volumes:
+      - ks-pki:/pki:ro
+      - ks-hsm:/hsm
+      - ks-witness-keys:/witness-keys:ro
+    depends_on:
+      ks-setup:
+        condition: service_completed_successfully
+      ks-migrate:
+        condition: service_completed_successfully
+
+  # The witnesses share the key service's network, so the key service reaches them on loopback
+  # (it accepts plain http only for a loopback witness; a real witness is https, elsewhere).
+  witness-1:
+    image: orbyn-keyservice:smoke
+    profiles: [smoke]
+    restart: unless-stopped
+    network_mode: "service:keyservice"
+    entrypoint: ["/usr/local/bin/smoke-entry.sh"]
+    command: ["witness", "1", "8481"]
+    volumes:
+      - ks-witness-keys:/witness-keys:ro
+      - ks-witness-1:/witness-state
+    depends_on: [keyservice]
+
+  witness-2:
+    image: orbyn-keyservice:smoke
+    profiles: [smoke]
+    restart: unless-stopped
+    network_mode: "service:keyservice"
+    entrypoint: ["/usr/local/bin/smoke-entry.sh"]
+    command: ["witness", "2", "8482"]
+    volumes:
+      - ks-witness-keys:/witness-keys:ro
+      - ks-witness-2:/witness-state
+    depends_on: [keyservice]
+
+volumes:
+  postgres:
+  ks-postgres:
+  ks-pki:
+  ks-hsm:
+  ks-witness-keys:
+  ks-witness-1:
+  ks-witness-2:
