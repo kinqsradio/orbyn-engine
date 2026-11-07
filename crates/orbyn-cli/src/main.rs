@@ -202,6 +202,10 @@ fn mailer(config: &Config) -> Result<orbyn_worker::Mailer, String> {
                 return Err("ORBYN_SMTP_URL needs ORBYN_AUTH_SETUP: the worker opens queued messages with it".to_owned());
             }
             let sender = orbyn_worker::Smtp::new(url, from, config.smtp_ca_file.as_deref())?;
+            // Warnings written for the operator go to stderr as they are; the worker goes on.
+            for warning in sender.ca_warnings() {
+                eprintln!("{warning}");
+            }
             Ok(orbyn_worker::Mailer {
                 secrets,
                 sender: std::sync::Arc::new(sender),
@@ -327,7 +331,7 @@ mod tests {
         // SMTP without the setup that opens queued messages is refused, naming the setting.
         let error = mailer(&config(&[
             ("ORBYN_SMTP_URL", "smtps://mail.example.com"),
-            ("ORBYN_MAIL_FROM", "no-reply@example.com"),
+            ("ORBYN_MAIL_FROM", "hello@example.com"),
         ]))
         .expect_err("refused");
         assert!(
@@ -338,7 +342,7 @@ mod tests {
         let ok = config(&[
             ("ORBYN_AUTH_SETUP", setup.as_str()),
             ("ORBYN_SMTP_URL", "smtps://mail.example.com"),
-            ("ORBYN_MAIL_FROM", "no-reply@example.com"),
+            ("ORBYN_MAIL_FROM", "hello@example.com"),
         ]);
         assert!(mailer(&ok).is_ok());
         let bad = config(&[
@@ -359,7 +363,7 @@ mod tests {
         let bad = config(&[
             ("ORBYN_AUTH_SETUP", setup.as_str()),
             ("ORBYN_SMTP_URL", "smtps://mail.example.com"),
-            ("ORBYN_MAIL_FROM", "no-reply@example.com"),
+            ("ORBYN_MAIL_FROM", "hello@example.com"),
             ("ORBYN_SMTP_CA_FILE", "/nonexistent/orbyn-ca.pem"),
         ]);
         let error = mailer(&bad).expect_err("refused");

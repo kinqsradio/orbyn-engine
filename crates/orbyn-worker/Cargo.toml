@@ -12,6 +12,7 @@ orbyn-core.workspace = true
 orbyn-store.workspace = true
 rustls-pki-types.workspace = true
 tokio.workspace = true
+chrono.workspace = true
 url.workspace = true
 tracing.workspace = true
 

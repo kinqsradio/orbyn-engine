@@ -22,8 +22,8 @@ pub struct Rendered {
     pub html: String,
 }
 
-const FOOTER_HTML: &str = "Sent by Orbyn because of an action on your account. Orbyn never asks for your password or codes by email.";
-const FOOTER_TEXT: &str = "--\nSent by Orbyn because of an action on your account.\nOrbyn never asks for your password or codes by email.";
+const FOOTER_HTML: &str = "Sent by Orbyn because of an action on your account. You can reply to this email. Orbyn never asks for your password or codes by email.";
+const FOOTER_TEXT: &str = "--\nSent by Orbyn because of an action on your account.\nYou can reply to this email. Orbyn never asks for your\npassword or codes by email.";
 
 pub(super) fn render(mail: &Mail) -> Option<Rendered> {
     let value = mail.code.as_deref()?;
@@ -115,14 +115,19 @@ fn code_email(code: &str) -> Rendered {
 fn exists_email(to: &str, at: DateTime<Utc>, link: Option<&str>) -> Rendered {
     let subject = "Someone tried to create an Orbyn account with your email".to_owned();
     let when = long_time(at);
-    let sign_in = link.map(|link| format!("If this was you, sign in instead:\n{link}\n\n"));
+    // With no account URL there is no link: the email says to open the app, with no button.
+    let sign_in = match link {
+        Some(link) => format!("If this was you, sign in instead:\n{link}\n\n"),
+        None => format!(
+            "If this was you, open Orbyn and sign in with\n{to} instead of creating a new account.\n\n"
+        ),
+    };
     let text = format!(
         "Someone tried to create an Orbyn account with your email\n\n\
          Someone tried to create a new Orbyn account with\n{to} on {when}.\n\n\
-         {}If it wasn't, you don't need to do anything. Nothing on\n\
+         {sign_in}If it wasn't, you don't need to do anything. Nothing on\n\
          your account changed, and no one can get in with your\n\
-         email address alone.\n\n{FOOTER_TEXT}\n",
-        sign_in.as_deref().unwrap_or("")
+         email address alone.\n\n{FOOTER_TEXT}\n"
     );
     let mut html = Html::new(&subject);
     html.heading("You already have an Orbyn account");
@@ -130,13 +135,17 @@ fn exists_email(to: &str, at: DateTime<Utc>, link: Option<&str>) -> Rendered {
         "Someone tried to create a new Orbyn account with {} on {when}.",
         escape(to)
     ));
-    if let Some(link) = link {
-        html.raw_paragraph("<b>If this was you,</b> sign in instead.");
-        html.button(link, "Sign in to Orbyn");
-        html.quiet_raw("<b>If it wasn’t,</b> you don’t need to do anything. Nothing on your account changed, and no one can get in with your email address alone.");
-    } else {
-        html.quiet_raw("<b>If it wasn’t,</b> you don’t need to do anything. Nothing on your account changed, and no one can get in with your email address alone.");
+    match link {
+        Some(link) => {
+            html.raw_paragraph("<b>If this was you,</b> sign in instead.");
+            html.button(link, "Sign in to Orbyn");
+        }
+        None => html.raw_paragraph(&format!(
+            "<b>If this was you,</b> open Orbyn and sign in with {} instead of creating a new account.",
+            escape(to)
+        )),
     }
+    html.quiet_raw("<b>If it wasn’t,</b> you don’t need to do anything. Nothing on your account changed, and no one can get in with your email address alone.");
     Rendered {
         subject,
         text,
@@ -149,13 +158,15 @@ fn delete_email(to: &str, at: DateTime<Utc>, link: Option<&str>) -> Rendered {
     let when = long_time(at);
     let host = link.and_then(host_of);
     // The plain-text line breaks are the design's: the host starts its own line.
-    let check_text = match &host {
-        Some(host) => format!("check your devices at\n{host}"),
-        None => "check your devices".to_owned(),
-    };
-    let check = match &host {
-        Some(host) => format!("check your devices at {host}"),
-        None => "check your devices".to_owned(),
+    let (check_text, check_html) = match &host {
+        Some(host) => (
+            format!("check your devices at\n{host}"),
+            format!("check your devices at {host}"),
+        ),
+        None => (
+            "check your devices in Settings >\nAccount > Devices".to_owned(),
+            "check your devices in Settings › Account › Devices".to_owned(),
+        ),
     };
     let cancel_text = match link {
         Some(link) => format!(
@@ -164,8 +175,9 @@ fn delete_email(to: &str, at: DateTime<Utc>, link: Option<&str>) -> Rendered {
              can also cancel from any device where you're signed in:\n\
              Settings > Account > Cancel deletion.\n\n"
         ),
-        None => "You can cancel from any device where you're signed in:\n\
-                 Settings > Account > Cancel deletion.\n\n"
+        None => "Changed your mind? Open Orbyn on any device where you're\n\
+                 signed in and go to Settings > Account > Cancel deletion.\n\
+                 You have until the date above.\n\n"
             .to_owned(),
     };
     let text = format!(
@@ -189,11 +201,11 @@ fn delete_email(to: &str, at: DateTime<Utc>, link: Option<&str>) -> Rendered {
         html.button(link, "Cancel deletion");
         html.quiet("The button works once and doesn’t need you to sign in. You can also cancel from any device where you’re signed in: Settings › Account › Cancel deletion.");
     } else {
-        html.quiet("You can cancel from any device where you’re signed in: Settings › Account › Cancel deletion.");
+        html.raw_paragraph("<b>Changed your mind?</b> Open Orbyn on any device where you’re signed in and go to Settings › Account › Cancel deletion. You have until the date above.");
     }
     html.quiet(&format!(
         "If you asked for this, there’s nothing else to do. If you didn’t, cancel now and then {}.",
-        escape(&check)
+        escape(&check_html)
     ));
     Rendered {
         subject,
@@ -288,7 +300,7 @@ impl Html {
 mod tests {
     use super::*;
 
-    const FOOTER_LINES: &str = "--\nSent by Orbyn because of an action on your account.\nOrbyn never asks for your password or codes by email.\n";
+    const FOOTER_LINES: &str = "--\nSent by Orbyn because of an action on your account.\nYou can reply to this email. Orbyn never asks for your\npassword or codes by email.\n";
 
     fn mail(kind: Kind, code: Option<&str>) -> Mail {
         Mail {
@@ -338,7 +350,7 @@ mod tests {
         // Text colour on the client's background: no background on the page, one filled button.
         assert!(html.matches("background:#111111").count() <= 1);
         assert!(!html.contains("background-color"));
-        assert!(html.contains("Sent by Orbyn because of an action on your account. Orbyn never asks for your password or codes by email."));
+        assert!(html.contains("Sent by Orbyn because of an action on your account. You can reply to this email. Orbyn never asks for your password or codes by email."));
     }
 
     #[test]
@@ -407,13 +419,27 @@ mod tests {
     }
 
     #[test]
-    fn without_an_account_url_the_attempt_email_has_no_button_or_link() {
+    fn without_an_account_url_the_attempt_email_says_to_open_the_app() {
         let r = rendered(Kind::SignUpAttempt, "2026-11-07T09:41:30Z\n");
-        assert!(!r.text.contains("sign in instead") && !r.text.contains("http"));
+        assert_eq!(
+            r.text,
+            format!(
+                "Someone tried to create an Orbyn account with your email\n\n\
+                 Someone tried to create a new Orbyn account with\n\
+                 sam@example.com on Saturday 7 November 2026 at 09:41 UTC.\n\n\
+                 If this was you, open Orbyn and sign in with\n\
+                 sam@example.com instead of creating a new account.\n\n\
+                 If it wasn't, you don't need to do anything. Nothing on\n\
+                 your account changed, and no one can get in with your\n\
+                 email address alone.\n\n{FOOTER_LINES}"
+            )
+        );
+        assert!(!r.text.contains("http"));
+        assert!(r.html.contains("<b>If this was you,</b> open Orbyn and sign in with sam@example.com instead of creating a new account."));
         assert!(!r.html.contains("<a ") && !r.html.contains("sign in instead"));
         assert!(
-            r.text
-                .contains("If it wasn't, you don't need to do anything.")
+            r.html
+                .contains("<b>If it wasn’t,</b> you don’t need to do anything.")
         );
         assert!(remote_things(&r.html).is_empty());
         // A bare token, as an older queued message might carry, is not a link either.
@@ -476,11 +502,27 @@ mod tests {
     }
 
     #[test]
-    fn without_an_account_url_the_deletion_email_has_no_button() {
+    fn without_an_account_url_the_deletion_email_says_where_to_cancel_in_the_app() {
         let r = rendered(Kind::DeletionScheduled, "2026-11-14T12:00:00Z\n");
+        assert_eq!(
+            r.text,
+            format!(
+                "Your Orbyn account will be deleted on 14 November\n\n\
+                 You asked to delete your Orbyn account, sam@example.com.\n\
+                 It will be deleted on Saturday 14 November 2026 at 12:00 UTC,\n\
+                 with everything in it in every Orbyn app. Until then,\n\
+                 everything keeps working.\n\n\
+                 Changed your mind? Open Orbyn on any device where you're\n\
+                 signed in and go to Settings > Account > Cancel deletion.\n\
+                 You have until the date above.\n\n\
+                 If you asked for this, there's nothing else to do. If you\n\
+                 didn't, cancel now and then check your devices in Settings >\n\
+                 Account > Devices.\n\n{FOOTER_LINES}"
+            )
+        );
         assert!(!r.html.contains("<a ") && !r.text.contains("http"));
-        assert!(r.text.contains("Settings > Account > Cancel deletion."));
-        assert!(r.text.contains("check your devices."));
+        assert!(r.html.contains("<b>Changed your mind?</b> Open Orbyn on any device where you’re signed in and go to Settings › Account › Cancel deletion. You have until the date above."));
+        assert!(r.html.contains("If you asked for this, there’s nothing else to do. If you didn’t, cancel now and then check your devices in Settings › Account › Devices."));
         assert!(remote_things(&r.html).is_empty());
     }
 

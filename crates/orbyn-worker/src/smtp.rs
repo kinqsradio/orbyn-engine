@@ -12,6 +12,7 @@ use rustls_pki_types::pem::PemObject;
 pub struct Smtp {
     transport: AsyncSmtpTransport<Tokio1Executor>,
     from: Mailbox,
+    ca_warnings: Vec<String>,
 }
 
 impl std::fmt::Debug for Smtp {
@@ -25,7 +26,7 @@ impl Smtp {
     /// `smtp://user:password@host:587?tls=required` (STARTTLS, and a server that does not offer
     /// it is not used), as lettre reads it. Anything else is refused: a message, a code and a
     /// password must never cross the network in the clear, nor after a STARTTLS an attacker on the
-    /// path stripped. `from` is a mailbox such as `Orbyn <no-reply@example.com>`. The errors name
+    /// path stripped. `from` is a mailbox such as `Orbyn <hello@example.com>`. The errors name
     /// the setting, never its value.
     ///
     /// `ca_file` is the path of a PEM bundle of extra CA certificates (`ORBYN_SMTP_CA_FILE`), for a
@@ -37,20 +38,36 @@ impl Smtp {
         require_tls(url)?;
         let mut builder = AsyncSmtpTransport::<Tokio1Executor>::from_url(url)
             .map_err(|_| "ORBYN_SMTP_URL is not an smtp:// or smtps:// address".to_owned())?;
+        let mut ca_warnings = Vec::new();
         if let Some(path) = ca_file {
-            builder = builder.tls(tls_with_extra_roots(url, path)?);
+            let (tls, warnings) = tls_with_extra_roots(url, path)?;
+            builder = builder.tls(tls);
+            ca_warnings = warnings;
         }
         let transport = builder.build();
         let from = from
             .parse::<Mailbox>()
             .map_err(|_| "ORBYN_MAIL_FROM is not an email address".to_owned())?;
-        Ok(Self { transport, from })
+        Ok(Self {
+            transport,
+            from,
+            ca_warnings,
+        })
+    }
+
+    /// What to tell the operator at start about the CA file, as designed (an expired certificate):
+    /// each is a complete `warning: …` message, printed to stderr while the worker goes on starting.
+    pub fn ca_warnings(&self) -> &[String] {
+        &self.ca_warnings
     }
 }
 
 /// Start-up errors the operator reads are written as designed: they begin with this, and the
 /// binary prints them to stderr as they are, then exits with status 1.
 pub const OPERATOR_ERROR: &str = "error: ";
+
+/// Start-up warnings written for the operator begin with this.
+pub const OPERATOR_WARNING: &str = "warning: ";
 
 /// The last two lines of the CA file errors, as designed.
 const ROOTS_NOTE: &str = "  Orbyn always trusts the public web roots; this file only adds to them.\n  To use just the public roots, unset ORBYN_SMTP_CA_FILE.";
@@ -72,7 +89,7 @@ fn os_reason(error: &std::io::Error) -> String {
 /// server still verifies. The mode follows the scheme, as lettre reads it: `smtps` is TLS from
 /// the first byte, `smtp` with `tls=required` is STARTTLS that must succeed. `require_tls` has
 /// already refused every other URL.
-fn tls_with_extra_roots(url: &str, path: &str) -> Result<Tls, String> {
+fn tls_with_extra_roots(url: &str, path: &str) -> Result<(Tls, Vec<String>), String> {
     let bad = |what: &str| format!("ORBYN_SMTP_CA_FILE ({path}) {what}");
     let bytes = std::fs::read(path).map_err(|e| {
         format!(
@@ -80,32 +97,47 @@ fn tls_with_extra_roots(url: &str, path: &str) -> Result<Tls, String> {
             os_reason(&e)
         )
     })?;
+    let text = String::from_utf8_lossy(&bytes);
+    if text.trim().is_empty() {
+        return Err(no_certificates(path));
+    }
+    // A file with no PEM block at all, such as a binary (DER) certificate or plain text.
+    if !text
+        .split(['\r', '\n'])
+        .any(|line| line.trim().starts_with("-----BEGIN "))
+    {
+        return Err(format!(
+            "{OPERATOR_ERROR}ORBYN_SMTP_CA_FILE ({path}) isn't a PEM file\n  It should hold one or more blocks starting\n  -----BEGIN CERTIFICATE-----.\n  If you have a binary (DER) certificate, convert it first:\n    openssl x509 -inform der -in ca.der -out ca.pem\n{ROOTS_NOTE}"
+        ));
+    }
     // Only certificates: a private key or anything else pasted into the bundle is a mistake, and a
-    // key must not sit in a file the worker reads for trust.
-    for line in String::from_utf8_lossy(&bytes).lines() {
+    // key must not sit in a file the worker reads for trust. Split on `\r` as well as `\n`: the PEM
+    // reader accepts a lone `\r` as a line end, so a key after one must not hide from this scan.
+    for line in text.split(['\r', '\n']) {
         let line = line.trim();
         if let Some(label) = line
             .strip_prefix("-----BEGIN ")
             .and_then(|l| l.strip_suffix("-----"))
             && label != "CERTIFICATE"
         {
-            let label: String = label
-                .chars()
-                .filter(|c| c.is_ascii_uppercase() || *c == ' ')
-                .take(40)
-                .collect();
-            return Err(bad(&format!(
-                "has a PEM section that is not a certificate ({label}); only CERTIFICATE sections are accepted"
-            )));
+            if label.ends_with("PRIVATE KEY") {
+                return Err(format!(
+                    "{OPERATOR_ERROR}ORBYN_SMTP_CA_FILE ({path}) holds a private key, not a certificate\n  Take the private key out of this file; it should hold only\n  CA certificates. Keep private keys out of files that other\n  services read.\n{ROOTS_NOTE}"
+                ));
+            }
+            return Err(foreign_section(path, label));
         }
     }
-    let certs = rustls_pki_types::CertificateDer::pem_slice_iter(&bytes)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| bad("is not a PEM bundle of certificates"))?;
+    // The position of a damaged block is its place among the certificates, counted from 1.
+    let mut certs = Vec::new();
+    for (index, item) in rustls_pki_types::CertificateDer::pem_slice_iter(&bytes).enumerate() {
+        match item {
+            Ok(der) => certs.push(der),
+            Err(_) => return Err(damaged(path, index + 1)),
+        }
+    }
     if certs.is_empty() {
-        return Err(format!(
-            "{OPERATOR_ERROR}ORBYN_SMTP_CA_FILE ({path}) has no certificates in it\n  The file should hold the PEM certificate that signed your mail server's\n  certificate: a block starting -----BEGIN CERTIFICATE-----.\n{ROOTS_NOTE}"
-        ));
+        return Err(no_certificates(path));
     }
     let parsed = url::Url::parse(url).map_err(|_| "ORBYN_SMTP_URL is not an address".to_owned())?;
     let host = parsed
@@ -115,32 +147,96 @@ fn tls_with_extra_roots(url: &str, path: &str) -> Result<Tls, String> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
-    for der in certs {
-        let info = cert_info(der.as_ref()).ok_or_else(|| bad("holds a bad certificate"))?;
+    let mut warnings = Vec::new();
+    for (index, der) in certs.into_iter().enumerate() {
+        let info = cert_info(der.as_ref()).ok_or_else(|| damaged(path, index + 1))?;
         // A server certificate in the CA file is a mistake, not a trust anchor. A self-issued one
         // is the way to trust a single self-signed server, so it stays.
         if !info.is_ca && !info.self_issued {
-            return Err(bad(&format!(
-                "holds a certificate that is not a CA ({}): put the CA that signed it here, not the server's own certificate",
-                info.subject
-            )));
+            return Err(format!(
+                "{OPERATOR_ERROR}ORBYN_SMTP_CA_FILE ({path}) holds a server certificate, not a CA ({})\n  Use the certificate of the authority that signed your mail server,\n  not the mail server's own certificate.\n{ROOTS_NOTE}",
+                common_name(&info.subject)
+            ));
         }
         if info.not_after < now {
-            tracing::warn!(subject = %info.subject, "a CA in ORBYN_SMTP_CA_FILE has expired and will not verify anything");
+            let expired = chrono::DateTime::from_timestamp(info.not_after, 0).map_or_else(
+                || "an unknown date".to_owned(),
+                |at| at.format("%Y-%m-%d").to_string(),
+            );
+            warnings.push(format!(
+                "{OPERATOR_WARNING}a certificate in ORBYN_SMTP_CA_FILE ({path}) expired on {expired} ({})\n  Orbyn is starting anyway, but mail servers signed only by it will\n  fail to connect. Replace it with the authority's current certificate.",
+                common_name(&info.subject)
+            ));
         }
         tracing::info!(subject = %info.subject, "SMTP also trusts a CA from ORBYN_SMTP_CA_FILE");
-        let cert = Certificate::from_der(der.as_ref().to_vec())
-            .map_err(|_| bad("holds a bad certificate"))?;
+        let cert =
+            Certificate::from_der(der.as_ref().to_vec()).map_err(|_| damaged(path, index + 1))?;
         params = params.add_root_certificate(cert);
     }
     let params = params
         .build_rustls()
         .map_err(|_| bad("could not be used as a trust root"))?;
-    Ok(if parsed.scheme() == "smtps" {
+    let tls = if parsed.scheme() == "smtps" {
         Tls::Wrapper(params)
     } else {
         Tls::Required(params)
-    })
+    };
+    Ok((tls, warnings))
+}
+
+/// The error for a file with no certificate in it, as designed.
+fn no_certificates(path: &str) -> String {
+    format!(
+        "{OPERATOR_ERROR}ORBYN_SMTP_CA_FILE ({path}) has no certificates in it\n  The file should hold the PEM certificate that signed your mail\n  server's certificate: a block starting -----BEGIN CERTIFICATE-----.\n{ROOTS_NOTE}"
+    )
+}
+
+/// A PEM section that is neither a certificate nor a private key, as designed: the kind of thing
+/// it is, and what to do. A `TRUSTED CERTIFICATE` has its own advice. Any other label is quoted.
+fn foreign_section(path: &str, label: &str) -> String {
+    let kind = match label {
+        "X509 CRL" | "CRL" => "certificate revocation list".to_owned(),
+        "PUBLIC KEY" | "RSA PUBLIC KEY" => "public key".to_owned(),
+        "CERTIFICATE REQUEST" | "NEW CERTIFICATE REQUEST" => "certificate request".to_owned(),
+        "TRUSTED CERTIFICATE" => "trusted certificate".to_owned(),
+        other => {
+            // Only what a label can hold, and not too much of it, goes into a message.
+            let other: String = other
+                .chars()
+                .filter(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == ' ')
+                .take(40)
+                .collect();
+            format!("\"{other}\" section")
+        }
+    };
+    let advice = if label == "TRUSTED CERTIFICATE" {
+        "  This is OpenSSL's trusted-certificate format. Convert it to a\n  plain certificate:\n    openssl x509 -in ca.pem -out ca-plain.pem"
+    } else {
+        "  It should hold only CA certificates, each starting\n  -----BEGIN CERTIFICATE-----."
+    };
+    format!(
+        "{OPERATOR_ERROR}ORBYN_SMTP_CA_FILE ({path}) holds a {kind}, not a certificate\n{advice}\n{ROOTS_NOTE}"
+    )
+}
+
+/// A certificate block that does not decode, as designed; `n` counts from 1.
+fn damaged(path: &str, n: usize) -> String {
+    format!(
+        "{OPERATOR_ERROR}certificate {n} in ORBYN_SMTP_CA_FILE ({path}) is damaged\n  Its text may be cut off or changed. Copy the certificate again\n  from where you got it.\n{ROOTS_NOTE}"
+    )
+}
+
+/// What an error shows for a certificate: `CN=<common name>`, else its whole subject (such as
+/// `O=Acme, C=US`), else "no subject".
+fn common_name(subject: &str) -> String {
+    match subject
+        .split(", ")
+        .find_map(|part| part.strip_prefix("CN="))
+    {
+        Some(cn) if !cn.is_empty() => format!("CN={cn}"),
+        _ if subject.is_empty() => "no subject".to_owned(),
+        _ => subject.to_owned(),
+    }
 }
 
 /// One DER element: its tag, its content and what follows it.
@@ -376,13 +472,13 @@ mod tests {
         assert!(
             Smtp::new(
                 "smtps://user:secret@mail.example.com:465",
-                "Orbyn <no-reply@example.com>",
+                "Orbyn <hello@example.com>",
                 None
             )
             .is_ok()
         );
-        let bad_url = Smtp::new("http://mail.example.com", "no-reply@example.com", None)
-            .expect_err("refused");
+        let bad_url =
+            Smtp::new("http://mail.example.com", "hello@example.com", None).expect_err("refused");
         assert!(bad_url.contains("ORBYN_SMTP_URL") && !bad_url.contains("mail.example.com"));
         let bad_from =
             Smtp::new("smtps://mail.example.com", "not an address", None).expect_err("refused");
@@ -391,12 +487,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_recipient_that_is_not_an_address_is_a_permanent_failure() {
-        let smtp = Smtp::new(
-            "smtp://127.0.0.1:1?tls=required",
-            "no-reply@example.com",
-            None,
-        )
-        .expect("settings");
+        let smtp = Smtp::new("smtp://127.0.0.1:1?tls=required", "hello@example.com", None)
+            .expect("settings");
         let mail = Mail {
             kind: orbyn_core::mail::Kind::VerifyEmail,
             account: None,
@@ -411,12 +503,8 @@ mod tests {
     #[tokio::test]
     async fn a_server_that_is_not_there_is_retried_not_given_up_on() {
         // Nothing listens on port 1: the connection fails, which is worth another try.
-        let smtp = Smtp::new(
-            "smtp://127.0.0.1:1?tls=required",
-            "no-reply@example.com",
-            None,
-        )
-        .expect("settings");
+        let smtp = Smtp::new("smtp://127.0.0.1:1?tls=required", "hello@example.com", None)
+            .expect("settings");
         let mail = Mail {
             kind: orbyn_core::mail::Kind::VerifyEmail,
             account: None,
@@ -435,7 +523,7 @@ mod tests {
             "smtp://mail.example.com:587?tls=required",
             "smtp://user:secret@mail.example.com:587?tls=required",
         ] {
-            assert!(Smtp::new(ok, "no-reply@example.com", None).is_ok(), "{ok}");
+            assert!(Smtp::new(ok, "hello@example.com", None).is_ok(), "{ok}");
         }
         for bad in [
             "smtp://mail.example.com:587",
@@ -450,7 +538,7 @@ mod tests {
             "http://mail.example.com?tls=required",
             "mail.example.com",
         ] {
-            let error = Smtp::new(bad, "no-reply@example.com", None).expect_err(bad);
+            let error = Smtp::new(bad, "hello@example.com", None).expect_err(bad);
             assert!(
                 error.contains("ORBYN_SMTP_URL") && !error.contains("mail.example.com"),
                 "{bad}: {error}"
@@ -505,7 +593,7 @@ mod tests {
     async fn a_server_whose_starttls_was_stripped_is_never_sent_the_message_or_the_password() {
         let (port, seen) = stripped_server().await;
         let url = format!("smtp://user:hunter2@127.0.0.1:{port}?tls=required");
-        let smtp = Smtp::new(&url, "no-reply@example.com", None).expect("settings");
+        let smtp = Smtp::new(&url, "hello@example.com", None).expect("settings");
         let mail = Mail {
             kind: orbyn_core::mail::Kind::VerifyEmail,
             account: None,
@@ -607,6 +695,12 @@ mod tests {
             ));
             std::fs::write(&path, content).expect("write");
             Self(path)
+        }
+        /// A file with these exact bytes, such as a binary certificate.
+        fn bytes(content: &[u8]) -> Self {
+            let file = Self::new("");
+            std::fs::write(&file.0, content).expect("write");
+            file
         }
         fn path(&self) -> &str {
             self.0.to_str().expect("utf8 path")
@@ -749,7 +843,7 @@ mod tests {
     }
 
     async fn send(url: &str, ca_file: Option<&str>) -> Result<(), orbyn_core::mail::SendError> {
-        let smtp = Smtp::new(url, "no-reply@example.com", ca_file).expect("settings");
+        let smtp = Smtp::new(url, "hello@example.com", ca_file).expect("settings");
         tokio::time::timeout(std::time::Duration::from_secs(30), smtp.send(&mail()))
             .await
             .expect("no hang")
@@ -843,7 +937,7 @@ mod tests {
         // And the URL rules do not change: a URL without TLS is still refused with a CA file.
         let refused = Smtp::new(
             "smtp://127.0.0.1:587",
-            "no-reply@example.com",
+            "hello@example.com",
             Some(file.path()),
         )
         .expect_err("refused");
@@ -899,16 +993,16 @@ mod tests {
     #[test]
     fn only_certificate_sections_are_accepted_in_the_ca_file() {
         let url = "smtps://mail.example.com";
-        let from = "no-reply@example.com";
+        let from = "hello@example.com";
         let (_, key, cert) = ca("Orbyn test CA");
         // A CA with its private key pasted after it, as when two files are cat'ed together.
         let with_key = PemFile::new(&format!("{}\n{}", cert.pem(), key.serialize_pem()));
         let error = Smtp::new(url, from, Some(with_key.path())).expect_err("a key in the file");
-        assert!(error.contains("ORBYN_SMTP_CA_FILE") && error.contains("not a certificate"));
         assert!(
-            error.contains("PRIVATE KEY") && !error.contains("MII"),
+            error.contains("holds a private key, not a certificate"),
             "{error}"
         );
+        assert!(!error.contains("MII"), "{error}");
         // Other section types and the OpenSSL "trusted" form too; text between sections is fine.
         for label in [
             "PUBLIC KEY",
@@ -930,7 +1024,7 @@ mod tests {
     #[test]
     fn a_certificate_that_is_not_a_ca_is_refused_unless_it_is_self_issued() {
         let url = "smtps://mail.example.com";
-        let from = "no-reply@example.com";
+        let from = "hello@example.com";
         // The server's own certificate, pasted instead of its CA.
         let pki = pki("Orbyn test CA");
         let leaf = PemFile::new(&pki.server_pem);
@@ -980,7 +1074,7 @@ mod tests {
     #[test]
     fn the_log_names_each_ca_and_warns_about_an_expired_one_without_contents() {
         let url = "smtps://mail.example.com";
-        let from = "no-reply@example.com";
+        let from = "hello@example.com";
         let (_, _, fresh) = ca("Orbyn test CA");
         let key = rcgen::KeyPair::generate().expect("key");
         let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("params");
@@ -1000,15 +1094,14 @@ mod tests {
             log.contains("CN=Orbyn test CA") && log.contains("CN=Old lab CA"),
             "{log}"
         );
-        let warnings: Vec<_> = log.lines().filter(|l| l.contains("WARN")).collect();
-        assert_eq!(warnings.len(), 1, "{log}");
-        assert!(warnings[0].contains("Old lab CA") && warnings[0].contains("expired"));
+        // The expiry is no longer a log line: it is a designed warning for stderr.
+        assert!(!log.contains("WARN"), "{log}");
         // Never the certificate itself.
         assert!(!log.contains("MII") && !log.contains("BEGIN"), "{log}");
         // A fresh CA alone warns about nothing.
         let fresh_file = PemFile::new(&fresh.pem());
-        let log = logged(|| assert!(Smtp::new(url, from, Some(fresh_file.path())).is_ok()));
-        assert!(!log.contains("WARN"), "{log}");
+        let smtp = Smtp::new(url, from, Some(fresh_file.path())).expect("fresh");
+        assert!(smtp.ca_warnings().is_empty());
         // The validity dates are read right.
         assert_eq!(der_time(0x17, b"020101000000Z"), Some(1_009_843_200));
         assert_eq!(der_time(0x18, b"20400101000000Z"), Some(2_208_988_800));
@@ -1018,7 +1111,7 @@ mod tests {
     #[test]
     fn an_unusable_ca_file_is_refused_at_start_naming_the_setting() {
         let url = "smtps://mail.example.com";
-        let from = "no-reply@example.com";
+        let from = "hello@example.com";
         let empty = PemFile::new("");
         let text = PemFile::new("not a certificate, hunter2\n");
         let broken = PemFile::new("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n");
@@ -1082,7 +1175,7 @@ mod tests {
     #[test]
     fn the_ca_file_start_up_errors_are_as_designed() {
         let url = "smtps://mail.example.com";
-        let from = "no-reply@example.com";
+        let from = "hello@example.com";
         let notes = "  Orbyn always trusts the public web roots; this file only adds to them.\n  To use just the public roots, unset ORBYN_SMTP_CA_FILE.";
         // A file that cannot be read: the path and the operating system's own reason.
         let missing = "/nonexistent/orbyn-smtp-ca.pem";
@@ -1099,7 +1192,7 @@ mod tests {
         assert_eq!(
             error,
             format!(
-                "error: ORBYN_SMTP_CA_FILE ({}) has no certificates in it\n  The file should hold the PEM certificate that signed your mail server's\n  certificate: a block starting -----BEGIN CERTIFICATE-----.\n{notes}",
+                "error: ORBYN_SMTP_CA_FILE ({}) has no certificates in it\n  The file should hold the PEM certificate that signed your mail\n  server's certificate: a block starting -----BEGIN CERTIFICATE-----.\n{notes}",
                 empty.path()
             )
         );
@@ -1118,7 +1211,7 @@ mod tests {
         }
         let error = Smtp::new(
             "smtps://mail.example.com",
-            "no-reply@example.com",
+            "hello@example.com",
             Some(file.path()),
         )
         .expect_err("unreadable");
@@ -1129,5 +1222,198 @@ mod tests {
             )),
             "{error}"
         );
+    }
+
+    const ROOTS: &str = "  Orbyn always trusts the public web roots; this file only adds to them.\n  To use just the public roots, unset ORBYN_SMTP_CA_FILE.";
+
+    #[test]
+    fn the_other_ca_file_messages_are_as_designed() {
+        let url = "smtps://mail.example.com";
+        let from = "hello@example.com";
+        let new = |file: &PemFile| Smtp::new(url, from, Some(file.path()));
+        // Not a PEM file: plain text and a binary (DER) certificate.
+        let (_, _, cert) = ca("Orbyn test CA");
+        for file in [
+            PemFile::new("just some words\n"),
+            PemFile::bytes(cert.der()),
+        ] {
+            let error = new(&file).expect_err("not PEM");
+            assert_eq!(
+                error,
+                format!(
+                    "error: ORBYN_SMTP_CA_FILE ({}) isn't a PEM file\n  It should hold one or more blocks starting\n  -----BEGIN CERTIFICATE-----.\n  If you have a binary (DER) certificate, convert it first:\n    openssl x509 -inform der -in ca.der -out ca.pem\n{ROOTS}",
+                    file.path()
+                )
+            );
+        }
+        // A private key, in each of its PEM spellings.
+        let (_, key, _) = ca("Orbyn test CA");
+        for label in [
+            "PRIVATE KEY",
+            "RSA PRIVATE KEY",
+            "EC PRIVATE KEY",
+            "ENCRYPTED PRIVATE KEY",
+        ] {
+            let file = PemFile::new(&format!(
+                "{}\n-----BEGIN {label}-----\nAAAA\n-----END {label}-----\n",
+                cert.pem()
+            ));
+            assert_eq!(
+                new(&file).expect_err(label),
+                format!(
+                    "error: ORBYN_SMTP_CA_FILE ({}) holds a private key, not a certificate\n  Take the private key out of this file; it should hold only\n  CA certificates. Keep private keys out of files that other\n  services read.\n{ROOTS}",
+                    file.path()
+                ),
+                "{label}"
+            );
+        }
+        let _ = key;
+        // A server certificate, with its common name.
+        let (root_params, root_key, _) = ca("Orbyn test CA");
+        let leaf_key = rcgen::KeyPair::generate().expect("key");
+        let mut leaf =
+            rcgen::CertificateParams::new(vec!["mail.example.test".to_owned()]).expect("params");
+        leaf.distinguished_name
+            .push(rcgen::DnType::CommonName, "mail.example.test");
+        let issuer = rcgen::Issuer::from_params(&root_params, &root_key);
+        let leaf = leaf.signed_by(&leaf_key, &issuer).expect("signed");
+        let file = PemFile::new(&leaf.pem());
+        assert_eq!(
+            new(&file).expect_err("leaf"),
+            format!(
+                "error: ORBYN_SMTP_CA_FILE ({}) holds a server certificate, not a CA (CN=mail.example.test)\n  Use the certificate of the authority that signed your mail server,\n  not the mail server's own certificate.\n{ROOTS}",
+                file.path()
+            )
+        );
+        // The name an error shows: the common name, else the subject, else "no subject".
+        assert_eq!(common_name("CN=Lab CA, O=Lab"), "CN=Lab CA");
+        assert_eq!(common_name("O=Lab, C=US"), "O=Lab, C=US");
+        assert_eq!(common_name(""), "no subject");
+        assert_eq!(common_name("O=Lab, CN="), "O=Lab, CN=");
+    }
+
+    #[test]
+    fn an_expired_certificate_is_a_designed_warning_and_the_worker_goes_on() {
+        let key = rcgen::KeyPair::generate().expect("key");
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("params");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Old lab CA");
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.not_before = rcgen::date_time_ymd(2001, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2002, 3, 4);
+        let old = params.self_signed(&key).expect("self signed");
+        let file = PemFile::new(&old.pem());
+        let smtp = Smtp::new(
+            "smtps://mail.example.com",
+            "hello@example.com",
+            Some(file.path()),
+        )
+        .expect("an expired certificate does not stop the worker");
+        assert_eq!(
+            smtp.ca_warnings(),
+            [format!(
+                "warning: a certificate in ORBYN_SMTP_CA_FILE ({}) expired on 2002-03-04 (CN=Old lab CA)\n  Orbyn is starting anyway, but mail servers signed only by it will\n  fail to connect. Replace it with the authority's current certificate.",
+                file.path()
+            )]
+        );
+        assert!(smtp.ca_warnings()[0].starts_with(OPERATOR_WARNING));
+    }
+
+    #[test]
+    fn other_pem_sections_and_damaged_blocks_are_as_designed() {
+        let url = "smtps://mail.example.com";
+        let from = "hello@example.com";
+        let (_, _, cert) = ca("Orbyn test CA");
+        let new = |file: &PemFile| Smtp::new(url, from, Some(file.path()));
+        let with = |label: &str| {
+            PemFile::new(&format!(
+                "{}\n-----BEGIN {label}-----\nAAAA\n-----END {label}-----\n",
+                cert.pem()
+            ))
+        };
+        let plain =
+            "  It should hold only CA certificates, each starting\n  -----BEGIN CERTIFICATE-----.";
+        for (label, kind) in [
+            ("X509 CRL", "certificate revocation list"),
+            ("PUBLIC KEY", "public key"),
+            ("CERTIFICATE REQUEST", "certificate request"),
+            ("NEW CERTIFICATE REQUEST", "certificate request"),
+            ("DH PARAMETERS", "\"DH PARAMETERS\" section"),
+            ("PKCS7", "\"PKCS7\" section"),
+        ] {
+            let file = with(label);
+            assert_eq!(
+                new(&file).expect_err(label),
+                format!(
+                    "error: ORBYN_SMTP_CA_FILE ({}) holds a {kind}, not a certificate\n{plain}\n{ROOTS}",
+                    file.path()
+                ),
+                "{label}"
+            );
+        }
+        // The OpenSSL trusted-certificate form has its own advice.
+        let file = with("TRUSTED CERTIFICATE");
+        assert_eq!(
+            new(&file).expect_err("trusted"),
+            format!(
+                "error: ORBYN_SMTP_CA_FILE ({}) holds a trusted certificate, not a certificate\n  This is OpenSSL's trusted-certificate format. Convert it to a\n  plain certificate:\n    openssl x509 -in ca.pem -out ca-plain.pem\n{ROOTS}",
+                file.path()
+            )
+        );
+        // A damaged block names its place among the certificates, from 1.
+        let broken = "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n";
+        let truncated = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+        for (n, content) in [
+            (1, broken.to_owned()),
+            (2, format!("{}\n{broken}", cert.pem())),
+            (3, format!("{}\n{}\n{truncated}", cert.pem(), cert.pem())),
+        ] {
+            let file = PemFile::new(&content);
+            assert_eq!(
+                new(&file).expect_err("damaged"),
+                format!(
+                    "error: certificate {n} in ORBYN_SMTP_CA_FILE ({}) is damaged\n  Its text may be cut off or changed. Copy the certificate again\n  from where you got it.\n{ROOTS}",
+                    file.path()
+                ),
+                "block {n}"
+            );
+        }
+    }
+
+    /// No line of a hint is longer than 72 characters (the first line of each message holds a path
+    /// of any length, so it is left out).
+    #[test]
+    fn no_hint_line_is_longer_than_72_characters() {
+        let url = "smtps://mail.example.com";
+        let from = "hello@example.com";
+        let (_, key, cert) = ca("Orbyn test CA");
+        let mut messages = vec![Smtp::new(url, from, Some("/nonexistent")).expect_err("missing")];
+        for content in [
+            String::new(),
+            "words\n".to_owned(),
+            format!("{}\n{}", cert.pem(), key.serialize_pem()),
+            format!(
+                "{}\n-----BEGIN TRUSTED CERTIFICATE-----\nAAAA\n-----END TRUSTED CERTIFICATE-----\n",
+                cert.pem()
+            ),
+            format!(
+                "{}\n-----BEGIN X509 CRL-----\nAAAA\n-----END X509 CRL-----\n",
+                cert.pem()
+            ),
+            "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n".to_owned(),
+        ] {
+            let file = PemFile::new(&content);
+            messages.push(Smtp::new(url, from, Some(file.path())).expect_err("refused"));
+        }
+        for message in messages {
+            for line in message.lines().skip(1) {
+                assert!(
+                    line.chars().count() <= 72,
+                    "{} chars: {line}",
+                    line.chars().count()
+                );
+            }
+        }
     }
 }

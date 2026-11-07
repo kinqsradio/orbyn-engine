@@ -292,7 +292,7 @@ mod tests {
         );
         let set = with(&[
             ("ORBYN_SMTP_URL", "smtps://user:hunter2@mail.example.com"),
-            ("ORBYN_MAIL_FROM", "Orbyn <no-reply@example.com>"),
+            ("ORBYN_MAIL_FROM", "Orbyn <hello@example.com>"),
         ])?;
         assert!(set.smtp_url.is_some());
         assert!(!format!("{set:?}").contains("hunter2"));
@@ -304,7 +304,7 @@ mod tests {
         );
         let with_ca = with(&[
             ("ORBYN_SMTP_URL", "smtps://mail.example.com"),
-            ("ORBYN_MAIL_FROM", "no-reply@example.com"),
+            ("ORBYN_MAIL_FROM", "hello@example.com"),
             ("ORBYN_SMTP_CA_FILE", "/etc/orbyn/ca.pem"),
         ])?;
         assert_eq!(with_ca.smtp_ca_file.as_deref(), Some("/etc/orbyn/ca.pem"));
