@@ -1,5 +1,6 @@
 [package]
 name = "orbyn-translog"
+license = "MIT OR Apache-2.0"
 description = "The transparency log: the RFC 9162 Merkle tree, its proofs, and the canonical entry and head encodings."
 version.workspace = true
 edition.workspace = true

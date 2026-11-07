@@ -54,7 +54,7 @@ jobs:
           if ! files=$(git diff --no-renames --name-only "$BASE"...HEAD); then all "could not compare with the base"; exit 0; fi
           docs='^(docs/|[^/]+\.md$|\.github/ISSUE_TEMPLATE/|\.github/pull_request_template\.md$|\.github/(CODEOWNERS|dependabot\.yml)$|\.gitignore$|\.env\.example$)'
           # What the Rust tests build or read. Docker files do not.
-          rust='^(crates/|migrations/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|\.cargo/|\.github/workflows/)'
+          rust='^(crates/|scripts/check_licence_split\.py$|migrations/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|\.cargo/|\.github/workflows/)'
           # Where a platform can matter: the manifests and the toolchain decide what builds, `orbyn-cli` holds the
           # only platform-specific code (`cfg(windows)`, `cfg(unix)`), and a build script could branch too.
           platform='^(Cargo\.(toml|lock)$|rust-toolchain\.toml$|\.cargo/|crates/[^/]+/(Cargo\.toml|build\.rs)$|crates/orbyn-cli/|\.github/workflows/)'
@@ -94,6 +94,9 @@ jobs:
           components: rustfmt
       - if: env.RUST == 'true'
         run: cargo fmt --all --check
+      # No app-side (MIT OR Apache-2.0) crate may depend on a server-side (AGPL-3.0-only) one.
+      - if: env.RUST == 'true'
+        run: python3 scripts/check_licence_split.py
 
   # The Rust lane: lint, the whole workspace with the Postgres tests against a service container, the web build of the
   # device crates, and the committed wire types. The one lane a pull request always runs (unless it only touches docs).

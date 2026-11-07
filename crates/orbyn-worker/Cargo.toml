@@ -1,5 +1,6 @@
 [package]
 name = "orbyn-worker"
+license = "AGPL-3.0-only"
 description = "Background job runner for orbyn-engine."
 version.workspace = true
 edition.workspace = true

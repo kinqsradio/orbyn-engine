@@ -1,5 +1,6 @@
 [package]
 name = "orbyn-server"
+license = "AGPL-3.0-only"
 description = "HTTP transport for orbyn-engine. Thin: parsing, auth and mapping only."
 version.workspace = true
 edition.workspace = true

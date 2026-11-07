@@ -1,5 +1,6 @@
 [package]
 name = "orbyn-contracts"
+license = "MIT OR Apache-2.0"
 description = "Wire types shared by orbyn-engine and its clients."
 version.workspace = true
 edition.workspace = true

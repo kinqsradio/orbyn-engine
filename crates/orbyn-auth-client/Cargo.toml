@@ -1,5 +1,6 @@
 [package]
 name = "orbyn-auth-client"
+license = "MIT OR Apache-2.0"
 description = "The OPAQUE ciphersuite Orbyn uses and the device side of sign-up, sign-in and device approval."
 version.workspace = true
 edition.workspace = true

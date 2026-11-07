@@ -1,5 +1,6 @@
 [package]
 name = "orbyn-cli"
+license = "AGPL-3.0-only"
 description = "The orbyn binary: serve, worker, migrate and health."
 version.workspace = true
 edition.workspace = true

@@ -1,5 +1,6 @@
 [package]
 name = "orbyn-wasm"
+license = "MIT OR Apache-2.0"
 description = "JavaScript bindings for the device crates: sign-in, device keys and the sync engine."
 version.workspace = true
 edition.workspace = true
