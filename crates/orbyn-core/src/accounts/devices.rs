@@ -448,7 +448,6 @@ impl Accounts {
         nonce: &[u8; 32],
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        Self::lock_account_shared(&mut tx, session.account_id).await?;
         let view = self
             .open_approval(&mut tx, session, approval_id, false)
             .await?;
@@ -598,6 +597,8 @@ impl Accounts {
         }
 
         let mut tx = self.pool.begin().await?;
+        // The account first (the deletion takes it before the approval's row), then the approval.
+        Self::lock_account_shared(&mut tx, session.account_id).await?;
         let view = self
             .open_approval(&mut tx, session, approval_id, false)
             .await?;
