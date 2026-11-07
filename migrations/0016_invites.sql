@@ -9,7 +9,7 @@ CREATE TABLE invites (
     short_id        text        NOT NULL UNIQUE CHECK (short_id ~ '^[0-9a-f]{4}$'),
     code_digest     bytea       NOT NULL UNIQUE CHECK (length(code_digest) = 32),
     -- The operator's own note. It never holds an email address (the CLI refuses "@").
-    label           text        NOT NULL DEFAULT '' CHECK (length(label) <= 100 AND position('@' in label) = 0),
+    label           text        NOT NULL DEFAULT '' CHECK (length(label) <= 100 AND label !~ '[@＠﹫]'),
     created_at      timestamptz NOT NULL DEFAULT now(),
     expires_at      timestamptz NOT NULL,
     -- Set in the transaction that creates the account the invite was used for.
@@ -22,6 +22,9 @@ CREATE TABLE invites (
     -- has it is never released again. No other deletion sets it.
     released_at     timestamptz
 );
+
+-- Looked up when delete-unused releases an invite, and by the account's deletion.
+CREATE INDEX invites_used_by_account ON invites (used_by_account) WHERE used_by_account IS NOT NULL;
 
 -- The invite a pending sign-up was started with, decoys included, so a decoy takes the same steps.
 ALTER TABLE pending_signups ADD COLUMN invite_id uuid REFERENCES invites (id);

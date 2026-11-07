@@ -37,8 +37,12 @@ pub enum InviteError {
     Count,
     #[error("the lifetime must be from 1 to {MAX_DAYS} days")]
     Days,
-    #[error("the label must not contain @, and must be at most {MAX_LABEL} characters")]
+    /// A label naming an address: it contains an at sign, including the full-width and small
+    /// forms (U+FF20, U+FE6B) that read as one.
+    #[error("the label must not contain @")]
     Label,
+    #[error("the label must be at most {MAX_LABEL} characters")]
+    LabelTooLong,
     #[error("the database failed")]
     Database(String),
     #[error("an internal step failed")]
@@ -75,6 +79,12 @@ pub fn new_code() -> Result<String, InviteError> {
         &text[8..12],
         &text[12..16]
     ))
+}
+
+/// Whether `label` holds an at sign in any of the forms that read as one: `@`, the full-width
+/// `＠` (U+FF20) and the small `﹫` (U+FE6B).
+pub fn label_has_at(label: &str) -> bool {
+    label.contains(['@', '\u{ff20}', '\u{fe6b}'])
 }
 
 /// The code as the server compares it: upper case, spaces and dashes dropped, and the characters
@@ -146,8 +156,11 @@ pub async fn create(
         return Err(InviteError::Days);
     }
     let label = label.trim();
-    if label.contains('@') || label.chars().count() > MAX_LABEL {
+    if label_has_at(label) {
         return Err(InviteError::Label);
+    }
+    if label.chars().count() > MAX_LABEL {
+        return Err(InviteError::LabelTooLong);
     }
     let mut made = Vec::new();
     let mut tx = pool.begin().await?;
@@ -242,7 +255,9 @@ impl Accounts {
     /// every call says yes and names none. With invites required:
     ///
     /// - **One answer.** An unknown, malformed, expired, used or revoked code, and a code that
-    ///   already has five live sign-ups waiting, are all [`AccountError::InviteInvalid`], and take
+    ///   already has five live sign-ups waiting (counted here, outside any lock, so parallel finishes
+    ///   can go a little past five: **accepted**, since it only ever affects the holder of the code
+    ///   and the sign-ups still each need their own email code), are all [`AccountError::InviteInvalid`], and take
     ///   the same steps (a code that is not even well formed is looked up as a random digest), so
     ///   neither the answer nor the work says which it was.
     /// - **Failures count, successes do not.** Each call takes a slot of the client address's
@@ -351,6 +366,16 @@ mod tests {
             "K7QM-2XWH-9QXA-LC2!",
         ] {
             assert_eq!(normalise(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_label_with_an_at_sign_in_any_form_is_refused() {
+        for bad in ["a@b", "@", "x\u{ff20}y", "\u{fe6b}", "team \u{ff20}example"] {
+            assert!(label_has_at(bad), "{bad}");
+        }
+        for fine in ["", "batch-1", "friends & family", "Ａ", "名前 2026"] {
+            assert!(!label_has_at(fine), "{fine}");
         }
     }
 

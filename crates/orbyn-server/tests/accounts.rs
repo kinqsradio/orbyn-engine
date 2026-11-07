@@ -6143,8 +6143,10 @@ async fn a_zone_insert_racing_a_confirm_is_stored_and_refused_or_deleted_and_fai
                 assert_eq!(body["code"], "delete_unused_not_possible");
                 stored += 1;
             }
-            // Deleted first: the insert fails (the account is gone), and no zone is left.
-            (false, StatusCode::NO_CONTENT) => {
+            // Deleted first: the insert fails (the account is gone), and no zone is left. The
+            // answer is 200 with `invite_released` (false: these accounts have no invite).
+            (false, StatusCode::OK) => {
+                assert_eq!(body, json!({"invite_released": false}));
                 assert!(!exists);
                 let zones: i64 = orbyn_core::sqlx::query_scalar(
                     "SELECT count(*) FROM zones WHERE owner_id = $1",
@@ -6160,6 +6162,51 @@ async fn a_zone_insert_racing_a_confirm_is_stored_and_refused_or_deleted_and_fai
         }
     }
     eprintln!("raced: {stored} stored first, {deleted} deleted first");
+    // Every round was one branch or the other (a round that was neither panicked above); which one
+    // wins is the race's, so each branch is also run on its own, in the two tests below.
+    assert_eq!(stored + deleted, 8);
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_zone_stored_before_the_confirm_is_refused_and_nothing_is_deleted() {
+    let _turn = TURN.lock().await;
+    let server = server_with(unused_limits()).await;
+    let (email, _, session) = unused_account(&server).await;
+    let account = uuid_of(&session["account_id"]);
+    server.ask_unused(&email).await;
+    server.decide_requests(unused_limits()).await;
+    let token = server.unused_tokens(&email).await.remove(0);
+    server.store_zone(account).await;
+    let (status, body) = server.confirm_unused(&token).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "delete_unused_not_possible");
+    assert!(server.account_exists(&email).await);
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_confirm_before_the_zone_deletes_at_once_answers_ok_and_the_late_insert_fails() {
+    let _turn = TURN.lock().await;
+    let server = server_with(unused_limits()).await;
+    let (email, _, session) = unused_account(&server).await;
+    let account = uuid_of(&session["account_id"]);
+    server.ask_unused(&email).await;
+    server.decide_requests(unused_limits()).await;
+    let token = server.unused_tokens(&email).await.remove(0);
+    let (status, body) = server.confirm_unused(&token).await;
+    assert_eq!(
+        (status, body),
+        (StatusCode::OK, json!({"invite_released": false}))
+    );
+    assert!(!server.account_exists(&email).await);
+    let late =
+        orbyn_core::sqlx::query("INSERT INTO zones (id, owner_id, name) VALUES ($1, $2, 'late')")
+            .bind(Uuid::new_v4())
+            .bind(account)
+            .execute(server.db.pool())
+            .await;
+    assert!(late.is_err(), "the account is gone");
 }
 
 #[tokio::test]
@@ -8351,5 +8398,45 @@ async fn an_account_made_without_an_invite_releases_nothing_and_no_other_deletio
     assert_eq!(
         server.invite_row(&invite.id).await,
         (true, false, false, false)
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn deleting_one_unused_account_never_releases_another_accounts_invite() {
+    let _turn = TURN.lock().await;
+    let server = invite_server(invite_limits()).await;
+    // Account B holds a used invite; account C, also invited, is deleted as unused.
+    let theirs = server.new_invite().await;
+    let b = self::email();
+    let (status, _) = server
+        .register_invited(&b, &DeviceKeys::generate().expect("keys"), &theirs.code)
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let mine = server.new_invite().await;
+    let c = self::email();
+    let (status, _) = server
+        .register_invited(&c, &DeviceKeys::generate().expect("keys"), &mine.code)
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = delete_unused_account(&server, &c).await;
+    assert_eq!(
+        (status, body),
+        (StatusCode::OK, json!({"invite_released": true}))
+    );
+    // C's own invite is back; B's is untouched: still used, by B, never released.
+    assert_eq!(
+        server.invite_row(&mine.id).await,
+        (false, false, false, true)
+    );
+    assert_eq!(
+        server.invite_row(&theirs.id).await,
+        (true, true, false, false)
+    );
+    assert!(server.account_exists(&b).await);
+    let (status, body) = server.check_invite_code(&theirs.code).await;
+    assert_eq!(
+        (status, body["code"].clone()),
+        (StatusCode::BAD_REQUEST, json!("invite_invalid"))
     );
 }

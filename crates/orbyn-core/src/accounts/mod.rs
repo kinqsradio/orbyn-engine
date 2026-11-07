@@ -416,8 +416,9 @@ pub struct Accounts {
     trace: Option<Arc<std::sync::Mutex<Vec<&'static str>>>>,
     /// Where the account site is served, for the cancel link in the deletion email.
     account_url: Option<String>,
-    /// Whether sign-up needs an invite. `Open` unless set, so the services tests build need none;
-    /// the server sets it from `ORBYN_SIGNUP`, which defaults to `invite`.
+    /// Whether sign-up needs an invite. **`Invite` unless set**, so a service built without the
+    /// mode fails closed; the server sets it from `ORBYN_SIGNUP` (also `invite` by default), and a
+    /// test that signs people up asks for `Open`.
     signup: crate::SignupMode,
 }
 
@@ -441,7 +442,7 @@ impl Accounts {
             clock: Clock(Arc::new(|| u64::try_from(unix_now_secs()).unwrap_or(0))),
             trace: None,
             account_url: None,
-            signup: crate::SignupMode::Open,
+            signup: crate::SignupMode::Invite,
         }
     }
 
@@ -454,7 +455,7 @@ impl Accounts {
             clock: Clock(Arc::new(|| u64::try_from(unix_now_secs()).unwrap_or(0))),
             trace: None,
             account_url: None,
-            signup: crate::SignupMode::Open,
+            signup: crate::SignupMode::Invite,
         }
     }
 

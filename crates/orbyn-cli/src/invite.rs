@@ -67,6 +67,15 @@ pub fn label_has_at() -> String {
     )
 }
 
+/// A label of over 100 characters. **Plain text, not designed yet** (TODO-design): the designer
+/// has not written it, and it must not read as the at-sign refusal.
+pub fn label_too_long() -> String {
+    error(
+        &format!("--label must be {} characters or fewer", invites::MAX_LABEL),
+        "Use a shorter note.",
+    )
+}
+
 pub fn no_such_invite(id: &str) -> String {
     error(
         &format!("no invite with id {id}"),
@@ -247,14 +256,18 @@ async fn create(pool: &PgPool, o: CreateOptions) -> Outcome {
     if o.days > MAX_DAYS {
         return Err(days_too_long());
     }
-    if o.label.contains('@') {
+    if invites::label_has_at(&o.label) {
         return Err(label_has_at());
+    }
+    if o.label.trim().chars().count() > invites::MAX_LABEL {
+        return Err(label_too_long());
     }
     match invites::create(pool, o.count, o.days, &o.label).await {
         Ok(made) => Ok(created(&made)),
         Err(InviteError::Count) => Err(count_too_big()),
         Err(InviteError::Days) => Err(days_too_long()),
         Err(InviteError::Label) => Err(label_has_at()),
+        Err(InviteError::LabelTooLong) => Err(label_too_long()),
         Err(other) => Err(failed(other)),
     }
 }
@@ -542,6 +555,44 @@ mod tests {
         .await
         .expect("days");
         assert_eq!(default_days, 14);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs DATABASE_URL"]
+    async fn labels_are_refused_for_an_at_sign_in_any_form_and_for_length_with_their_own_errors() {
+        let pool = pool().await;
+        for at in ["a@b", "x\u{ff20}y", "x\u{fe6b}y"] {
+            assert_eq!(
+                run(&pool, &args(&["create", "--label", at])).await,
+                Err(label_has_at()),
+                "{at:?}"
+            );
+        }
+        // Over 100 characters (counted as characters, not bytes) is its own refusal, never the
+        // at-sign one.
+        let long = "名".repeat(101);
+        assert_eq!(
+            run(&pool, &args(&["create", "--label", &long])).await,
+            Err(label_too_long())
+        );
+        assert_ne!(label_too_long(), label_has_at());
+        let edge = "名".repeat(100);
+        assert!(
+            run(&pool, &args(&["create", "--label", &edge]))
+                .await
+                .is_ok()
+        );
+        // The table refuses the same forms on its own, whatever the code does.
+        for at in ["a@b", "x\u{ff20}y", "x\u{fe6b}y"] {
+            let direct = sqlx::query(
+                "INSERT INTO invites (id, short_id, code_digest, label, expires_at)
+                 VALUES (gen_random_uuid(), 'ffff', decode(repeat('00', 32), 'hex'), $1, now() + interval '1 day')",
+            )
+            .bind(at)
+            .execute(&pool)
+            .await;
+            assert!(direct.is_err(), "{at:?}");
+        }
     }
 
     #[tokio::test]
