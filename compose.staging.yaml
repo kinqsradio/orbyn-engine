@@ -62,8 +62,10 @@ services:
       ORBYN_CLIENT_IP_HEADER: cf-connecting-ip
       # Where the deletion email's cancel link points: the planner serves /cancel-deletion.
       ORBYN_ACCOUNT_URL: https://account-staging.orbyn.dev
-      # Development mode: no mail is sent (see docs/staging.md for what the log then holds).
-      ORBYN_MAIL: log
+      # Staging only: no mail is sent; each address and code is written to the log
+      # (docs/staging.md). Refused unless ORBYN_ENV=staging and ORBYN_SIGNUP=invite.
+      ORBYN_MAIL: log-codes
+      ORBYN_ENV: staging
       # Sign-up needs an invite code from `orbyn invite create`.
       ORBYN_SIGNUP: invite
       ORBYN_LOG: info
@@ -85,7 +87,9 @@ services:
       DATABASE_URL: postgres://orbyn:${POSTGRES_PASSWORD:-}@postgres:5432/orbyn
       ORBYN_AUTH_SETUP: ${ORBYN_AUTH_SETUP:-}
       ORBYN_ACCOUNT_URL: https://account-staging.orbyn.dev
-      ORBYN_MAIL: log
+      ORBYN_MAIL: log-codes
+      ORBYN_ENV: staging
+      ORBYN_SIGNUP: invite
       ORBYN_LOG: info
     depends_on:
       migrate:

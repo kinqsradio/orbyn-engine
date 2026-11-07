@@ -23,10 +23,11 @@ orbyn.dev uses `127.0.0.1:8080` on the same host, which is why these ports diffe
 | `ORBYN_ALLOWED_ORIGINS` | `https://account-staging.orbyn.dev` |
 | `ORBYN_CLIENT_IP_HEADER` | `cf-connecting-ip` (every request comes through the tunnel) |
 | `ORBYN_ACCOUNT_URL` | `https://account-staging.orbyn.dev` |
-| `ORBYN_MAIL` | `log` (no SMTP; nothing is sent) |
+| `ORBYN_MAIL` | `log-codes` (staging only: nothing is sent; each address and code goes to the log) |
+| `ORBYN_ENV` | `staging` |
 | `ORBYN_SIGNUP` | `invite` |
 
-Everything else (`ORBYN_DATABASE_POOL_SIZE`, `ORBYN_PURGE_AFTER_DAYS`, the upload caps) keeps its default. Do not set `ORBYN_SMTP_URL` while `ORBYN_MAIL=log`.
+Everything else (`ORBYN_DATABASE_POOL_SIZE`, `ORBYN_PURGE_AFTER_DAYS`, the upload caps) keeps its default. Do not set `ORBYN_SMTP_URL` while `ORBYN_MAIL=log-codes`.
 
 ## Cloudflare (Anh)
 
@@ -75,19 +76,31 @@ dc run --rm --no-deps server invite list
 
 ### Email codes
 
-With `ORBYN_MAIL=log` the worker sends nothing. It logs only that a message was not sent, with its kind and account: never an address and never a code (architecture.md, Mail). So **the verification code a new sign-up needs is not in the log**, and sign-up cannot finish on staging as configured. This needs a decision before the checklist can pass; see the pull request. Until then:
+With `ORBYN_MAIL=log-codes` the worker sends nothing. Each message's address and code is written to the worker log, with a warning on every line:
 
 ```sh
-dc logs -f worker      # one line per message "not sent": kind and account only
+dc logs -f worker
 ```
+
+The server and the worker refuse to start in this mode (Account Designs, em-ops-log-codes) unless `ORBYN_ENV=staging` and `ORBYN_SIGNUP=invite` are both set. They also refuse if the account URL or the allowed origins name a production host (orbyn.dev, api, account or engineer.orbyn.dev). Never use this mode anywhere else. Plain `log` mode never writes an address or a code.
+
+### Before any tester is invited: real mail
+
+`log-codes` is for our own testing only. **Before the first beta tester gets an invite**, staging (or production) must send real mail as `Orbyn <hello@orbyn.dev>`:
+
+1. **Provider.** Choose an SMTP provider. That decision is made at this step.
+2. **DNS on orbyn.dev, in Cloudflare:**
+   - **SPF:** a TXT record on `orbyn.dev`, `v=spf1 include:<provider's SPF host> -all`. Merge it into any SPF record that already exists; a domain has only one.
+   - **DKIM:** the provider's selector records, CNAME or TXT at `<selector>._domainkey.orbyn.dev`, exactly as the provider gives them.
+   - **DMARC:** a TXT record at `_dmarc.orbyn.dev`, `v=DMARC1; p=quarantine; rua=mailto:hello@orbyn.dev`. Start at `p=quarantine`, and move to `p=reject` once reports are clean.
+3. **Settings.** Set `ORBYN_SMTP_URL` in `.env.staging` (`smtps://user:password@host:465`, or `smtp://…:587?tls=required`). Then remove the `ORBYN_MAIL: log-codes` lines from `compose.staging.yaml` for the server and the worker. With no `ORBYN_MAIL`, the worker sends through `ORBYN_SMTP_URL`.
+4. **Check.** Send a sign-up code to a test address, and check that SPF, DKIM and DMARC all pass in the headers.
 
 ## End-to-end checklist
 
-Steps that need an email code are blocked until the question above is settled.
-
 1. Create an invite (above).
 2. Open `https://account-staging.orbyn.dev`, sign up with the invite.
-3. Enter the email code. (blocked)
+3. Enter the email code from the worker log.
 4. Sign out, sign in.
 5. Pair a second device: approve it from the first with the six digits.
 6. Make a change on one device; it appears on the other (sync).
