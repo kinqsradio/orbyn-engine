@@ -493,6 +493,34 @@ impl Drop for Running {
     }
 }
 
+/// Every run of the binary has a deadline, so a start-up check that is removed fails a test with
+/// a time-out instead of hanging it.
+trait OutputWithin {
+    fn output_within(&mut self) -> std::io::Result<std::process::Output>;
+}
+
+impl OutputWithin for std::process::Command {
+    fn output_within(&mut self) -> std::io::Result<std::process::Output> {
+        let mut child = self
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if child.try_wait()?.is_some() {
+                return child.wait_with_output();
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the binary did not exit within 30 seconds");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
 fn binary() -> std::process::Command {
     std::process::Command::new(env!("CARGO_BIN_EXE_orbyn-witness"))
 }
@@ -547,7 +575,7 @@ async fn the_real_binary_cosigns_over_localhost_and_keeps_its_state_across_a_res
         .arg("keygen")
         .arg("--out")
         .arg(dir.join("key"))
-        .output()
+        .output_within()
         .expect("keygen");
     assert!(made.status.success());
     let printed = String::from_utf8(made.stdout).expect("utf8");
@@ -558,7 +586,7 @@ async fn the_real_binary_cosigns_over_localhost_and_keeps_its_state_across_a_res
         .arg("keygen")
         .arg("--out")
         .arg(dir.join("key"))
-        .output()
+        .output_within()
         .expect("keygen");
     assert!(!again.status.success());
 
@@ -576,7 +604,7 @@ async fn the_real_binary_cosigns_over_localhost_and_keeps_its_state_across_a_res
                 hex(&log_key().verifying_key().to_bytes())
             ),
         ])
-        .output()
+        .output_within()
         .expect("run");
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("no saved state"));
@@ -623,10 +651,13 @@ async fn the_real_binary_cosigns_over_localhost_and_keeps_its_state_across_a_res
     // A bootstrap flag over saved state is refused.
     let port = free_port();
     let mut third = start(&dir, port, &["--bootstrap-empty"]);
+    let mut waited = 0;
     let status = loop {
         if let Some(status) = third.child.try_wait().expect("wait") {
             break status;
         }
+        waited += 1;
+        assert!(waited < 400, "the binary did not exit within 20 seconds");
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
     assert!(!status.success());
@@ -635,10 +666,13 @@ async fn the_real_binary_cosigns_over_localhost_and_keeps_its_state_across_a_res
     std::fs::remove_file(dir.join("state").join("state")).expect("remove state");
     let port = free_port();
     let mut fourth = start(&dir, port, &[]);
+    let mut waited = 0;
     let status = loop {
         if let Some(status) = fourth.child.try_wait().expect("wait") {
             break status;
         }
+        waited += 1;
+        assert!(waited < 400, "the binary did not exit within 20 seconds");
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
     assert!(!status.success());
@@ -661,7 +695,7 @@ fn run_with(dir: &std::path::Path, flags: &[&str]) -> std::process::Output {
             ),
         ])
         .args(flags)
-        .output()
+        .output_within()
         .expect("run")
 }
 
@@ -684,7 +718,7 @@ fn the_binary_says_what_the_designs_say_for_help_and_for_each_start_up_error() {
         (vec!["keygen", "-h"], messages::KEYGEN_HELP),
         (vec!["--bind", "x", "--help"], messages::HELP),
     ] {
-        let output = binary().args(&args).output().expect("help");
+        let output = binary().args(&args).output_within().expect("help");
         assert!(output.status.success(), "{args:?}");
         assert_eq!(
             String::from_utf8(output.stdout).expect("utf8"),
@@ -716,7 +750,7 @@ fn the_binary_says_what_the_designs_say_for_help_and_for_each_start_up_error() {
         .arg("keygen")
         .arg("--out")
         .arg(&key)
-        .output()
+        .output_within()
         .expect("keygen");
     assert_eq!(made.status.code(), Some(0));
     let out = String::from_utf8(made.stdout).expect("utf8");
@@ -725,7 +759,7 @@ fn the_binary_says_what_the_designs_say_for_help_and_for_each_start_up_error() {
         .arg("keygen")
         .arg("--out")
         .arg(&key)
-        .output()
+        .output_within()
         .expect("keygen");
     assert_eq!(
         stderr_of(&again),
@@ -738,7 +772,7 @@ fn the_binary_says_what_the_designs_say_for_help_and_for_each_start_up_error() {
         .arg("--key-file")
         .arg(&missing)
         .args(["--log-keys", "1:00"])
-        .output()
+        .output_within()
         .expect("run");
     assert_eq!(
         stderr_of(&output),
@@ -776,7 +810,7 @@ fn the_binary_says_what_the_designs_say_for_help_and_for_each_start_up_error() {
         .arg("--key-file")
         .arg(&key)
         .args(["--log-keys", "nonsense"])
-        .output()
+        .output_within()
         .expect("run");
     assert_eq!(
         stderr_of(&output),
@@ -788,7 +822,7 @@ fn the_binary_says_what_the_designs_say_for_help_and_for_each_start_up_error() {
         .arg("--key-file")
         .arg(&key)
         .args(["--log-keys", ""])
-        .output()
+        .output_within()
         .expect("run");
     assert_eq!(stderr_of(&output), format!("{}\n", messages::no_log_keys()));
 
@@ -876,7 +910,7 @@ fn the_binary_says_what_the_designs_say_for_help_and_for_each_start_up_error() {
             ),
         ])
         .arg("--bootstrap-empty")
-        .output()
+        .output_within()
         .expect("run");
     assert_eq!(
         stderr_of(&output),
@@ -903,7 +937,7 @@ fn the_binary_says_what_the_designs_say_for_help_and_for_each_start_up_error() {
             ),
         ])
         .arg("--bootstrap-empty")
-        .output()
+        .output_within()
         .expect("run");
     assert_eq!(
         stderr_of(&output),
@@ -968,7 +1002,7 @@ fn the_binary_says_what_the_designs_say_for_help_and_for_each_start_up_error() {
         .arg("keygen")
         .arg("--out")
         .arg(&nowhere)
-        .output()
+        .output_within()
         .expect("keygen");
     assert_eq!(
         stderr_of(&output),
@@ -1012,7 +1046,7 @@ fn the_binary_says_what_the_designs_say_for_help_and_for_each_start_up_error() {
                     ),
                 ])
                 .arg("--bootstrap-empty")
-                .output()
+                .output_within()
                 .expect("run");
             assert_eq!(
                 stderr_of(&output),
@@ -1035,7 +1069,7 @@ fn a_key_file_others_can_read_is_refused_and_a_new_one_is_not() {
         .arg("keygen")
         .arg("--out")
         .arg(&key)
-        .output()
+        .output_within()
         .expect("keygen");
     assert!(made.status.success());
     // keygen makes it readable by its owner only.
@@ -1052,7 +1086,7 @@ fn a_key_file_others_can_read_is_refused_and_a_new_one_is_not() {
             .arg("--key-file")
             .arg(&key)
             .args(["--log-keys", &log_keys])
-            .output()
+            .output_within()
             .expect("run")
     };
     for loose in [0o640, 0o604, 0o644, 0o660] {
@@ -1131,4 +1165,211 @@ async fn an_answer_without_end_is_not_read_past_the_limit_and_a_huge_request_is_
     let witness = serve(51, 60).await;
     let (status, _) = post_raw(&witness, vec![0u8; wire::MAX_REQUEST_BYTES + 1024]).await;
     assert_eq!(status, 413);
+}
+
+// ---- Round 2 of the review ----
+
+/// A witness that records what it is asked, and answers every cosign with a valid cosignature.
+async fn recording_witness(
+    seed: u8,
+) -> (
+    String,
+    [u8; 32],
+    Arc<Mutex<Vec<(bool, Hash)>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    use axum::routing::{get, post};
+    use ed25519_dalek::Signer;
+    let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+    let public = key.verifying_key().to_bytes();
+    let seen: Arc<Mutex<Vec<(bool, Hash)>>> = Arc::default();
+    let log = seen.clone();
+    let app = axum::Router::new()
+        .route(
+            "/v1/cosignature",
+            get(|| async { axum::http::StatusCode::NOT_FOUND }),
+        )
+        .route(
+            "/v1/cosign",
+            post(move |body: axum::body::Bytes| {
+                let (log, key) = (log.clone(), key.clone());
+                async move {
+                    let request = wire::decode_request(&body).expect("a request");
+                    let hash = request.head.hash();
+                    log.lock().expect("lock").push((request.intermediate, hash));
+                    let signature = key
+                        .sign(&orbyn_witness::cosign_message(&hash, T0))
+                        .to_bytes();
+                    let cosignature = orbyn_witness::Cosignature {
+                        head_hash: hash,
+                        time_ms: T0,
+                        signature,
+                    };
+                    cosignature.encode().to_vec()
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("addr"));
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (url, public, seen, task)
+}
+
+#[tokio::test]
+async fn the_target_is_never_flagged_intermediate_and_the_heads_before_it_always_are() {
+    let (url, public, seen, task) = recording_witness(61).await;
+    let client = WitnessClient::new(&url, public, Duration::from_secs(10)).expect("client");
+    let cosigner = Cosigner::new(vec![client], 1).expect("threshold");
+    let chain = Chain::new(30, 10, T0);
+    let target = chain.head(2).clone();
+    let outcome = cosigner.cosign(&chain, &target).await;
+    assert!(outcome.enough, "{:?}", outcome.failures);
+    let seen = seen.lock().expect("lock").clone();
+    assert_eq!(
+        seen,
+        vec![
+            (true, chain.head(0).hash()),
+            (true, chain.head(1).hash()),
+            (false, target.hash()),
+        ],
+        "every head on the way is intermediate; the target never is"
+    );
+    // A chain of one: the target alone is final.
+    let (url, public, seen, task2) = recording_witness(62).await;
+    let client = WitnessClient::new(&url, public, Duration::from_secs(10)).expect("client");
+    let single = Chain::new(10, 10, T0);
+    let outcome = Cosigner::new(vec![client], 1)
+        .expect("threshold")
+        .cosign(&single, single.head(0))
+        .await;
+    assert!(outcome.enough);
+    assert_eq!(
+        seen.lock().expect("lock").as_slice(),
+        [(false, single.head(0).hash())]
+    );
+    task.abort();
+    task2.abort();
+}
+
+#[tokio::test]
+async fn a_flag_byte_other_than_zero_or_one_is_a_bad_request_over_http() {
+    let witness = serve(63, 60).await;
+    let chain = Chain::new(10, 10, T0);
+    let mut body = wire::encode_request(&chain.svc.request(0, 10, [0; 32], T0)).expect("encode");
+    body[1] = 2;
+    let (status, answer) = post_raw(&witness, body).await;
+    assert_eq!(status, 400);
+    let json: serde_json::Value = serde_json::from_slice(&answer).expect("json");
+    assert_eq!(json["reason"], "bad_request");
+    assert_eq!(
+        witness.service.witness().state().size,
+        0,
+        "nothing was accepted"
+    );
+}
+
+#[tokio::test]
+async fn the_fifth_concurrent_cosign_is_turned_away_before_its_body_is_read() {
+    use tokio::io::AsyncWriteExt;
+    let witness = serve(64, 60).await;
+    let address = witness.url.trim_start_matches("http://").to_owned();
+    // Four uploads that have said how long they are and then stop: each holds a permit and waits
+    // for its body.
+    let mut held = Vec::new();
+    for _ in 0..4 {
+        let mut stream = tokio::net::TcpStream::connect(&address)
+            .await
+            .expect("connect");
+        stream
+            .write_all(
+                b"POST /v1/cosign HTTP/1.1\r\nHost: witness\r\nContent-Length: 1000000\r\n\r\n",
+            )
+            .await
+            .expect("headers");
+        held.push(stream);
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    // The fifth, with a whole body, gets 503 `busy`.
+    let (status, answer) = post_raw(&witness, vec![0u8; 100]).await;
+    assert_eq!(status, 503);
+    let json: serde_json::Value = serde_json::from_slice(&answer).expect("json");
+    assert_eq!(json["reason"], "busy");
+    // Once the others go, the witness answers again.
+    drop(held);
+    let mut answered = false;
+    for _ in 0..100 {
+        if post_raw(&witness, vec![0u8; 100]).await.0 != 503 {
+            answered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(answered, "the permits came back");
+}
+
+/// A server that sends `response` to every connection after reading its request, then closes.
+async fn raw_server(response: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("addr"));
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let response = response.clone();
+            tokio::spawn(async move {
+                let mut buffer = [0u8; 1024];
+                let _ = stream.read(&mut buffer).await;
+                let _ = stream.write_all(&response).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    (url, task)
+}
+
+#[tokio::test]
+async fn an_answer_that_streams_past_the_limit_is_cut_off_whatever_it_claims() {
+    let client =
+        |url: &str| WitnessClient::new(url, [1; 32], Duration::from_secs(10)).expect("client");
+    let big = vec![b'x'; 1024 * 1024];
+
+    // No Content-Length, chunked.
+    let mut chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+    for _ in 0..256 {
+        chunked.extend_from_slice(b"1000\r\n");
+        chunked.extend_from_slice(&big[..4096]);
+        chunked.extend_from_slice(b"\r\n");
+    }
+    chunked.extend_from_slice(b"0\r\n\r\n");
+    // No Content-Length, read until the connection closes.
+    let mut until_close = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec();
+    until_close.extend_from_slice(&big);
+    // A Content-Length that is false: far smaller than what follows.
+    let mut understated = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n".to_vec();
+    understated.extend_from_slice(&big);
+    // One that is false the other way: it claims far more than the limit.
+    let mut overstated = b"HTTP/1.1 200 OK\r\nContent-Length: 99999999\r\n\r\n".to_vec();
+    overstated.extend_from_slice(&big[..1000]);
+
+    for (name, response) in [
+        ("chunked", chunked),
+        ("until close", until_close),
+        ("understated", understated),
+        ("overstated", overstated),
+    ] {
+        let (url, task) = raw_server(response).await;
+        let answer = tokio::time::timeout(Duration::from_secs(10), client(&url).newest())
+            .await
+            .unwrap_or_else(|_| panic!("{name}: the client read without end"));
+        assert_eq!(answer, Err(ClientError::Invalid), "{name}");
+        task.abort();
+    }
 }

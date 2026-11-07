@@ -14,7 +14,7 @@ use orbyn_translog::merkle::{Accumulator, empty_root};
 use orbyn_translog::{Hash, UnsignedHead};
 use sha2::{Digest, Sha256};
 
-const MAGIC: &[u8] = b"orbyn/witness-state/v2";
+const MAGIC: &[u8] = b"orbyn/witness-state/v3";
 
 /// The bytes of an encoded head.
 pub const HEAD_LEN: usize = 165;
@@ -40,6 +40,11 @@ pub struct State {
     pub frontier: Vec<Hash>,
     /// The head the rest describes, with its log signature: `None` only at the empty start.
     pub head: Option<SignedHead>,
+    /// The last head accepted **as final** (within the clock's skew when it was asked). The state
+    /// above may stand on a later head accepted only as intermediate, for the chain's linkage; what
+    /// the witness serves as its newest and cosigns again is this one, so a head that was only ever
+    /// an old stop on the way is never presented as current.
+    pub final_head: Option<SignedHead>,
 }
 
 impl State {
@@ -55,6 +60,7 @@ impl State {
             head_time_ms: 0,
             frontier: Vec::new(),
             head: None,
+            final_head: None,
         }
     }
 
@@ -76,12 +82,14 @@ impl State {
         for node in &self.frontier {
             out.extend_from_slice(node);
         }
-        match &self.head {
-            None => out.push(0),
-            Some(signed) => {
-                out.push(1);
-                out.extend_from_slice(&signed.head.encode());
-                out.extend_from_slice(&signed.log_signature);
+        for head in [&self.head, &self.final_head] {
+            match head {
+                None => out.push(0),
+                Some(signed) => {
+                    out.push(1);
+                    out.extend_from_slice(&signed.head.encode());
+                    out.extend_from_slice(&signed.log_signature);
+                }
             }
         }
         let sum = Sha256::digest(&out);
@@ -116,23 +124,26 @@ impl State {
             frontier.push(*h);
             rest = r;
         }
-        let (flag, rest) = rest.split_first().ok_or_else(bad)?;
-        let (head, rest) = match flag {
-            0 => (None, rest),
-            1 => {
-                let (head, rest) = rest.split_at_checked(HEAD_LEN).ok_or_else(bad)?;
-                let (signature, rest) = rest.split_first_chunk::<64>().ok_or_else(bad)?;
-                let head = UnsignedHead::decode(head).ok_or_else(bad)?;
-                (
+        let mut rest = rest;
+        let mut heads = [None, None];
+        for slot in &mut heads {
+            let (flag, after) = rest.split_first().ok_or_else(bad)?;
+            rest = after;
+            *slot = match flag {
+                0 => None,
+                1 => {
+                    let (head, after) = rest.split_at_checked(HEAD_LEN).ok_or_else(bad)?;
+                    let (signature, after) = after.split_first_chunk::<64>().ok_or_else(bad)?;
+                    rest = after;
                     Some(SignedHead {
-                        head,
+                        head: UnsignedHead::decode(head).ok_or_else(bad)?,
                         log_signature: *signature,
-                    }),
-                    rest,
-                )
-            }
-            _ => return Err(bad()),
-        };
+                    })
+                }
+                _ => return Err(bad()),
+            };
+        }
+        let [head, final_head] = heads;
         if !rest.is_empty() {
             return Err(bad());
         }
@@ -145,7 +156,14 @@ impl State {
             head_time_ms: u64::from_be_bytes(*time),
             frontier,
             head,
+            final_head,
         };
+        // A final head is never newer than the head the state stands on.
+        if let Some(final_head) = &state.final_head {
+            if final_head.head.size > state.size || final_head.head.time_ms > state.head_time_ms {
+                return Err(bad());
+            }
+        }
         // The head the state keeps is the head it describes, field for field.
         match &state.head {
             None => {

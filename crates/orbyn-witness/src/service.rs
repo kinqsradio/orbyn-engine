@@ -74,7 +74,7 @@ pub struct Service<S: StateStore, C: Clock> {
     witness: Witness<S, C>,
     reads: Mutex<HashMap<Block, VecDeque<Instant>>>,
     newest_per_hour: usize,
-    cosigns: Semaphore,
+    cosigns: Arc<Semaphore>,
 }
 
 impl<S, C> Service<S, C>
@@ -87,7 +87,7 @@ where
             witness,
             reads: Mutex::new(HashMap::new()),
             newest_per_hour,
-            cosigns: Semaphore::new(MAX_COSIGNS),
+            cosigns: Arc::new(Semaphore::new(MAX_COSIGNS)),
         }
     }
 
@@ -152,11 +152,28 @@ where
     /// request may be at most [`wire::MAX_REQUEST_BYTES`] and take at most a minute to arrive and
     /// be checked.
     pub fn router(self: Arc<Self>) -> Router {
+        // The permit is taken by the outermost layer, **before the body is read**: a request that
+        // cannot have one is turned away without a byte of its body buffered, so the most that is
+        // ever held is [`MAX_COSIGNS`] bodies.
+        let permits = self.cosigns.clone();
         let cosign_route = Router::new()
             .route("/v1/cosign", post(cosign::<S, C>))
             .layer(DefaultBodyLimit::max(wire::MAX_REQUEST_BYTES))
             .layer(middleware::from_fn(|req: Request, next: Next| async move {
                 within(COSIGN_TIMEOUT, req, next).await
+            }))
+            .layer(middleware::from_fn(move |req: Request, next: Next| {
+                let permits = permits.clone();
+                async move {
+                    match permits.try_acquire_owned() {
+                        Ok(_permit) => next.run(req).await,
+                        Err(_) => refused(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "busy",
+                            "the witness is busy; try again",
+                        ),
+                    }
+                }
             }));
         let read_route = Router::new()
             .route("/v1/cosignature", get(newest::<S, C>))
@@ -200,13 +217,6 @@ where
     S: StateStore + Send + Sync + 'static,
     C: Clock + Send + Sync + 'static,
 {
-    let Ok(_permit) = service.cosigns.try_acquire() else {
-        return refused(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "busy",
-            "the witness is busy; try again",
-        );
-    };
     let request = match wire::decode_request(&body) {
         Ok(request) => request,
         Err(_) => {

@@ -290,7 +290,11 @@ impl<S: StateStore, C: Clock> Witness<S, C> {
         if store.load()?.is_some() {
             return Err(StartError::AlreadyStarted);
         }
-        let state = replay(entries, pinned, &config)?;
+        let mut state = replay(entries, pinned, &config)?;
+        // A pinned head counts as final only if it is within the skew of this clock now.
+        if pinned.head.time_ms.abs_diff(clock.now_ms()) > config.max_skew_ms {
+            state.final_head = None;
+        }
         store.save(&state)?;
         Ok(Self {
             key,
@@ -325,31 +329,34 @@ impl<S: StateStore, C: Clock> Witness<S, C> {
         }
     }
 
-    /// Signs the last head cosigned again, with this witness's time now: **the witness's own
-    /// schedule**. A log that is idle, or whose key service has gone quiet, still shows a fresh
-    /// cosignature of the newest head the witness knows, so a device can tell a key service that
-    /// is withholding from one that is simply between heads. It changes no state, and is `None`
-    /// before the first head.
+    /// Signs the last head accepted **as final** again, with this witness's time now: **the
+    /// witness's own schedule**. A log that is idle, or whose key service has gone quiet, still
+    /// shows a fresh cosignature of the newest head the witness knows, so a device can tell a key
+    /// service that is withholding from one that is simply between heads. It changes no state.
+    /// A head accepted only as intermediate (an old stop on a catch-up) is never re-cosigned: with
+    /// none final yet, this is `None`.
     pub fn recosign_latest(&self) -> Option<Cosignature> {
         let state = self.lock();
-        let cosignature = (state.head_hash != [0; 32])
-            .then(|| self.sign(state.head_hash, self.clock.now_ms()))?;
+        let hash = state.final_head.as_ref()?.head.hash();
+        let cosignature = self.sign(hash, self.clock.now_ms());
         *self.last_cosignature() = Some(cosignature.clone());
         Some(cosignature)
     }
 
-    /// The newest head this witness cosigned, as it is saved: the head, the log key's signature,
-    /// and **this witness's own newest cosignature** of it. Read from the state itself under its
-    /// lock, so it is never a head the saved state does not end on. `None` before the first head.
+    /// The newest head this witness accepted **as final**, as it is saved: the head, the log key's
+    /// signature, and **this witness's own newest cosignature** of it. Read from the state itself
+    /// under its lock. A head accepted only as intermediate is kept for the chain's linkage and is
+    /// never served here. `None` before the first final head.
     pub fn newest(&self) -> Option<(SignedHead, Cosignature)> {
         let state = self.lock();
-        let signed = state.head.clone()?;
+        let signed = state.final_head.clone()?;
+        let hash = signed.head.hash();
         let mut last = self.last_cosignature();
         // After a restart there is none yet: sign the saved head with the time now.
         let cosignature = match last.as_ref() {
-            Some(c) if c.head_hash == state.head_hash => c.clone(),
+            Some(c) if c.head_hash == hash => c.clone(),
             _ => {
-                let fresh = self.sign(state.head_hash, self.clock.now_ms());
+                let fresh = self.sign(hash, self.clock.now_ms());
                 *last = Some(fresh.clone());
                 fresh
             }
@@ -424,8 +431,20 @@ impl<S: StateStore, C: Clock> Witness<S, C> {
             && head.service_map_root == state.service_map_root
             && head.identity_map_root == state.identity_map_root
         {
+            // Asked again as a final head, and within the skew (checked above): it is final now.
+            // That is a change of the saved state, so it is saved before it is answered.
+            let promoted = !request.intermediate
+                && state.final_head.as_ref().map(|f| f.head.hash()) != Some(state.head_hash);
+            if promoted {
+                let mut next = state.clone();
+                next.final_head = next.head.clone();
+                self.store.save(&next)?;
+                *state = next;
+            }
             let cosignature = self.sign(state.head_hash, now);
-            *self.last_cosignature() = Some(cosignature.clone());
+            if !request.intermediate {
+                *self.last_cosignature() = Some(cosignature.clone());
+            }
             return Ok(cosignature);
         }
         if head.size < state.size {
@@ -509,12 +528,18 @@ impl<S: StateStore, C: Clock> Witness<S, C> {
             head: head.clone(),
             log_signature: request.log_signature,
         });
+        // Only a head accepted as final becomes what the witness serves and cosigns again.
+        if !request.intermediate {
+            next.final_head = next.head.clone();
+        }
 
         // Durable before it is answered.
         self.store.save(&next)?;
         *state = next;
         let cosignature = self.sign(head.hash(), now);
-        *self.last_cosignature() = Some(cosignature.clone());
+        if !request.intermediate {
+            *self.last_cosignature() = Some(cosignature.clone());
+        }
         Ok(cosignature)
     }
 }
@@ -608,6 +633,10 @@ fn replay(entries: &[Entry], pinned: &PinnedHead, config: &Config) -> Result<Sta
         head_time_ms: head.time_ms,
         frontier: accumulator.frontier().to_vec(),
         head: Some(SignedHead {
+            head: head.clone(),
+            log_signature: pinned.log_signature,
+        }),
+        final_head: Some(SignedHead {
             head: head.clone(),
             log_signature: pinned.log_signature,
         }),

@@ -789,3 +789,74 @@ fn a_head_signed_by_the_key_service_is_cosigned() {
         19 + 32 + 8
     );
 }
+
+#[test]
+fn a_head_accepted_only_as_intermediate_is_never_served_or_cosigned_again() {
+    let public = log_key().verifying_key().to_bytes();
+    let (w, _, clock) = test_witness(7, vec![(LOG_VERSION, public)], T0).expect("witness");
+    let mut svc = Svc::new();
+    svc.fill(30);
+    // The witness's clock is a day on from a single old head, which it accepts as intermediate
+    // (it may be old: the witness was away).
+    let day = 24 * 60 * 60 * 1000;
+    clock.set(T0 + day);
+    let mut old = svc.request(0, 10, [0; 32], T0);
+    old.intermediate = true;
+    w.cosign(&old).expect("accepted on the way");
+    assert_eq!(w.state().size, 10, "kept for the chain's linkage");
+    assert!(w.newest().is_none(), "never served as newest");
+    assert!(
+        w.recosign_latest().is_none(),
+        "never cosigned again on the schedule"
+    );
+    // Asking for the same old head again as a final head is refused: it is a day old.
+    let mut as_final = old.clone();
+    as_final.intermediate = false;
+    assert_eq!(refused(w.cosign(&as_final)).reason, Reason::ClockSkew);
+    assert!(w.newest().is_none());
+
+    // A final head near the clock is the newest, and a later intermediate does not replace it.
+    let mut last = svc.request(10, 20, old.head.hash(), T0 + day);
+    last.intermediate = false;
+    w.cosign(&last).expect("final");
+    let (signed, cosignature) = w.newest().expect("newest");
+    assert_eq!(signed.head, last.head);
+    assert_eq!(cosignature.head_hash, last.head.hash());
+    let mut next = svc.request(20, 30, last.head.hash(), T0 + day + 1000);
+    next.intermediate = true;
+    w.cosign(&next).expect("another stop");
+    assert_eq!(w.state().size, 30);
+    let (signed, _) = w.newest().expect("still the final one");
+    assert_eq!(
+        signed.head, last.head,
+        "the intermediate head is not served"
+    );
+    assert_eq!(
+        w.recosign_latest().expect("recosigned").head_hash,
+        last.head.hash()
+    );
+    // Asked again as final, within the skew, the head on the chain becomes the final one.
+    let mut promote = next.clone();
+    promote.intermediate = false;
+    w.cosign(&promote).expect("now final");
+    assert_eq!(w.newest().expect("newest").0.head, next.head);
+}
+
+#[test]
+fn the_intermediate_flag_byte_is_zero_or_one_and_nothing_else() {
+    use orbyn_witness::wire::{decode_request, encode_request};
+    let mut svc = Svc::new();
+    svc.fill(5);
+    let mut request = svc.request(0, 5, [0; 32], T0);
+    for flag in [false, true] {
+        request.intermediate = flag;
+        let bytes = encode_request(&request).expect("encode");
+        assert_eq!(bytes[1], u8::from(flag));
+        assert_eq!(decode_request(&bytes).expect("decode"), request);
+    }
+    let mut bytes = encode_request(&request).expect("encode");
+    for bad in [2u8, 3, 0x80, 255] {
+        bytes[1] = bad;
+        assert!(decode_request(&bytes).is_err(), "flag {bad}");
+    }
+}
