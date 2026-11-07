@@ -84,19 +84,24 @@ It does not trust its own rows for time. A recovery's 72 hours are measured from
 - **Service identity.** Ed25519 keys generated in the HSM, never extractable, each with a version.
   - **Pinning.** Client configuration pins a set of identity public keys per deployment, so one can be added before an old one is retired.
   - **What they sign:**
-    - account service keys (`orbyn/service-key/v1`: identity version, account id, X25519 public key);
+    - account service keys (`orbyn/service-key/v1`: identity version, account id, P-256 public key);
     - transparency-log heads;
     - recovery approvals.
   - **Certification.** The key service signs a service key only one it generated inside the HSM in the same call. It has no API that takes a key to sign.
-- **Account service key.** One X25519 pair per Standard account, generated in the HSM when the account first signs Standard.
+- **Account service key.** One **P-256** pair per Standard account, generated in the HSM when the account first signs Standard.
+  - **Why P-256 and not X25519**, which devices use between themselves: ECDH on P-256 (CKM_ECDH1_DERIVE) is what HSMs and cloud KMS services widely support. SoftHSM 2.6.1 has no Montgomery keys at all, which was checked on 7 November 2026: X25519 key generation answers CKR_MECHANISM_INVALID, and P-256 derive works. With X25519 the private key would have to leave the HSM to be used. P-256 keeps it inside on every HSM we would run.
   - The private key leaves the HSM only wrapped under the key-encryption key (CKM_AES_KEY_WRAP_KWP), stored in the key service's schema.
   - To open envelopes, it is unwrapped back into the HSM as a non-extractable session object and destroyed afterwards.
-- **Service envelopes.** These use the device envelope format (`orbyn_crypto::wrap_key`) with the service public key as the recipient and the same label (`orbyn/zone-key/v1`, account, zone, key id).
+- **Service envelopes.** These are the device envelope format with a P-256 recipient: `orbyn_crypto::wrap_key_p256`.
+  - The sender makes a one-time P-256 key, does ECDH with the service public key, and runs HKDF-SHA256 over the shared secret and both public keys (SEC1 compressed), bound to the same label (`orbyn/zone-key/v1`, account, zone, key id).
+  - It seals with XChaCha20-Poly1305 and signs with the device's Ed25519 key, as device envelopes are.
+  - The envelope starts with a format byte (`2` = P-256 recipient), so it can never be read as a device envelope.
+  - The P-256 code is the RustCrypto `p256` crate (Apache-2.0 or MIT), and it runs in wasm as well. It sits beside the existing crypto in `orbyn-crypto` and falls under the same outside review.
   - `key_envelopes` gains a recipient kind, `device` or `service`.
   - The 5000-envelope cap and the replace-on-retry rule apply per recipient.
 - **Opening one.**
-  - **Preferred:** CKM_ECDH1_DERIVE, then CKM_HKDF_DERIVE (PKCS#11 3.0), all inside the HSM. Only the unwrapped zone key leaves the HSM.
-  - **Fallback**, where the HSM lacks HKDF: the shared secret is extractable, and the key service opens one envelope at a time, seals it to the recovered device and zeroes it before the next.
+  - **Preferred:** CKM_ECDH1_DERIVE on the P-256 key, then CKM_HKDF_DERIVE (PKCS#11 3.0), all inside the HSM. Only the unwrapped zone key leaves the HSM.
+  - **Fallback**, where the HSM lacks HKDF, SoftHSM included: the derived shared secret is extractable, and the key service runs HKDF in memory. It opens one envelope at a time, seals it to the recovered device and zeroes it before the next. The service's private key stays in the HSM either way.
   - **Never** are all of an account's zone keys in memory at once.
 
 ### Rotation
@@ -217,7 +222,7 @@ A cancel is a statement signed by a device (`orbyn/recovery-cancel/v1`: account,
   Devices ask for their account's lookup proof. It proves the full chain for the account, or proves there is none, so "nothing for your account" can be checked, not just asserted.
 - **The map key.** It is `SHA-256(orbyn/log-account/v1 ‖ the account's certified service public key)`. The key service computes it from the service key it holds for the account id, so neither the record server nor anyone else chooses where an entry is filed. A device computes the same value from the service key it verified. The map does not list accounts by id, but anyone who holds an account's service public key can look it up, and that key is given only to the account's own sessions.
 - **Rotating an account's service key.**
-  - **Who can start it.** Only a request signed by a trusted device of the account (`orbyn/service-key-rotate/v1`), for example after a suspected leak. Identity and KEK rotations keep the X25519 key, so they do not move the map key.
+  - **Who can start it.** Only a request signed by a trusted device of the account (`orbyn/service-key-rotate/v1`), for example after a suspected leak. Identity and KEK rotations keep the P-256 key, so they do not move the map key.
   - **The link between chains.** The old chain's last entry names the new key, and the new chain's first entry links back to the old one.
   - **Devices follow the link.** They watch both chains, and alert on any rotation they did not ask for.
 - **Signed heads.** Heads carry the time, the log size and root, and the map root. They are signed by a **log key** kept apart from the service identities, then **cosigned by at least one independent witness**. A witness checks consistency with the last head it signed and refuses to sign a fork.
@@ -260,7 +265,7 @@ A cancel is a statement signed by a device (`orbyn/recovery-cancel/v1`: account,
 
 - **PKCS#11** through the `cryptoki` crate (Apache-2.0 or MIT).
   - Production: a cloud HSM with a PKCS#11 library. The provider is an open decision.
-  - Development, CI and self-hosting: SoftHSM 2.6 or later. Its Curve25519 support is believed to cover X25519 derive (CKK_EC_MONTGOMERY); step 3 confirms this with a test before relying on it. SoftHSM has no CKM_HKDF_DERIVE, so these use the one-at-a-time fallback.
+  - Development, CI and self-hosting: SoftHSM 2.6 or later. It does P-256 ECDH and Ed25519 signing (for the identity keys); it has no CKM_HKDF_DERIVE, so these use the one-at-a-time fallback.
 - **Configuration:**
   - `ORBYN_HSM_MODULE`, `ORBYN_HSM_SLOT`, `ORBYN_HSM_PIN` (a secret);
   - the key service URL and mutual TLS settings, in `orbyn-server`;
