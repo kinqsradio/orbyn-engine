@@ -4,9 +4,9 @@
 //! insertion order gives the same root. A node is one of
 //!
 //! - empty: `SHA256("orbyn/map/v1/empty")`, only ever the root of an empty map;
-//! - a leaf: `SHA256(0x00 ‖ key ‖ value)`;
+//! - a leaf: `SHA256(0x02 ‖ key ‖ value)`;
 //! - a branch at bit `i` (the first bit where the keys below it differ, counted from the most
-//!   significant bit of the first byte): `SHA256(0x01 ‖ i as u16 big endian ‖ left ‖ right)`,
+//!   significant bit of the first byte): `SHA256(0x03 ‖ i as u16 big endian ‖ left ‖ right)`,
 //!   where `left` holds the keys with bit `i` clear.
 //!
 //! A [`Proof`] is the walk from the root along the lookup key's own bits: the branch indices and
@@ -14,6 +14,9 @@
 //! that leaf holds the key the proof shows membership; if it holds another key it shows the key is
 //! absent. One verifier, [`verify`], answers both, and the answer comes from the proof, so a proof
 //! cannot be read as the opposite of what it shows.
+//!
+//! The tags 0x02 and 0x03 are not the RFC 9162 log's 0x00 and 0x01, so no map hash can equal a log
+//! leaf or node hash, and the empty root is not the log's empty root.
 //!
 //! So a proof has three forms, told apart by its end alone:
 //!
@@ -26,6 +29,13 @@
 //! Why a non-membership proof is sound: every key in the map sits at the leaf its own bits reach.
 //! The verifier checks the end leaf agrees with the lookup key on every branch bit of the walk, so
 //! the walk for the lookup key ends at that same leaf; if the key were in the map it would be there.
+//!
+//! **Assumption: the root was built by [`update`] or [`Map`] from the empty map.** Soundness rests on
+//! the radix invariant that every key sits at the leaf its own bits reach, and only those two keep
+//! it. A hand-built root can break it (a key on the wrong side of a branch, say), and then
+//! [`verify`] can show a present key absent. So a verifier must never take a map root from an
+//! operator: it starts from [`map_empty_root`] and applies entries with [`update`], or replays the
+//! whole map from the log.
 //!
 //! [`update`] is what a witness replays: given the stored root and the proof for a key as the map
 //! stood, it checks the proof and returns the root after setting that key. It uses no stored nodes.
@@ -60,23 +70,23 @@ pub enum MapError {
 type Result<T> = std::result::Result<T, MapError>;
 
 /// The root of an empty map.
-pub fn empty_root() -> Hash {
+pub fn map_empty_root() -> Hash {
     Sha256::digest(b"orbyn/map/v1/empty").into()
 }
 
 /// The hash of a leaf.
-pub fn leaf_hash(key: &Key, value: &Hash) -> Hash {
+pub fn map_leaf_hash(key: &Key, value: &Hash) -> Hash {
     let mut h = Sha256::new();
-    h.update([0x00]);
+    h.update([0x02]);
     h.update(key);
     h.update(value);
     h.finalize().into()
 }
 
 /// The hash of a branch at bit `index`.
-pub fn branch_hash(index: u16, left: &Hash, right: &Hash) -> Hash {
+pub fn map_branch_hash(index: u16, left: &Hash, right: &Hash) -> Hash {
     let mut h = Sha256::new();
-    h.update([0x01]);
+    h.update([0x03]);
     h.update(index.to_be_bytes());
     h.update(left);
     h.update(right);
@@ -129,8 +139,14 @@ pub struct Proof {
 impl Proof {
     /// The canonical bytes: the step count (u16 big endian), each step as its index (u16 big
     /// endian) and sibling, then `0x00` for an empty map or `0x01 ‖ key ‖ value` for a leaf.
-    pub fn encode(&self) -> Vec<u8> {
-        let count = u16::try_from(self.steps.len()).expect("a proof has at most 256 steps");
+    ///
+    /// A proof is at most 256 steps (indices strictly increase below 256), which is what
+    /// [`Proof::decode`] accepts; one with more is [`MapError::BadProof`], not a panic.
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        if self.steps.len() > KEY_BITS {
+            return Err(MapError::BadProof);
+        }
+        let count = u16::try_from(self.steps.len()).map_err(|_| MapError::BadProof)?;
         let mut out = Vec::with_capacity(2 + self.steps.len() * STEP_LEN + 65);
         out.extend_from_slice(&count.to_be_bytes());
         for s in &self.steps {
@@ -145,7 +161,7 @@ impl Proof {
                 out.extend_from_slice(value);
             }
         }
-        out
+        Ok(out)
     }
 
     /// Reads canonical bytes. It rejects trailing bytes, an unknown end tag, more than 256 steps,
@@ -169,7 +185,8 @@ impl Proof {
         let (tag, rest) = rest.split_first().ok_or(MapError::Encoding)?;
         let end = match tag {
             0x00 => {
-                if !rest.is_empty() {
+                // An empty map has no branches to walk.
+                if !rest.is_empty() || !steps.is_empty() {
                     return Err(MapError::Encoding);
                 }
                 End::Empty
@@ -208,9 +225,9 @@ fn check_indices(steps: &[Step]) -> Result<()> {
 fn fold(key: &Key, mut node: Hash, steps: &[Step]) -> Hash {
     for s in steps.iter().rev() {
         node = if bit(key, usize::from(s.index)) {
-            branch_hash(s.index, &s.sibling, &node)
+            map_branch_hash(s.index, &s.sibling, &node)
         } else {
-            branch_hash(s.index, &node, &s.sibling)
+            map_branch_hash(s.index, &node, &s.sibling)
         };
     }
     node
@@ -227,7 +244,7 @@ pub fn verify(root: &Hash, key: &Key, proof: &Proof) -> Result<Lookup> {
             if !proof.steps.is_empty() {
                 return Err(MapError::BadProof);
             }
-            (empty_root(), Lookup::Absent)
+            (map_empty_root(), Lookup::Absent)
         }
         End::Leaf { key: found, value } => {
             if proof
@@ -242,7 +259,7 @@ pub fn verify(root: &Hash, key: &Key, proof: &Proof) -> Result<Lookup> {
             } else {
                 Lookup::Absent
             };
-            (leaf_hash(found, value), lookup)
+            (map_leaf_hash(found, value), lookup)
         }
     };
     if fold(key, start, &proof.steps) == *root {
@@ -256,7 +273,7 @@ pub fn verify(root: &Hash, key: &Key, proof: &Proof) -> Result<Lookup> {
 /// `root`. The proof is verified first; a bad one is an error and no root comes out.
 pub fn update(root: &Hash, key: &Key, value: &Hash, proof: &Proof) -> Result<Hash> {
     let lookup = verify(root, key, proof)?;
-    let new_leaf = leaf_hash(key, value);
+    let new_leaf = map_leaf_hash(key, value);
     match (&proof.end, lookup) {
         // The key is already there: only its leaf changes.
         (_, Lookup::Present(_)) => Ok(fold(key, new_leaf, &proof.steps)),
@@ -278,12 +295,16 @@ pub fn update(root: &Hash, key: &Key, value: &Hash, proof: &Proof) -> Result<Has
                 .iter()
                 .take_while(|s| usize::from(s.index) < j)
                 .count();
-            let below = fold(found, leaf_hash(found, found_value), &proof.steps[above..]);
+            let below = fold(
+                found,
+                map_leaf_hash(found, found_value),
+                &proof.steps[above..],
+            );
             let index = u16::try_from(j).expect("below 256");
             let joined = if bit(key, j) {
-                branch_hash(index, &below, &new_leaf)
+                map_branch_hash(index, &below, &new_leaf)
             } else {
-                branch_hash(index, &new_leaf, &below)
+                map_branch_hash(index, &new_leaf, &below)
             };
             Ok(fold(key, joined, &proof.steps[..above]))
         }
@@ -362,12 +383,12 @@ fn split_range(range: &[(Key, Hash)]) -> (usize, usize) {
 
 fn node(range: &[(Key, Hash)]) -> Hash {
     match range {
-        [] => empty_root(),
-        [(key, value)] => leaf_hash(key, value),
+        [] => map_empty_root(),
+        [(key, value)] => map_leaf_hash(key, value),
         _ => {
             let (index, split) = split_range(range);
             let (left, right) = range.split_at(split);
-            branch_hash(
+            map_branch_hash(
                 u16::try_from(index).expect("below 256"),
                 &node(left),
                 &node(right),
@@ -461,31 +482,31 @@ mod tests {
     #[test]
     fn fixed_vector() {
         assert_eq!(
-            empty_root(),
+            map_empty_root(),
             hex32("bcdac63aafde247a6c23038ff603fad48a938b080694a5f8c102aa1407932aeb")
         );
-        assert_eq!(Map::new().root(), empty_root());
+        assert_eq!(Map::new().root(), map_empty_root());
         let mut m = Map::new();
         let expected = [
             (
                 A(),
                 "a",
-                "632865a79ca8922e149d78cf7a30187bbed87e2363ee88b7b39984dad1aadb46",
+                "711f8dfc6c2b58dc4b3743e5aaae634dda71017ed8de3eee263b6acd8ff9d925",
             ),
             (
                 B(),
                 "b",
-                "b434b432aa0d745c822f0b29f46bbbe0d79e923b692b99f4057157c5ea527a1d",
+                "78c886883ab091dfe1ec3283075e221e60ee6278002341e801631eae1e851fb2",
             ),
             (
                 C(),
                 "c",
-                "765a9054c86988fc94d10569630982ab8a09805788fc68bb9c96756b55ff313c",
+                "545b693e710a32833139d3319cc9cb737ff9ce0687d3893af262506e08d9e873",
             ),
             (
                 D(),
                 "d",
-                "9761f7a0ede140a941d0b3996bba9ff9e5be6b29b612050cdbbaf341b25cb91e",
+                "9c88344f2ee76c0d8f24d890be8cda5e300df92d4fd8efa6398456aef8344311",
             ),
         ];
         for (k, v, root) in expected {
@@ -494,11 +515,11 @@ mod tests {
         }
         // The non-membership proof for E, byte for byte, and the root after setting it.
         let proof = m.prove(&E());
-        let bytes = "0003000020f98f115c04bcdf2d7c956afcbccfc4a77f161fc601609d5e933a19ba131116000100c4358c7ad185c2f284bfc4e00473433dc15c340c51e92dbe2068570b10562d00ff253ab41a6e2c63638a7aa2086af2abe5c1521e505004c7eeab6c584da251e624010000000000000000000000000000000000000000000000000000000000000000ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb";
-        assert_eq!(proof.encode(), hex(bytes));
+        let bytes = "0003000014b068431632c5ad85b1b134269c8d624a3af2a1acaad54501d144d1ef3dd0220001ce339a71e6a0f7226420108dcb43ffae3e136c7742c700011b9c42ccb919264900ff047e7156a34881ef6f857ea00ad016925a41a485d1277d514dd4d6db3cf637a8010000000000000000000000000000000000000000000000000000000000000000ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb";
+        assert_eq!(proof.encode().unwrap(), hex(bytes));
         assert_eq!(Proof::decode(&hex(bytes)).unwrap(), proof);
         assert_eq!(verify(&m.root(), &E(), &proof), Ok(Lookup::Absent));
-        let five = "65fb61571d9142f502c552c7a9970cc784786cce17fcf6dad36fff0def4059a9";
+        let five = "0cf02a1c2571f9785f375d54f8be4ff76bbf0beb026e0b385773b629f90d56e8";
         assert_eq!(update(&m.root(), &E(), &h("e"), &proof), Ok(hex32(five)));
         m.insert(E(), h("e"));
         assert_eq!(m.root(), hex32(five));
@@ -524,7 +545,7 @@ mod tests {
         assert_eq!(verify(&one.root(), &A(), &p), Err(MapError::RootMismatch));
         // The first insert: the new root is the leaf.
         assert_eq!(update(&m.root(), &A(), &h("a"), &p), Ok(one.root()));
-        assert_eq!(one.root(), leaf_hash(&A(), &h("a")));
+        assert_eq!(one.root(), map_leaf_hash(&A(), &h("a")));
         let p = one.prove(&A());
         assert_eq!(p.steps.len(), 0);
         assert_eq!(verify(&one.root(), &A(), &p), Ok(Lookup::Present(h("a"))));
@@ -571,7 +592,7 @@ mod tests {
                 };
                 assert_eq!(was, plain.get(&k).copied());
                 let predicted = update(&before, &k, &v, &proof).unwrap();
-                assert_eq!(Proof::decode(&proof.encode()).unwrap(), proof);
+                assert_eq!(Proof::decode(&proof.encode().unwrap()).unwrap(), proof);
 
                 m.insert(k, v);
                 plain.insert(k, v);
@@ -754,7 +775,7 @@ mod tests {
             verify(&root, &[0u8; 32], &proof),
             Ok(Lookup::Present(h("zero")))
         );
-        let bytes = proof.encode();
+        let bytes = proof.encode().unwrap();
         assert_eq!(bytes.len(), 2 + 256 * 34 + 65);
         assert_eq!(Proof::decode(&bytes).unwrap(), proof);
         // Updating through the longest path agrees with the map.
@@ -818,7 +839,7 @@ mod tests {
         for seed in 1..=30u64 {
             let mut rng = Rng(seed.wrapping_mul(0xD1B5_4A32_D192_ED03));
             let mut server = Map::new();
-            let mut witness_root = empty_root();
+            let mut witness_root = map_empty_root();
             let mut plain: BTreeMap<Key, Hash> = BTreeMap::new();
             let mut pool: Vec<Key> = Vec::new();
             for batch in 0..6 {
@@ -834,7 +855,7 @@ mod tests {
                 }
                 let mut paths = Vec::new();
                 for (k, v) in &entries {
-                    paths.push(server.prove(k).encode()); // the path as the map stands before this entry
+                    paths.push(server.prove(k).encode().unwrap()); // the path as the map stands before this entry
                     server.insert(*k, *v);
                     pool.push(*k);
                 }
@@ -853,9 +874,100 @@ mod tests {
         }
     }
 
+    /// {A, K} differ first at bit 0 and agree at bit 7. A proof for K relabelled from index 0 to 7,
+    /// with A as the end leaf and K's own leaf as the sibling, folds to the right root when the
+    /// index is left out of the hash, and would show K, which is present, as absent.
+    #[test]
+    fn the_branch_index_is_committed_to() {
+        let (a, k) = (A(), B());
+        let (leaf_a, leaf_k) = (map_leaf_hash(&a, &h("a")), map_leaf_hash(&k, &h("b")));
+        let m = map_of(&[(a, "a"), (k, "b")]);
+        let root = m.root();
+        assert_eq!(root, map_branch_hash(0, &leaf_a, &leaf_k));
+        assert_ne!(root, map_branch_hash(7, &leaf_a, &leaf_k));
+        let honest = m.prove(&k);
+        assert_eq!(verify(&root, &k, &honest), Ok(Lookup::Present(h("b"))));
+
+        let forged = Proof {
+            steps: vec![Step {
+                index: 7,
+                sibling: leaf_k,
+            }],
+            end: End::Leaf {
+                key: a,
+                value: h("a"),
+            },
+        };
+        // It is well formed: A and K agree at bit 7, so only the hash can refuse it.
+        assert_eq!(bit(&a, 7), bit(&k, 7));
+        assert_eq!(verify(&root, &k, &forged), Err(MapError::RootMismatch));
+        let mut relabelled = honest.clone();
+        relabelled.steps[0].index = 7;
+        assert!(verify(&root, &k, &relabelled).is_err());
+    }
+
+    /// The assumption in the module docs, pinned: a root nobody built with `update` can put a key
+    /// on the wrong side, and then a present key is shown absent. A witness must never take a root
+    /// from an operator.
+    #[test]
+    fn a_root_not_built_by_update_breaks_the_assumption() {
+        let (a, k) = (A(), B());
+        let hand_built =
+            map_branch_hash(7, &map_leaf_hash(&a, &h("a")), &map_leaf_hash(&k, &h("b")));
+        let proof = Proof {
+            steps: vec![Step {
+                index: 7,
+                sibling: map_leaf_hash(&k, &h("b")),
+            }],
+            end: End::Leaf {
+                key: a,
+                value: h("a"),
+            },
+        };
+        assert_eq!(verify(&hand_built, &k, &proof), Ok(Lookup::Absent));
+        // The map never builds that shape, whatever the order of inserts.
+        assert_ne!(map_of(&[(a, "a"), (k, "b")]).root(), hand_built);
+        assert_ne!(map_of(&[(k, "b"), (a, "a")]).root(), hand_built);
+    }
+
+    /// No map hash can equal a log hash: the tags differ.
+    #[test]
+    fn map_hashes_are_not_log_hashes() {
+        let (k, v) = (A(), h("a"));
+        assert_ne!(map_empty_root(), crate::merkle::empty_root());
+        assert_ne!(
+            map_leaf_hash(&k, &v),
+            crate::merkle::leaf_hash(&[k, v].concat())
+        );
+        assert_ne!(map_branch_hash(0, &k, &v), crate::merkle::node_hash(&k, &v));
+        // The leaf and branch of the map differ from each other too, over the same bytes.
+        assert_ne!(
+            map_leaf_hash(&k, &v),
+            map_branch_hash(u16::from_be_bytes([k[0], k[1]]), &k, &v)
+        );
+    }
+
+    #[test]
+    fn encode_refuses_what_decode_would_and_does_not_panic() {
+        let step = Step {
+            index: 0,
+            sibling: [0; 32],
+        };
+        let too_long = Proof {
+            steps: vec![step.clone(); 70_000],
+            end: End::Empty,
+        };
+        assert_eq!(too_long.encode(), Err(MapError::BadProof));
+        let over = Proof {
+            steps: vec![step; 257],
+            end: End::Empty,
+        };
+        assert_eq!(over.encode(), Err(MapError::BadProof));
+    }
+
     #[test]
     fn decode_is_strict() {
-        let good = four().prove(&E()).encode();
+        let good = four().prove(&E()).encode().unwrap();
         assert!(Proof::decode(&good).is_ok());
         // Trailing bytes, truncation, an unknown tag, too many steps, bad indices.
         let mut extra = good.clone();
@@ -879,6 +991,11 @@ mod tests {
         let mut range = good.clone();
         range[2] = 1; // index 256
         assert_eq!(Proof::decode(&range), Err(MapError::Encoding));
+        // Steps followed by an Empty end: an empty map has nothing to walk.
+        let mut empty_with_steps = vec![0, 1, 0, 3];
+        empty_with_steps.extend_from_slice(&[0u8; 32]);
+        empty_with_steps.push(0x00);
+        assert_eq!(Proof::decode(&empty_with_steps), Err(MapError::Encoding));
         // An empty tag with trailing bytes.
         assert_eq!(Proof::decode(&[0, 0, 0, 0]), Err(MapError::Encoding));
         assert_eq!(
