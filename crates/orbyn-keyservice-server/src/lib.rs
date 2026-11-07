@@ -403,6 +403,53 @@ impl Store {
         Ok(id)
     }
 
+    /// Counts one `action` by `subject` against a limit of `limit` in the last `window_secs`
+    /// seconds, in `rate_events`. Returns whether it was within the limit; an event over the limit
+    /// is not recorded. Events of this subject older than the window are removed in the same
+    /// transaction, so the table stays small. A lock on the pair keeps two callers from both
+    /// taking the last slot.
+    pub async fn allow(
+        &self,
+        action: &str,
+        subject: &[u8],
+        limit: u32,
+        window_secs: u64,
+    ) -> Result<bool> {
+        let window = i64::try_from(window_secs).map_err(|_| StoreError::BadEntry)?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1 || encode($2, 'hex'), 0))")
+            .bind(action)
+            .bind(subject)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "DELETE FROM rate_events WHERE action = $1 AND subject = $2 \
+             AND at < now() - make_interval(secs => $3)",
+        )
+        .bind(action)
+        .bind(subject)
+        .bind(window as f64)
+        .execute(&mut *tx)
+        .await?;
+        let used: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM rate_events WHERE action = $1 AND subject = $2",
+        )
+        .bind(action)
+        .bind(subject)
+        .fetch_one(&mut *tx)
+        .await?;
+        let allowed = used < i64::from(limit);
+        if allowed {
+            sqlx::query("INSERT INTO rate_events (action, subject) VALUES ($1, $2)")
+                .bind(action)
+                .bind(subject)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(allowed)
+    }
+
     /// The newest stored head.
     pub async fn latest_head(&self) -> Result<Option<StoredHead>> {
         let mut conn = self.pool.acquire().await?;

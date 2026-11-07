@@ -1794,3 +1794,53 @@ async fn retiring_destroys_the_wrapped_key_logs_it_once_and_is_idempotent() {
     }
     db.cleanup().await;
 }
+
+#[tokio::test]
+#[ignore = "needs ORBYN_KEYSERVICE_DATABASE_URL"]
+async fn the_rate_limit_counts_per_subject_and_forgets_after_its_window() {
+    let db = TestDb::new().await;
+    let store = db.store().await;
+    for _ in 0..3 {
+        assert!(store.allow("act", b"one", 3, 3600).await.expect("allow"));
+    }
+    assert!(!store.allow("act", b"one", 3, 3600).await.expect("over"));
+    // Another subject and another action have their own counts.
+    assert!(
+        store
+            .allow("act", b"two", 3, 3600)
+            .await
+            .expect("other subject")
+    );
+    assert!(
+        store
+            .allow("other", b"one", 3, 3600)
+            .await
+            .expect("other action")
+    );
+    // A refused call is not recorded, and old events fall out of the window.
+    let n: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM rate_events WHERE action = 'act' AND subject = 'one'",
+    )
+    .fetch_one(&db.owner)
+    .await
+    .expect("count");
+    assert_eq!(n, 3);
+    sqlx::query("UPDATE rate_events SET at = now() - interval '2 hours' WHERE action = 'act' AND subject = 'one'")
+        .execute(&db.owner)
+        .await
+        .expect("back-date");
+    assert!(
+        store
+            .allow("act", b"one", 3, 3600)
+            .await
+            .expect("window passed")
+    );
+    let n: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM rate_events WHERE action = 'act' AND subject = 'one'",
+    )
+    .fetch_one(&db.owner)
+    .await
+    .expect("count");
+    assert_eq!(n, 1, "the old events were removed");
+    db.cleanup().await;
+}
