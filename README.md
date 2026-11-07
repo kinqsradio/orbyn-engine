@@ -17,11 +17,7 @@ Status: early. Nothing here is released.
 | Connected-app grants for other Orbyn apps | Planned |
 | Advanced protection: recovery key, recovery contacts, web approval | Planned |
 
-Sources of truth:
-
-- [Orbyn Product Line Plan](https://claude.ai/artifact/ARvZq9n6jayX42VGaAcibJ): the apps, licences, identifiers and naming.
-- [Orbyn Platform Plan](https://claude.ai/artifact/BBhxZSmXRg1DawhLVRbsNc): the engine design, the feature map and the phases.
-- [Orbyn Domains and Hosting Plan](https://claude.ai/artifact/WTsLDhHaXKwNxdUzHJuyTU): the hostnames (`api.orbyn.dev` and `api-staging.orbyn.dev`).
+The product, platform and hosting plans that this README follows are internal. Hostnames: `api.orbyn.dev` and `api-staging.orbyn.dev`.
 
 ## Layout
 
