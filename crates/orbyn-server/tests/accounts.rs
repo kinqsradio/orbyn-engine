@@ -2139,6 +2139,15 @@ async fn a_start_proven_by_a_trusted_device_skips_the_second_factor() {
     );
 }
 
+/// The newest step a code was accepted for on this account: the one that enrolled it.
+async fn enrolled_step(server: &Server, p: &Protected) -> i64 {
+    orbyn_core::sqlx::query_scalar("SELECT last_step FROM account_totp WHERE account_id = $1")
+        .bind(uuid_of(&p.session["account_id"]))
+        .fetch_one(server.db.pool())
+        .await
+        .expect("last step")
+}
+
 #[tokio::test]
 #[ignore = "needs DATABASE_URL"]
 async fn a_code_works_once_and_only_a_newer_step_follows_it() {
@@ -2149,26 +2158,36 @@ async fn a_code_works_once_and_only_a_newer_step_follows_it() {
     let first = server
         .password_step(&p.email, b"pw", &DeviceKeys::generate().expect("keys"))
         .await;
-    for drift in [-1, 0] {
+    // Steps are counted from the one the enrolling code was accepted for, which the server
+    // stored, not from the clock now: a 30-second step edge between the enrolment and here would
+    // otherwise turn "the same step" into a newer one and the replay into a success.
+    let enrolled = enrolled_step(&server, &p).await;
+    let code_at_step = |step: i64| {
+        format!(
+            "{:06}",
+            totp::code_at(&p.secret, u64::try_from(step).expect("step"))
+        )
+    };
+    for step in [enrolled - 1, enrolled] {
         let (status, body) = server
-            .second_factor(&first, Some(&code_for(&p.secret, drift)), None)
+            .second_factor(&first, Some(&code_at_step(step)), None)
             .await;
         assert_eq!(
             (status, &body["code"]),
             (StatusCode::UNAUTHORIZED, &json!("second_factor_failed")),
-            "drift {drift}"
+            "step {step}"
         );
     }
     // The next step is newer, so it is accepted; then it is spent too.
     let (status, body) = server
-        .second_factor(&first, Some(&code_for(&p.secret, 1)), None)
+        .second_factor(&first, Some(&code_at_step(enrolled + 1)), None)
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let second = server
         .password_step(&p.email, b"pw", &DeviceKeys::generate().expect("keys"))
         .await;
     let (status, body) = server
-        .second_factor(&second, Some(&code_for(&p.secret, 1)), None)
+        .second_factor(&second, Some(&code_at_step(enrolled + 1)), None)
         .await;
     assert_eq!(
         (status, &body["code"]),
