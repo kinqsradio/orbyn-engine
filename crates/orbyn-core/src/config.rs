@@ -45,6 +45,10 @@ pub struct Config {
     /// deletion email's cancel link points to `<url>/cancel-deletion#<token>`. Without it the email
     /// carries the token alone.
     pub app_url: Option<String>,
+    /// `ORBYN_SMTP_CA_FILE`: a PEM bundle of extra CA certificates the worker trusts for SMTP, in
+    /// addition to the web roots and never instead of them. For a private relay or a test mail
+    /// server. TLS is still required. Needs `smtp_url`.
+    pub smtp_ca_file: Option<String>,
 }
 
 impl std::fmt::Debug for Config {
@@ -62,6 +66,7 @@ impl std::fmt::Debug for Config {
             .field("smtp_url", &self.smtp_url.as_ref().map(|_| "(hidden)"))
             .field("mail_from", &self.mail_from)
             .field("app_url", &self.app_url)
+            .field("smtp_ca_file", &self.smtp_ca_file)
             .finish()
     }
 }
@@ -82,6 +87,8 @@ pub enum ConfigError {
     InvalidPoolSize,
     #[error("ORBYN_SMTP_URL needs ORBYN_MAIL_FROM, the address email is sent from")]
     MissingMailFrom,
+    #[error("ORBYN_SMTP_CA_FILE needs ORBYN_SMTP_URL: it is the CA for that mail server")]
+    CaFileWithoutSmtp,
     #[error("ORBYN_MAIL can only be `log`")]
     InvalidMailMode,
     #[error("ORBYN_APP_URL must be an https:// address (http:// only for localhost)")]
@@ -160,6 +167,10 @@ impl Config {
         if smtp_url.is_some() && mail_from.is_none() {
             return Err(ConfigError::MissingMailFrom);
         }
+        let smtp_ca_file = optional("ORBYN_SMTP_CA_FILE");
+        if smtp_ca_file.is_some() && smtp_url.is_none() {
+            return Err(ConfigError::CaFileWithoutSmtp);
+        }
         let mail_log_only = match optional("ORBYN_MAIL").as_deref() {
             None => false,
             Some("log") => true,
@@ -188,6 +199,7 @@ impl Config {
             mail_log_only,
             mail_from,
             app_url,
+            smtp_ca_file,
         })
     }
 }
@@ -283,6 +295,18 @@ mod tests {
         ])?;
         assert!(set.smtp_url.is_some());
         assert!(!format!("{set:?}").contains("hunter2"));
+        // The extra CA file belongs to a mail server, so it needs one.
+        assert_eq!(set.smtp_ca_file, None);
+        assert_eq!(
+            with(&[("ORBYN_SMTP_CA_FILE", "/etc/orbyn/ca.pem")]).err(),
+            Some(ConfigError::CaFileWithoutSmtp)
+        );
+        let with_ca = with(&[
+            ("ORBYN_SMTP_URL", "smtps://mail.example.com"),
+            ("ORBYN_MAIL_FROM", "no-reply@example.com"),
+            ("ORBYN_SMTP_CA_FILE", "/etc/orbyn/ca.pem"),
+        ])?;
+        assert_eq!(with_ca.smtp_ca_file.as_deref(), Some("/etc/orbyn/ca.pem"));
         Ok(())
     }
 

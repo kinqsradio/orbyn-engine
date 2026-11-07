@@ -196,7 +196,7 @@ fn mailer(config: &Config) -> Result<orbyn_worker::Mailer, String> {
             if secrets.is_none() {
                 return Err("ORBYN_SMTP_URL needs ORBYN_AUTH_SETUP: the worker opens queued messages with it".to_owned());
             }
-            let sender = orbyn_worker::Smtp::new(url, from)?;
+            let sender = orbyn_worker::Smtp::new(url, from, config.smtp_ca_file.as_deref())?;
             Ok(orbyn_worker::Mailer {
                 secrets,
                 sender: std::sync::Arc::new(sender),
@@ -346,5 +346,18 @@ mod tests {
                 .expect_err("refused")
                 .contains("ORBYN_MAIL_FROM")
         );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_smtp_ca_file_stops_the_worker_at_start() {
+        let setup = orbyn_core::accounts::AuthSecrets::generate();
+        let bad = config(&[
+            ("ORBYN_AUTH_SETUP", setup.as_str()),
+            ("ORBYN_SMTP_URL", "smtps://mail.example.com"),
+            ("ORBYN_MAIL_FROM", "no-reply@example.com"),
+            ("ORBYN_SMTP_CA_FILE", "/nonexistent/orbyn-ca.pem"),
+        ]);
+        let error = mailer(&bad).expect_err("refused");
+        assert!(error.contains("ORBYN_SMTP_CA_FILE"), "{error}");
     }
 }
