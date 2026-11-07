@@ -1525,12 +1525,16 @@ mod tests {
         // A file that cannot be read: the path and the operating system's own reason.
         let missing = "/nonexistent/orbyn-smtp-ca.pem";
         let error = Smtp::new(url, from, Some(missing)).expect_err("missing");
+        // The reason is the platform's own wording ("no such file or directory" on Unix).
+        let reason = os_reason(&std::fs::read(missing).expect_err("missing"));
         assert_eq!(
             error,
             format!(
-                "error: can't read ORBYN_SMTP_CA_FILE ({missing}): no such file or directory\n  Check the path, and that the user running Orbyn can read the file.\n{notes}"
+                "error: can't read ORBYN_SMTP_CA_FILE ({missing}): {reason}\n  Check the path, and that the user running Orbyn can read the file.\n{notes}"
             )
         );
+        #[cfg(unix)]
+        assert_eq!(reason, "no such file or directory");
         // A file with no certificate in it.
         let empty = PemFile::new("");
         let error = Smtp::new(url, from, Some(empty.path())).expect_err("empty");
