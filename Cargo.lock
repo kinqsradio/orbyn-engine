@@ -1984,6 +1984,7 @@ dependencies = [
 name = "orbyn-worker"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "lettre",
  "orbyn-core",
  "orbyn-store",
