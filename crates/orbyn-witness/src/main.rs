@@ -217,6 +217,8 @@ fn start_error(error: StartError, state_dir: &Path) -> String {
         StartError::Replay(ReplayCause::Entries) => messages::entries_file_unreadable(),
         StartError::Replay(ReplayCause::Chain) => messages::chain_broken(),
         // The state could not be written, or could not be read back (a checksum that fails).
+        StartError::Store(StoreError::OlderFormat) => messages::state_older_format(state_dir),
+        StartError::Store(StoreError::NewerFormat) => messages::state_newer_format(state_dir),
         StartError::Store(StoreError::Corrupt) => messages::state_unreadable(),
         StartError::Store(_) => messages::state_unsaveable(state_dir),
     }

@@ -885,6 +885,35 @@ fn the_binary_says_what_the_designs_say_for_help_and_for_each_start_up_error() {
         format!("{}\n", messages::entries_file_unreadable())
     );
 
+    // A saved state of another format, told apart by its tag: the older and the newer message,
+    // each with the state directory named.
+    {
+        use sha2::{Digest, Sha256};
+        std::fs::create_dir_all(dir.join("state")).expect("dir");
+        for (tag, expected) in [
+            (
+                &b"orbyn/witness-state/v2"[..],
+                messages::state_older_format(&dir.join("state")),
+            ),
+            (
+                &b"orbyn/witness-state/v1"[..],
+                messages::state_older_format(&dir.join("state")),
+            ),
+            (
+                &b"orbyn/witness-state/v4"[..],
+                messages::state_newer_format(&dir.join("state")),
+            ),
+        ] {
+            let mut file = tag.to_vec();
+            file.extend_from_slice(b" the rest of some other format");
+            let sum = Sha256::digest(&file);
+            file.extend_from_slice(&sum);
+            std::fs::write(dir.join("state").join("state"), &file).expect("write");
+            assert_eq!(stderr_of(&run_with(&dir, &[])), format!("{expected}\n"));
+        }
+        std::fs::remove_file(dir.join("state").join("state")).expect("rm");
+    }
+
     // A damaged saved state.
     std::fs::create_dir_all(dir.join("state")).expect("dir");
     std::fs::write(dir.join("state").join("state"), b"damaged").expect("write");
@@ -996,6 +1025,16 @@ fn the_binary_says_what_the_designs_say_for_help_and_for_each_start_up_error() {
         !messages::HELP.contains("--pin-size") && !messages::HELP.contains("signature, in hex")
     );
 
+    // The older and newer saved-state formats (v49), word for word, and which one a file is.
+    let state_dir = std::path::Path::new("/var/lib/orbyn-witness");
+    assert_eq!(
+        messages::state_older_format(state_dir),
+        "error: the saved state is from an older version of the witness, and this version can't read it (/var/lib/orbyn-witness)\n  Start the previous version of orbyn-witness to keep using this state.\n  Or move the state directory aside, then start again with --bootstrap-replay and --pin-head."
+    );
+    assert_eq!(
+        messages::state_newer_format(state_dir),
+        "error: the saved state is from a newer version of the witness, and this version can't read it (/var/lib/orbyn-witness)\n  Start the version that wrote it, or a newer one, to keep using this state.\n  Or move the state directory aside, then start again with --bootstrap-replay and --pin-head."
+    );
     // A key file that can't be written: the directory is not there.
     let nowhere = dir.join("no-such-directory").join("key");
     let output = binary()
@@ -1372,4 +1411,138 @@ async fn an_answer_that_streams_past_the_limit_is_cut_off_whatever_it_claims() {
         assert_eq!(answer, Err(ClientError::Invalid), "{name}");
         task.abort();
     }
+}
+
+/// A source that stops working after `allowed` requests, as a timeout or a restart would.
+struct Interrupted<'a> {
+    inner: &'a Chain,
+    allowed: usize,
+    used: Mutex<usize>,
+}
+
+impl RequestSource for Interrupted<'_> {
+    fn next<'a>(
+        &'a self,
+        after: Option<&'a UnsignedHead>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<CosignRequest, ClientError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            {
+                let mut used = self.used.lock().expect("lock");
+                if *used >= self.allowed {
+                    return Err(ClientError::Source);
+                }
+                *used += 1;
+            }
+            self.inner.next(after).await
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_catch_up_cut_short_resumes_from_the_chain_head_and_reaches_the_target() {
+    let witness = serve(70, 60).await;
+    let client = client(&witness);
+    let cosigner = Cosigner::new(vec![client.clone()], 1).expect("threshold");
+    let chain = Chain::new(40, 10, T0);
+    // The first head, accepted as final.
+    let first = cosigner.cosign(&chain, chain.head(0)).await;
+    assert!(first.enough, "{:?}", first.failures);
+    assert_eq!(witness.service.witness().state().size, 10);
+
+    // A catch-up to the last head is cut short after two heads on the way.
+    let target = chain.head(3).clone();
+    witness.clock.set(target.time_ms);
+    let cut = Interrupted {
+        inner: &chain,
+        allowed: 2,
+        used: Mutex::new(0),
+    };
+    let outcome = cosigner.cosign(&cut, &target).await;
+    assert!(!outcome.enough);
+    // The chain is two heads ahead; what the witness serves is still the last final head.
+    assert_eq!(witness.service.witness().state().size, 30);
+    let newest = client
+        .newest()
+        .await
+        .expect("newest")
+        .expect("a final head");
+    assert_eq!(newest.head, *chain.head(0));
+
+    // Run again with the source back: the refusal says where the chain stands, the client resumes
+    // from there, and reaches the target. (Before, this was a rollback for ever.)
+    let outcome = cosigner.cosign(&chain, &target).await;
+    assert!(outcome.enough, "{:?}", outcome.failures);
+    assert_eq!(witness.service.witness().state().size, 40);
+    let newest = client
+        .newest()
+        .await
+        .expect("newest")
+        .expect("a final head");
+    assert_eq!(newest.head, target);
+
+    // The cut came after the last head on the way: the chain already ends on the target (accepted
+    // on the way), and the next run asks for it as final.
+    let witness = serve(71, 60).await;
+    let client = self::client(&witness);
+    let cosigner = Cosigner::new(vec![client.clone()], 1).expect("threshold");
+    cosigner.cosign(&chain, chain.head(0)).await;
+    witness.clock.set(target.time_ms);
+    for (from, to, prev, head) in [(10, 20, 0, 1), (20, 30, 1, 2), (30, 40, 2, 3)] {
+        let mut request =
+            chain
+                .svc
+                .request(from, to, chain.head(prev).hash(), chain.head(head).time_ms);
+        request.intermediate = true;
+        client.cosign(&request).await.expect("on the way");
+    }
+    assert_eq!(witness.service.witness().state().size, 40);
+    let newest = client.newest().await.expect("newest").expect("final");
+    assert_eq!(newest.head, *chain.head(0), "not final yet");
+    let outcome = cosigner.cosign(&chain, &target).await;
+    assert!(outcome.enough, "{:?}", outcome.failures);
+    let newest = client.newest().await.expect("newest").expect("final");
+    assert_eq!(newest.head, target);
+}
+
+#[tokio::test]
+async fn an_endless_answer_is_cut_off_at_the_limit_within_the_timeout() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("addr"));
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buffer = [0u8; 1024];
+                let _ = stream.read(&mut buffer).await;
+                if stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                // Chunks for as long as the client reads: it must stop reading, not this.
+                loop {
+                    let chunk = [b"1000\r\n".as_slice(), &[b'x'; 4096], b"\r\n"].concat();
+                    if stream.write_all(&chunk).await.is_err() {
+                        return;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            });
+        }
+    });
+    let client = WitnessClient::new(&url, [1; 32], Duration::from_secs(30)).expect("client");
+    let answer = tokio::time::timeout(Duration::from_secs(10), client.newest())
+        .await
+        .expect("cut off, not read for ever");
+    assert_eq!(answer, Err(ClientError::Invalid));
+    task.abort();
 }

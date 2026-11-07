@@ -809,6 +809,13 @@ fn a_head_accepted_only_as_intermediate_is_never_served_or_cosigned_again() {
         w.recosign_latest().is_none(),
         "never cosigned again on the schedule"
     );
+    // Asked again as intermediate, the old head is cosigned again but never promoted to final.
+    w.cosign(&old).expect("re-asked on the way");
+    assert!(
+        w.state().final_head.is_none(),
+        "an intermediate re-ask promotes nothing"
+    );
+    assert!(w.newest().is_none());
     // Asking for the same old head again as a final head is refused: it is a day old.
     let mut as_final = old.clone();
     as_final.intermediate = false;
@@ -859,4 +866,107 @@ fn the_intermediate_flag_byte_is_zero_or_one_and_nothing_else() {
         bytes[1] = bad;
         assert!(decode_request(&bytes).is_err(), "flag {bad}");
     }
+}
+
+#[test]
+fn an_old_pinned_replay_head_is_never_made_final_and_a_current_one_is() {
+    let public = log_key().verifying_key().to_bytes();
+    let mut svc = Svc::new();
+    svc.fill(13);
+    let day = 24 * 60 * 60 * 1000;
+    let start = |head_time: u64, now: u64| {
+        let head = svc.head(13, [4; 32], head_time);
+        let pinned = PinnedHead {
+            log_signature: Svc::sign(&head),
+            head,
+        };
+        Witness::bootstrap_replay(
+            SigningKey::from_bytes(&[7; 32]),
+            Config::new(vec![(LOG_VERSION, public)]),
+            Arc::new(MemoryStore::new()),
+            TestClock::new(now),
+            &svc.entries,
+            &pinned,
+        )
+        .expect("replay")
+    };
+    // A head a day older than the clock stands on the chain but is not final: not served, not
+    // cosigned again.
+    let old = start(T0, T0 + day);
+    assert_eq!(old.state().size, 13);
+    assert!(old.state().head.is_some() && old.state().final_head.is_none());
+    assert!(old.newest().is_none() && old.recosign_latest().is_none());
+    // One within the skew is final at once.
+    let fresh = start(T0 + day - 1000, T0 + day);
+    assert!(fresh.state().final_head.is_some());
+    assert!(fresh.newest().is_some());
+}
+
+#[test]
+fn a_saved_state_whose_final_head_is_newer_than_its_chain_head_is_refused() {
+    let mut svc = Svc::new();
+    svc.fill(20);
+    let (w, mem, _) = witness();
+    w.cosign(&svc.request(0, 10, [0; 32], T0)).expect("first");
+    let state = mem.saved().expect("state");
+    assert_eq!(State::decode(&state.encode()), Ok(state.clone()));
+    // A final head of size 20 over a chain head of size 10, or later in time, cannot be.
+    let newer = svc.head(20, state.head_hash, T0 + 5);
+    let mut bad = state.clone();
+    bad.final_head = Some(orbyn_witness::SignedHead {
+        log_signature: Svc::sign(&newer),
+        head: newer,
+    });
+    assert_eq!(State::decode(&bad.encode()), Err(StoreError::Corrupt));
+    // Nor one later in time at the same size.
+    let mut later = state.head.clone().expect("head");
+    later.head.time_ms += 1;
+    let mut bad = state;
+    bad.final_head = Some(later);
+    assert_eq!(State::decode(&bad.encode()), Err(StoreError::Corrupt));
+}
+
+#[test]
+fn a_state_file_of_another_format_is_older_or_newer_and_a_bad_checksum_is_damaged() {
+    use sha2::{Digest, Sha256};
+    let mut svc = Svc::new();
+    svc.fill(5);
+    let (w, mem, _) = witness();
+    w.cosign(&svc.request(0, 5, [0; 32], T0)).expect("cosign");
+    let state = mem.saved().expect("state");
+    let current = state.encode();
+    let with_tag = |tag: &[u8]| {
+        let (body, _) = current.split_at(current.len() - 32);
+        let rest = &body[b"orbyn/witness-state/v3".len()..];
+        let mut out = tag.to_vec();
+        out.extend_from_slice(rest);
+        let sum = Sha256::digest(&out);
+        out.extend_from_slice(&sum);
+        out
+    };
+    assert_eq!(
+        State::decode(&with_tag(b"orbyn/witness-state/v2")),
+        Err(StoreError::OlderFormat)
+    );
+    assert_eq!(
+        State::decode(&with_tag(b"orbyn/witness-state/v1")),
+        Err(StoreError::OlderFormat)
+    );
+    assert_eq!(
+        State::decode(&with_tag(b"orbyn/witness-state/v4")),
+        Err(StoreError::NewerFormat)
+    );
+    assert_eq!(
+        State::decode(&with_tag(b"orbyn/witness-state/v9")),
+        Err(StoreError::NewerFormat)
+    );
+    // Something else with a good checksum, and a damaged file, are damage.
+    assert_eq!(
+        State::decode(&with_tag(b"orbyn/something-else/v3")),
+        Err(StoreError::Corrupt)
+    );
+    let mut damaged = with_tag(b"orbyn/witness-state/v2");
+    damaged[30] ^= 1;
+    assert_eq!(State::decode(&damaged), Err(StoreError::Corrupt));
+    assert_eq!(State::decode(&current), Ok(state));
 }

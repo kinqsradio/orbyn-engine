@@ -98,6 +98,20 @@ pub fn state_unreadable() -> String {
     )
 }
 
+pub fn state_older_format(dir: &Path) -> String {
+    format!(
+        "{ERROR}the saved state is from an older version of the witness, and this version can't read it ({})\n  Start the previous version of orbyn-witness to keep using this state.\n  Or move the state directory aside, then start again with --bootstrap-replay and --pin-head.",
+        dir.display()
+    )
+}
+
+pub fn state_newer_format(dir: &Path) -> String {
+    format!(
+        "{ERROR}the saved state is from a newer version of the witness, and this version can't read it ({})\n  Start the version that wrote it, or a newer one, to keep using this state.\n  Or move the state directory aside, then start again with --bootstrap-replay and --pin-head.",
+        dir.display()
+    )
+}
+
 /// `option` names whichever option was given a value the witness can't read.
 pub fn bad_value(option: &str) -> String {
     format!(

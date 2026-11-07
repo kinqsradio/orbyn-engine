@@ -107,7 +107,11 @@ impl State {
         if Sha256::digest(body).as_slice() != sum {
             return Err(bad());
         }
-        let rest = body.strip_prefix(MAGIC).ok_or_else(bad)?;
+        let rest = match body.strip_prefix(MAGIC) {
+            Some(rest) => rest,
+            // The checksum holds, so this is a state of some format: say which side of this one.
+            None => return Err(format_mismatch(body)),
+        };
         let (size, rest) = rest.split_first_chunk::<8>().ok_or_else(bad)?;
         let mut hashes = [[0u8; 32]; 4];
         let mut rest = rest;
@@ -199,6 +203,12 @@ pub enum StoreError {
     Io,
     #[error("the witness state is damaged")]
     Corrupt,
+    /// A state file of an older format of this witness.
+    #[error("the witness state is from an older version of the witness")]
+    OlderFormat,
+    /// A state file of a newer format than this witness reads (a downgrade).
+    #[error("the witness state is from a newer version of the witness")]
+    NewerFormat,
 }
 
 /// Where a witness keeps its state.
@@ -297,5 +307,31 @@ impl<T: StateStore + ?Sized> StateStore for std::sync::Arc<T> {
     }
     fn save(&self, state: &State) -> Result<(), StoreError> {
         (**self).save(state)
+    }
+}
+
+/// What a state file that is not this format is: older or newer, by the version in its tag
+/// (`orbyn/witness-state/v<N>`), or damaged when it has no such tag.
+fn format_mismatch(body: &[u8]) -> StoreError {
+    const PREFIX: &[u8] = b"orbyn/witness-state/v";
+    let current: u32 = std::str::from_utf8(&MAGIC[PREFIX.len()..])
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+    let Some(tail) = body.strip_prefix(PREFIX) else {
+        return StoreError::Corrupt;
+    };
+    let digits: Vec<u8> = tail
+        .iter()
+        .copied()
+        .take_while(u8::is_ascii_digit)
+        .collect();
+    match std::str::from_utf8(&digits)
+        .ok()
+        .and_then(|n| n.parse::<u32>().ok())
+    {
+        Some(n) if n < current => StoreError::OlderFormat,
+        Some(n) if n > current => StoreError::NewerFormat,
+        _ => StoreError::Corrupt,
     }
 }

@@ -76,7 +76,8 @@ impl Reason {
     }
 }
 
-/// What a fork refusal shows: the head the witness holds, so the refusal is evidence.
+/// What a fork or rollback refusal shows: the head the witness holds, so the refusal is evidence
+/// and, for a rollback, the place a catch-up that was interrupted resumes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Held {
     pub size: u64,
@@ -84,6 +85,9 @@ pub struct Held {
     pub service_map_root: Hash,
     pub identity_map_root: Hash,
     pub head_hash: Hash,
+    /// The head the witness's chain stands on (not necessarily its last final head), with its log
+    /// signature.
+    pub head: Option<SignedHead>,
 }
 
 /// A refusal: a reason code, a fixed description (never request contents), and for a fork the
@@ -387,14 +391,29 @@ impl<S: StateStore, C: Clock> Witness<S, C> {
             return Err(refuse(Reason::BadSignature, "the log signature does not verify").into());
         }
 
+        let held = || Held {
+            size: state.size,
+            log_root: state.log_root,
+            service_map_root: state.service_map_root,
+            identity_map_root: state.identity_map_root,
+            head_hash: state.head_hash,
+            head: state.head.clone(),
+        };
+        let rollback = |detail: &'static str| Refusal {
+            reason: Reason::Rollback,
+            detail,
+            held: Some(Box::new(held())),
+        };
+        let fork = |detail: &'static str| Refusal {
+            reason: Reason::Fork,
+            detail,
+            held: Some(Box::new(held())),
+        };
+
         // 2. Time: not before the last head's, and near this witness's clock.
         let now = self.clock.now_ms();
         if head.time_ms < state.head_time_ms {
-            return Err(refuse(
-                Reason::Rollback,
-                "the head's time is before the last head's",
-            )
-            .into());
+            return Err(rollback("the head's time is before the last head's").into());
         }
         // The head that ends the request is within the skew of this clock. One on the way to a
         // later head (a witness catching up) may be older, as it was away, but never ahead of
@@ -409,19 +428,6 @@ impl<S: StateStore, C: Clock> Witness<S, C> {
             )
             .into());
         }
-
-        let held = || Held {
-            size: state.size,
-            log_root: state.log_root,
-            service_map_root: state.service_map_root,
-            identity_map_root: state.identity_map_root,
-            head_hash: state.head_hash,
-        };
-        let fork = |detail: &'static str| Refusal {
-            reason: Reason::Fork,
-            detail,
-            held: Some(Box::new(held())),
-        };
 
         // The very head already cosigned, asked again (a retry, or a fresh time for freshness):
         // the same size and the same roots as the state, as well as the same hash.
@@ -448,7 +454,7 @@ impl<S: StateStore, C: Clock> Witness<S, C> {
             return Ok(cosignature);
         }
         if head.size < state.size {
-            return Err(refuse(Reason::Rollback, "the head is smaller than the last one").into());
+            return Err(rollback("the head is smaller than the last one").into());
         }
 
         let mut next = state.clone();

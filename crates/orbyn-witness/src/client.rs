@@ -16,7 +16,7 @@ use std::time::Duration;
 use orbyn_translog::UnsignedHead;
 
 use crate::wire::{self, Newest};
-use crate::{CosignRequest, Cosignature, Refusal, cosigned_enough, threshold_ok};
+use crate::{CosignRequest, Cosignature, Reason, Refusal, cosigned_enough, threshold_ok};
 
 /// Why a witness gave no cosignature. Never carries request contents.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -256,11 +256,44 @@ async fn catch_up(
         return witness.cosign(&again).await;
     }
     let mut after = newest.map(|newest| newest.head);
+    // A catch-up that was cut short (a timeout, a 503, a restart) leaves the witness's chain ahead
+    // of the last head it served as final. The first refusal as a rollback says where it stands,
+    // and the run goes on from there, once.
+    let mut resumed = false;
     loop {
         let mut request = source.next(after.as_ref()).await?;
         // Only the head that ends the catch-up is held to the clock.
         request.intermediate = request.head.hash() != target.hash();
-        let cosignature = witness.cosign(&request).await?;
+        let cosignature = match witness.cosign(&request).await {
+            Ok(cosignature) => cosignature,
+            Err(ClientError::Refused(refusal))
+                if refusal.reason == Reason::Rollback && !resumed =>
+            {
+                resumed = true;
+                let Some(held) = refusal.held.as_ref().and_then(|h| h.head.clone()) else {
+                    return Err(ClientError::Refused(refusal));
+                };
+                if held.head.hash() == target.hash() {
+                    // The chain already ends on the target, accepted on the way: ask for it as
+                    // the final head, which the witness takes within the skew.
+                    let again = CosignRequest {
+                        head: held.head,
+                        log_signature: held.log_signature,
+                        consistency_proof: Vec::new(),
+                        entries: Vec::new(),
+                        intermediate: false,
+                    };
+                    return witness.cosign(&again).await;
+                }
+                // Past the target, or nowhere new to go: the refusal stands.
+                if held.head.size >= target.size {
+                    return Err(ClientError::Refused(refusal));
+                }
+                after = Some(held.head);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if request.head.hash() == target.hash() {
             return Ok(cosignature);
         }

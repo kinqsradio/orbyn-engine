@@ -15,7 +15,7 @@
 use orbyn_translog::{Cosignature, Entry, Proof, UnsignedHead};
 use serde_json::{Value, json};
 
-use crate::{CosignEntry, CosignRequest, Held, MAX_ENTRIES, Reason, Refusal};
+use crate::{CosignEntry, CosignRequest, Held, MAX_ENTRIES, Reason, Refusal, SignedHead};
 
 const VERSION: u8 = 1;
 /// The longest consistency proof a request may carry: two to the 64 leaves is as deep as a tree gets.
@@ -192,6 +192,11 @@ pub fn refusal_json(refusal: &Refusal) -> Value {
             "identity_map_root": hex(&held.identity_map_root),
             "head_hash": hex(&held.head_hash),
         });
+        if let Some(signed) = &held.head {
+            let mut bytes = signed.head.encode();
+            bytes.extend_from_slice(&signed.log_signature);
+            out["held"]["head"] = json!(hex(&bytes));
+        }
     }
     out
 }
@@ -217,11 +222,30 @@ pub fn parse_refusal(value: &Value) -> Option<Refusal> {
             service_map_root: unhex(h.get("service_map_root")?.as_str()?)?,
             identity_map_root: unhex(h.get("identity_map_root")?.as_str()?)?,
             head_hash: unhex(h.get("head_hash")?.as_str()?)?,
+            head: match h.get("head").and_then(Value::as_str) {
+                None => None,
+                Some(text) => Some(parse_signed_head(text)?),
+            },
         })),
     };
     Some(Refusal {
         reason,
         detail: "the witness refused the head",
         held,
+    })
+}
+
+/// A head and its log signature, in hex, as a refusal carries them.
+fn parse_signed_head(text: &str) -> Option<SignedHead> {
+    if text.len() != (HEAD_LEN + 64) * 2 || !text.is_ascii() {
+        return None;
+    }
+    let bytes: Vec<u8> = (0..text.len() / 2)
+        .map(|i| u8::from_str_radix(&text[i * 2..i * 2 + 2], 16).ok())
+        .collect::<Option<_>>()?;
+    let (head, signature) = bytes.split_at(HEAD_LEN);
+    Some(SignedHead {
+        head: UnsignedHead::decode(head)?,
+        log_signature: signature.try_into().ok()?,
     })
 }
