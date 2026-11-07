@@ -28,6 +28,7 @@ pub fn hsm_message(error: &HsmError) -> String {
         HsmError::Setup(HsmSetup::Module) => messages::hsm_module(),
         HsmError::Setup(HsmSetup::Slot) => messages::hsm_slot(),
         HsmError::Setup(HsmSetup::Pin) => messages::hsm_pin(),
+        HsmError::Rv(code) => messages::hsm_error(code),
         // Anything else the HSM did wrong at start-up is a token that cannot be used.
         _ => messages::hsm_unreachable(),
     }
@@ -36,11 +37,16 @@ pub fn hsm_message(error: &HsmError) -> String {
 /// Reads the three HSM settings and loads the module. A setting that is missing or not usable is
 /// reported as the message for that setting.
 fn open_hsm(env: Env<'_>) -> Result<Pkcs11Hsm, String> {
+    // The module has a message of its own for missing or unloadable; the others are the general
+    // "is not set", and a slot that is not a number is not a slot the HSM has.
     let module = get(env, "ORBYN_HSM_MODULE").ok_or_else(messages::hsm_module)?;
-    let slot = get(env, "ORBYN_HSM_SLOT")
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .ok_or_else(messages::hsm_slot)?;
-    let pin = get(env, "ORBYN_HSM_PIN").ok_or_else(messages::hsm_pin)?;
+    let slot_text =
+        get(env, "ORBYN_HSM_SLOT").ok_or_else(|| messages::not_set("ORBYN_HSM_SLOT"))?;
+    let slot = slot_text
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| messages::hsm_slot())?;
+    let pin = get(env, "ORBYN_HSM_PIN").ok_or_else(|| messages::not_set("ORBYN_HSM_PIN"))?;
     let config = Pkcs11Config::from_lookup(|name| match name {
         "ORBYN_HSM_MODULE" => Some(module.clone()),
         "ORBYN_HSM_SLOT" => Some(slot.to_string()),
@@ -56,10 +62,11 @@ pub async fn run(args: &[String], env: Env<'_>) -> Result<String, String> {
     match args.first().map(String::as_str) {
         Some("-h" | "--help" | "help") => Ok(messages::HELP.to_owned()),
         Some("init") => init(env),
+        Some("init-log-key") => init_log_key(env),
         Some("migrate") => migrate(env).await.map(|()| String::new()),
         Some("serve") => serve(env).await.map(|()| String::new()),
-        // Not designed: a missing or unknown command gets the help, on stderr.
-        _ => Err(messages::HELP.to_owned()),
+        Some(other) => Err(messages::unknown_command(other)),
+        None => Err(messages::no_command()),
     }
 }
 
@@ -73,13 +80,24 @@ fn init(env: Env<'_>) -> Result<String, String> {
     }
 }
 
+fn init_log_key(env: Env<'_>) -> Result<String, String> {
+    let keys = KeyService::new(open_hsm(env)?);
+    match keys.init_log_key(1) {
+        Ok(public) => Ok(messages::log_key_created(&hex(&public))),
+        Err(KeyServiceError::Hsm(HsmError::AlreadyExists)) => Err(messages::log_key_exists()),
+        Err(KeyServiceError::Hsm(e)) => Err(hsm_message(&e)),
+        Err(_) => Err(messages::hsm_unreachable()),
+    }
+}
+
 async fn migrate(env: Env<'_>) -> Result<(), String> {
-    let role = get(env, "ORBYN_KEYSERVICE_RUNTIME_ROLE").unwrap_or_default();
+    let role = get(env, "ORBYN_KEYSERVICE_RUNTIME_ROLE")
+        .ok_or_else(|| messages::not_set("ORBYN_KEYSERVICE_RUNTIME_ROLE"))?;
     if !orbyn_keyservice_server::valid_role_name(&role) {
         return Err(messages::bad_role_name());
     }
     let url = get(env, "ORBYN_KEYSERVICE_MIGRATE_DATABASE_URL")
-        .ok_or_else(messages::migrate_database_unreachable)?;
+        .ok_or_else(|| messages::not_set("ORBYN_KEYSERVICE_MIGRATE_DATABASE_URL"))?;
     let pool = PgPoolOptions::new()
         .max_connections(2)
         .connect(&url)
@@ -106,11 +124,15 @@ async fn migrate(env: Env<'_>) -> Result<(), String> {
 pub fn migration_message(error: &sqlx::migrate::MigrateError) -> String {
     use sqlx::migrate::MigrateError as M;
     match error {
+        M::VersionMismatch(version) => messages::migration_changed(*version),
+        M::VersionMissing(version) | M::VersionNotPresent(version) => {
+            messages::migration_file_missing(*version)
+        }
+        M::Dirty(version) => messages::migration_unfinished(*version),
+        // Any other migration that did not apply, by its number.
         M::ExecuteMigration(_, version)
-        | M::Dirty(version)
-        | M::VersionMismatch(version)
-        | M::VersionMissing(version)
-        | M::VersionNotPresent(version) => messages::migration_failed(*version),
+        | M::VersionTooOld(version, _)
+        | M::VersionTooNew(version, _) => messages::migration_failed(*version),
         _ => messages::migrate_database_unreachable(),
     }
 }
@@ -131,36 +153,33 @@ async fn serve(env: Env<'_>) -> Result<(), String> {
         Err(_) => return Err(messages::hsm_unreachable()),
     }
     let url = get(env, "ORBYN_KEYSERVICE_DATABASE_URL")
-        .ok_or_else(messages::serve_database_unreachable)?;
+        .ok_or_else(|| messages::not_set("ORBYN_KEYSERVICE_DATABASE_URL"))?;
     let pool = PgPoolOptions::new()
         .max_connections(8)
         .connect(&url)
         .await
         .map_err(|_| messages::serve_database_unreachable())?;
-    let role: String = sqlx::query_scalar("SELECT current_user::text")
-        .fetch_one(&pool)
-        .await
-        .map_err(|_| messages::serve_database_unreachable())?;
     let store = match Store::connect(pool).await {
         Ok(store) => store,
-        Err(StoreError::UnsafeRole) => return Err(messages::role_unsafe(&role)),
+        Err(StoreError::UnsafeRole) => return Err(messages::database_user_unsafe()),
         Err(_) => return Err(messages::serve_database_unreachable()),
     };
-    let path = |name: &str, unreadable: fn() -> String| {
-        get(env, name).map(PathBuf::from).ok_or_else(unreadable)
+    let path = |name: &str| {
+        get(env, name)
+            .map(PathBuf::from)
+            .ok_or_else(|| messages::not_set(name))
     };
     let files = TlsFiles {
-        cert: path("ORBYN_KS_TLS_CERT", messages::tls_cert_unreadable)?,
-        key: path("ORBYN_KS_TLS_KEY", messages::tls_key_unreadable)?,
-        client_ca: path("ORBYN_KS_CLIENT_CA", messages::client_ca_unreadable)?,
+        cert: path("ORBYN_KS_TLS_CERT")?,
+        key: path("ORBYN_KS_TLS_KEY")?,
+        client_ca: path("ORBYN_KS_CLIENT_CA")?,
     };
     let tls = Reloadable::load(files).map_err(messages::tls_error)?;
-    let bind_text = get(env, "ORBYN_KS_INTERNAL_BIND").unwrap_or_default();
-    // A missing or unparsable address has no text of its own in the design yet.
+    let bind_text = get(env, "ORBYN_KS_INTERNAL_BIND").ok_or_else(messages::bind_not_set)?;
     let bind: SocketAddr = bind_text
         .trim()
         .parse()
-        .map_err(|_| messages::cannot_listen(&bind_text))?;
+        .map_err(|_| messages::bind_invalid())?;
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .map_err(|_| messages::cannot_listen(&bind_text))?;

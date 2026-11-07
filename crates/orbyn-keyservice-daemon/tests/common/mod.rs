@@ -252,6 +252,10 @@ pub fn files_in(dir: &Dir, server: &Leaf, client_ca: &Ca) -> TlsFiles {
 
 impl Harness {
     pub async fn start() -> Self {
+        Self::start_with(tls::Limits::default()).await
+    }
+
+    pub async fn start_with(limits: tls::Limits) -> Self {
         let db = Db::new().await;
         let dir = Dir::new();
         let server_ca = Ca::new("server ca");
@@ -272,8 +276,8 @@ impl Harness {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
-        let server =
-            tls::serve(listener, reload.clone(), api::router(state.clone())).expect("serve");
+        let server = tls::serve_with(listener, reload.clone(), api::router(state.clone()), limits)
+            .expect("serve");
         Self {
             db,
             dir,

@@ -51,6 +51,33 @@ pub struct ServiceKeyRecord {
     pub head_covers_entry: bool,
 }
 
+/// What the store holds for an account that is not simply absent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ServiceKeyOutcome {
+    /// A key, held or retired.
+    Key(ServiceKeyRecord),
+    /// The account was retired before it ever had a key. It has no certification to show.
+    RetiredWithoutKey,
+}
+
+impl ServiceKeyOutcome {
+    /// Whether the account is retired, with or without a key.
+    pub fn is_retired(&self) -> bool {
+        match self {
+            Self::Key(record) => record.state == ServiceKeyState::Retired,
+            Self::RetiredWithoutKey => true,
+        }
+    }
+
+    /// The key's record, if there is one.
+    pub fn key(self) -> Option<ServiceKeyRecord> {
+        match self {
+            Self::Key(record) => Some(record),
+            Self::RetiredWithoutKey => None,
+        }
+    }
+}
+
 /// Why create-or-get failed: the store, or the closure that makes the key.
 #[derive(Debug)]
 pub enum CreateError<E> {
@@ -136,23 +163,45 @@ async fn record(
     })
 }
 
+/// What the store has for the account: its key (or retired key), a retirement with no key, or nothing.
+async fn lookup(
+    conn: &mut sqlx::PgConnection,
+    account_id: &[u8; 16],
+) -> Result<Option<ServiceKeyOutcome>> {
+    if let Some(record) = read(&mut *conn, account_id).await? {
+        return Ok(Some(ServiceKeyOutcome::Key(record)));
+    }
+    let retired: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM retired_accounts WHERE account_id = $1)")
+            .bind(account_id.as_slice())
+            .fetch_one(conn)
+            .await?;
+    Ok(retired.then_some(ServiceKeyOutcome::RetiredWithoutKey))
+}
+
 impl Store {
     /// The account's service key, made by `make` and certified in the log if it has none.
     ///
-    /// Idempotent and safe to race: the write lock is held from the lookup to the commit, so two
-    /// callers for one account get one key, and `make` runs only when there is none. Returns the
-    /// record and whether this call made it. `time_ms` is the certification entry's time. A retired
-    /// account is returned as it is, `Retired`: it is never given a second key here.
+    /// **`make` runs with no lock and no transaction open.** It is the HSM, which may be slow or
+    /// hung, and the write lock is every writer's: holding it across the HSM would stop the whole
+    /// log. The order is: look (no lock); make; take the write lock, **look again**, and insert
+    /// only if there is still none. If another call made a key meanwhile, this call's key is
+    /// discarded (it exists only wrapped, in memory, and is never stored) and the stored one is
+    /// returned. So racing calls for one account may each make a key, and exactly one is kept.
+    /// `make` runs only when the first look found none. Returns the outcome and whether this call
+    /// stored the key. `time_ms` is the certification entry's time. A retired account is returned
+    /// as it is and is never given a second key here.
     pub async fn get_or_create_service_key<E>(
         &self,
         account_id: &[u8; 16],
         time_ms: u64,
         make: impl FnOnce() -> std::result::Result<NewServiceKey, E>,
-    ) -> std::result::Result<(ServiceKeyRecord, bool), CreateError<E>> {
-        let mut tx = begin_write(&self.pool, &self.timeouts).await?;
-        if let Some(found) = read(&mut tx, account_id).await? {
-            tx.commit().await?;
-            return Ok((found, false));
+    ) -> std::result::Result<(ServiceKeyOutcome, bool), CreateError<E>> {
+        {
+            let mut conn = self.pool.acquire().await.map_err(StoreError::from)?;
+            if let Some(found) = lookup(&mut conn, account_id).await? {
+                return Ok((found, false));
+            }
         }
         let new = make().map_err(CreateError::Make)?;
         if new.statement.len() != CERTIFICATION_STATEMENT_LEN {
@@ -160,6 +209,12 @@ impl Store {
         }
         let fields =
             certification_fields(&new.statement, &new.signature).ok_or(StoreError::BadEntry)?;
+        let mut tx = begin_write(&self.pool, &self.timeouts).await?;
+        if let Some(found) = lookup(&mut tx, account_id).await? {
+            // Another call got there first: its key stays, this one is dropped.
+            tx.commit().await?;
+            return Ok((found, false));
+        }
         sqlx::query(
             "INSERT INTO service_keys (account_id, wrapped, public, identity_version, statement, signature) \
              VALUES ($1, $2, $3, $4, $5, $6)",
@@ -185,24 +240,46 @@ impl Store {
             .await?
             .ok_or(StoreError::Corrupt("a service key just written is missing"))?;
         tx.commit().await?;
-        Ok((found, true))
+        Ok((ServiceKeyOutcome::Key(found), true))
     }
 
-    /// The account's service key, or `None`.
+    /// The account's service key (held or retired), or `None`. An account retired before it had a
+    /// key has none to return; see [`Store::service_key_outcome`].
     pub async fn service_key(&self, account_id: &[u8; 16]) -> Result<Option<ServiceKeyRecord>> {
         let mut conn = self.pool.acquire().await?;
         read(&mut conn, account_id).await
     }
 
+    /// Everything the store knows about the account's key, including a retirement with no key.
+    pub async fn service_key_outcome(
+        &self,
+        account_id: &[u8; 16],
+    ) -> Result<Option<ServiceKeyOutcome>> {
+        let mut conn = self.pool.acquire().await?;
+        lookup(&mut conn, account_id).await
+    }
+
     /// Retires the account's service key: destroys the wrapped key, keeps the row, and appends the
-    /// retirement to the account's chain, in one transaction. Idempotent: a key that is already
-    /// retired, or an account with none, changes nothing and appends nothing. Returns whether this
-    /// call retired a key.
+    /// retirement to the account's chain, in one transaction. An account with **no key** is
+    /// recorded as retired too (`retired_accounts`), so a later create-or-get for it is refused
+    /// like any retired account's; nothing is logged for it, since it has no chain. Idempotent: an
+    /// account already retired changes nothing. Returns whether this call changed anything.
     pub async fn retire_service_key(&self, account_id: &[u8; 16], time_ms: u64) -> Result<bool> {
         let mut tx = begin_write(&self.pool, &self.timeouts).await?;
-        let Some(found) = read(&mut tx, account_id).await? else {
-            tx.commit().await?;
-            return Ok(false);
+        let found = match lookup(&mut tx, account_id).await? {
+            None => {
+                sqlx::query("INSERT INTO retired_accounts (account_id) VALUES ($1)")
+                    .bind(account_id.as_slice())
+                    .execute(&mut *tx)
+                    .await?;
+                tx.commit().await?;
+                return Ok(true);
+            }
+            Some(ServiceKeyOutcome::RetiredWithoutKey) => {
+                tx.commit().await?;
+                return Ok(false);
+            }
+            Some(ServiceKeyOutcome::Key(found)) => found,
         };
         if found.state == ServiceKeyState::Retired {
             tx.commit().await?;

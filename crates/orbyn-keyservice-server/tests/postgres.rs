@@ -6,7 +6,8 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use orbyn_keyservice_server::{
-    CreateError, NewServiceKey, ServiceKeyState, Store, StoreError, migrate,
+    CreateError, NewServiceKey, ServiceKeyOutcome, ServiceKeyState, Store, StoreError, Timeouts,
+    migrate,
 };
 use orbyn_translog::map::{map_empty_root, verify};
 use orbyn_translog::merkle::{leaf_hash, tree_root};
@@ -243,6 +244,7 @@ async fn migrating_twice_changes_nothing_and_the_key_service_has_its_own_migrati
             "log_nodes",
             "map_nodes",
             "rate_events",
+            "retired_accounts",
             "service_keys"
         ]
     );
@@ -1610,6 +1612,7 @@ async fn creating_a_service_key_is_idempotent_and_logs_one_certification() {
         within(store.get_or_create_service_key(&account, 5, || no_error(new_key(2))))
             .await
             .expect("create");
+    let first = first.key().expect("a key");
     assert!(made);
     assert_eq!(first.public, [2; 33]);
     assert_eq!(first.state, ServiceKeyState::Held);
@@ -1622,7 +1625,7 @@ async fn creating_a_service_key_is_idempotent_and_logs_one_certification() {
     .await
     .expect("get");
     assert!(!made);
-    assert_eq!(second, first);
+    assert_eq!(second.key(), Some(first.clone()));
     assert_eq!(store.size().await.expect("size"), 1);
     // The log holds the certification, filed under the key's hash, readable back.
     let row = sqlx::query("SELECT payload FROM log_entries WHERE seq = 1")
@@ -1642,6 +1645,7 @@ async fn creating_a_service_key_is_idempotent_and_logs_one_certification() {
     let (other, _) = within(store.get_or_create_service_key(&[9; 16], 7, || no_error(new_key(3))))
         .await
         .expect("create other");
+    let other = other.key().expect("a key");
     assert_eq!(other.public, [3; 33]);
     assert_eq!(other.entry_index, 1);
     assert_eq!(store.service_key(&[8; 16]).await.expect("read"), None);
@@ -1664,7 +1668,7 @@ async fn creating_a_service_key_is_idempotent_and_logs_one_certification() {
 
 #[tokio::test]
 #[ignore = "needs ORBYN_KEYSERVICE_DATABASE_URL"]
-async fn a_failed_make_writes_nothing_and_racing_creates_make_one_key() {
+async fn a_failed_make_writes_nothing_and_racing_creates_keep_exactly_one_key() {
     let db = TestDb::new().await;
     let store = db.store().await;
     let failed =
@@ -1701,11 +1705,27 @@ async fn a_failed_make_writes_nothing_and_racing_creates_make_one_key() {
     while let Some(done) = within(tasks.join_next()).await {
         results.push(done.expect("task"));
     }
-    assert_eq!(makes.load(Ordering::SeqCst), 1);
+    // Each racer may have made a key (the HSM runs outside the lock), and exactly one was kept:
+    // one call stored it, and every call got that same key.
+    let made = makes.load(Ordering::SeqCst);
+    assert!((1..=8).contains(&made), "{made} keys made");
     assert_eq!(
         results.iter().filter(|r| r.as_ref().expect("ok").1).count(),
         1
     );
+    let keys: Vec<_> = results
+        .iter()
+        .map(|r| {
+            r.as_ref()
+                .expect("ok")
+                .0
+                .clone()
+                .key()
+                .expect("a key")
+                .public
+        })
+        .collect();
+    assert!(keys.iter().all(|k| *k == keys[0]), "one key for all");
     assert_eq!(store.size().await.expect("size"), 1);
     db.cleanup().await;
 }
@@ -1716,14 +1736,41 @@ async fn retiring_destroys_the_wrapped_key_logs_it_once_and_is_idempotent() {
     let db = TestDb::new().await;
     let store = db.store().await;
     let account = [1u8; 16];
-    // None to retire: nothing happens and nothing is logged.
+    // An account with no key is recorded as retired (so it cannot be given one later), and
+    // nothing is logged for it: it has no chain.
+    let never = [7u8; 16];
     assert!(
-        !store
-            .retire_service_key(&account, 1)
+        store
+            .retire_service_key(&never, 1)
             .await
             .expect("retire none")
     );
+    assert!(!store.retire_service_key(&never, 1).await.expect("again"));
     assert_eq!(store.size().await.expect("size"), 0);
+    assert_eq!(
+        store.service_key_outcome(&never).await.expect("read"),
+        Some(ServiceKeyOutcome::RetiredWithoutKey)
+    );
+    let (refused, made) = store
+        .get_or_create_service_key::<()>(&never, 2, || panic!("a retired account gets no key"))
+        .await
+        .expect("get");
+    assert!(!made);
+    assert_eq!(refused, ServiceKeyOutcome::RetiredWithoutKey);
+    assert_eq!(store.size().await.expect("size"), 0);
+    // And that fact cannot be changed or removed, even by the owner.
+    for pool in [&db.runtime, &db.owner] {
+        for sql in [
+            "DELETE FROM retired_accounts",
+            "UPDATE retired_accounts SET retired_at = now()",
+            "TRUNCATE retired_accounts",
+        ] {
+            let result = sqlx::query(AssertSqlSafe(sql.to_owned()))
+                .execute(pool)
+                .await;
+            assert!(result.is_err(), "{sql}");
+        }
+    }
     within(store.get_or_create_service_key(&account, 2, || no_error(new_key(2))))
         .await
         .expect("create");
@@ -1775,7 +1822,7 @@ async fn retiring_destroys_the_wrapped_key_logs_it_once_and_is_idempotent() {
         .await
         .expect("get");
     assert!(!made);
-    assert_eq!(again.state, ServiceKeyState::Retired);
+    assert_eq!(again.key().expect("a key").state, ServiceKeyState::Retired);
     assert_eq!(store.size().await.expect("size"), 2);
     // And the one change cannot be undone, even by the owner, nor made twice.
     for (db_pool, name) in [(&db.runtime, "runtime"), (&db.owner, "owner")] {
@@ -1842,5 +1889,77 @@ async fn the_rate_limit_counts_per_subject_and_forgets_after_its_window() {
     .await
     .expect("count");
     assert_eq!(n, 1, "the old events were removed");
+    db.cleanup().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs ORBYN_KEYSERVICE_DATABASE_URL"]
+async fn a_slow_hsm_does_not_hold_the_write_lock() {
+    let db = TestDb::new().await;
+    let store = db.store().await;
+    let (began, began_rx) = std::sync::mpsc::channel();
+    let creating = {
+        let store = store.clone();
+        tokio::spawn(async move {
+            store
+                .get_or_create_service_key(&[1; 16], 1, || {
+                    // The HSM starts, and hangs for a while.
+                    began.send(()).expect("signal");
+                    // As the daemon calls the HSM: blocking, off the runtime's other work.
+                    tokio::task::block_in_place(|| {
+                        std::thread::sleep(std::time::Duration::from_millis(2500))
+                    });
+                    no_error(new_key(2))
+                })
+                .await
+        })
+    };
+    // Wait until the HSM call is really under way, so the lock (if it were held) is held.
+    tokio::task::spawn_blocking(move || began_rx.recv_timeout(std::time::Duration::from_secs(30)))
+        .await
+        .expect("join")
+        .expect("the HSM call began");
+    let started = std::time::Instant::now();
+    within(store.append(&entry(MapId::Service, 9, [0; 32], 0)))
+        .await
+        .expect("append while the HSM is slow");
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(1500),
+        "the append waited {:?}",
+        started.elapsed()
+    );
+    let (made, stored) = within(creating).await.expect("task").expect("create");
+    assert!(stored);
+    assert!(made.key().is_some());
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "needs ORBYN_KEYSERVICE_DATABASE_URL"]
+async fn the_rate_limit_is_bounded_by_the_lock_timeout() {
+    let db = TestDb::new().await;
+    let store = db.store().await.with_timeouts(Timeouts {
+        lock: "200ms".to_owned(),
+        statement: "5s".to_owned(),
+    });
+    // Another session holds the lock this subject's count takes.
+    let mut holder = db.owner.begin().await.expect("begin");
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1 || encode($2, 'hex'), 0))")
+        .bind("act")
+        .bind(b"one".as_slice())
+        .execute(&mut *holder)
+        .await
+        .expect("hold");
+    let started = std::time::Instant::now();
+    let result = within(store.allow("act", b"one", 3, 3600)).await;
+    assert!(matches!(result, Err(StoreError::Busy)), "{result:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    holder.rollback().await.expect("release");
+    assert!(
+        store
+            .allow("act", b"one", 3, 3600)
+            .await
+            .expect("free again")
+    );
     db.cleanup().await;
 }

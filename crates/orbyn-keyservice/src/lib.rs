@@ -51,6 +51,10 @@ pub enum HsmError {
     Failed(String),
     #[error("the HSM returned something that is not a valid key")]
     BadKey,
+    /// The HSM answered with a PKCS#11 return code that is none of the set-up causes below: its
+    /// name, as the specification writes it (`CKR_DEVICE_ERROR`). Never carries key material.
+    #[error("the HSM returned an error ({0})")]
+    Rv(String),
     /// The HSM could not be used because of how it is set up, which an operator can fix. Told
     /// apart from [`HsmError::Failed`] so a binary can name the setting at fault.
     #[error("the HSM cannot be used: {0:?}")]

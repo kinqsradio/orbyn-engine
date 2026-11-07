@@ -50,13 +50,12 @@ fn help_goes_to_stdout_with_status_0_whichever_way_it_is_asked_for() {
 }
 
 #[test]
-fn no_command_and_an_unknown_command_get_the_help_on_stderr_with_status_1() {
-    for args in [&[][..], &["frobnicate"]] {
-        let out = run(args, &[]);
-        assert_eq!(text(&out.stdout), "");
-        assert_eq!(text(&out.stderr), format!("{}\n", messages::HELP));
-        assert_eq!(out.status.code(), Some(1));
-    }
+fn no_command_and_an_unknown_command_have_their_own_messages() {
+    assert_fails_with(&run(&[], &[]), &messages::no_command());
+    assert_fails_with(
+        &run(&["frobnicate"], &[]),
+        &messages::unknown_command("frobnicate"),
+    );
 }
 
 #[test]
@@ -73,7 +72,7 @@ fn init_and_serve_name_the_hsm_setting_that_is_missing_or_wrong() {
         );
         assert_fails_with(
             &run(&[command], &[ok_module, ("ORBYN_HSM_PIN", PIN)]),
-            &messages::hsm_slot(),
+            &messages::not_set("ORBYN_HSM_SLOT"),
         );
         assert_fails_with(
             &run(
@@ -88,7 +87,7 @@ fn init_and_serve_name_the_hsm_setting_that_is_missing_or_wrong() {
         );
         assert_fails_with(
             &run(&[command], &[ok_module, ("ORBYN_HSM_SLOT", "0")]),
-            &messages::hsm_pin(),
+            &messages::not_set("ORBYN_HSM_PIN"),
         );
         // A module that cannot be loaded.
         assert_fails_with(
@@ -116,13 +115,7 @@ fn init_and_serve_name_the_hsm_setting_that_is_missing_or_wrong() {
 #[test]
 fn migrate_checks_the_role_name_before_it_connects_and_never_prints_the_url() {
     let url = format!("postgres://owner:{PASSWORD}@127.0.0.1:1/db");
-    for role in [
-        "",
-        "Upper",
-        "has-dash",
-        "1starts_with_digit",
-        &"a".repeat(64),
-    ] {
+    for role in ["Upper", "has-dash", "1starts_with_digit", &"a".repeat(64)] {
         let out = run(
             &["migrate"],
             &[
@@ -141,12 +134,38 @@ fn migrate_checks_the_role_name_before_it_connects_and_never_prints_the_url() {
         ],
     );
     assert_fails_with(&out, &messages::migrate_database_unreachable());
-    // No URL at all is the same message.
+    // No URL at all, and no role at all, are settings that are not set.
     let out = run(
         &["migrate"],
         &[("ORBYN_KEYSERVICE_RUNTIME_ROLE", "orbyn_keyservice_runtime")],
     );
-    assert_fails_with(&out, &messages::migrate_database_unreachable());
+    assert_fails_with(
+        &out,
+        &messages::not_set("ORBYN_KEYSERVICE_MIGRATE_DATABASE_URL"),
+    );
+    let out = run(
+        &["migrate"],
+        &[("ORBYN_KEYSERVICE_MIGRATE_DATABASE_URL", &url)],
+    );
+    assert_fails_with(&out, &messages::not_set("ORBYN_KEYSERVICE_RUNTIME_ROLE"));
+}
+
+#[test]
+fn init_log_key_names_the_hsm_setting_that_is_missing_or_wrong() {
+    let out = run(
+        &["init-log-key"],
+        &[("ORBYN_HSM_SLOT", "0"), ("ORBYN_HSM_PIN", PIN)],
+    );
+    assert_fails_with(&out, &messages::hsm_module());
+    let out = run(
+        &["init-log-key"],
+        &[
+            ("ORBYN_HSM_MODULE", "/nonexistent/module.so"),
+            ("ORBYN_HSM_SLOT", "0"),
+            ("ORBYN_HSM_PIN", PIN),
+        ],
+    );
+    assert_fails_with(&out, &messages::hsm_module());
 }
 
 #[test]
@@ -187,9 +206,26 @@ fn a_failed_migration_names_its_own_number_and_nothing_else_is_guessed() {
         failed(17)
             .starts_with("error: migration 0017 failed\n  Migrations before 0017 are applied.")
     );
+    // The other states a recorded migration can be in each have their own text.
     assert_eq!(
-        cli::migration_message(&M::Dirty(3)),
-        messages::migration_failed(3)
+        cli::migration_message(&M::VersionMismatch(4)),
+        messages::migration_changed(4)
+    );
+    assert_eq!(
+        cli::migration_message(&M::VersionMissing(4)),
+        messages::migration_file_missing(4)
+    );
+    assert_eq!(
+        cli::migration_message(&M::VersionNotPresent(4)),
+        messages::migration_file_missing(4)
+    );
+    assert_eq!(
+        cli::migration_message(&M::Dirty(4)),
+        messages::migration_unfinished(4)
+    );
+    assert_eq!(
+        cli::migration_message(&M::VersionTooOld(4, 5)),
+        messages::migration_failed(4)
     );
 }
 

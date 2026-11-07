@@ -59,7 +59,7 @@ rustls-pki-types = { version = "1", features = ["std"] }
 rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "service"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 # MIT OR Apache-2.0. Dev only: makes the tests' private CA and server certificates.
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
 jiff = { version = "0.2", default-features = false, features = ["std", "serde"] }

@@ -112,9 +112,19 @@ async fn a_certification_appears_in_the_next_head_and_verifies_under_the_pinned_
 async fn retire_is_idempotent_logs_once_and_leaves_no_second_key() {
     let h = Harness::start().await;
     let ok = h.client(&h.client_ca.client("orbyn-server"));
-    // Nothing to retire: fine, and nothing is logged.
-    ok.retire(&A).await.expect("retire none");
+    // Retiring an account that never had a key is fine, logs nothing, and the account is retired
+    // all the same: a later create for it is refused, not served.
+    let never = [0xdd; 16];
+    ok.retire(&never).await.expect("retire none");
+    ok.retire(&never).await.expect("retire none again");
     assert!(kinds(&h).await.is_empty());
+    assert_eq!(ok.create_or_get(&never).await, Err(ClientError::Retired));
+    assert_eq!(ok.get(&never).await, Err(ClientError::Retired));
+    assert!(kinds(&h).await.is_empty(), "and still nothing is logged");
+    assert!(
+        h.audit.0.lock().expect("lock").is_empty(),
+        "no key, nothing to audit"
+    );
     let made = ok.create_or_get(&A).await.expect("create");
     ok.retire(&A).await.expect("retire");
     ok.retire(&A).await.expect("retire again");
@@ -275,52 +285,71 @@ async fn the_api_has_three_routes_and_no_way_to_open_derive_or_sign() {
             assert!(!route.path.contains(word), "{} names {word}", route.path);
         }
     }
-    // And the live server agrees: with the right certificate, everything else is 404 or 405.
+    // And the live server agrees, path by path and verb by verb, with the right certificate. What
+    // each answers is worked out here from the three routes the contract names, not from the
+    // table the router was built from, so a route registered anywhere else shows as a difference:
+    //  - a path that is no route's: exactly 404, never anything else (not 400, not 405);
+    //  - a route's path with a verb it does not have: 405;
+    //  - a route's own verb: it answers (400 here, since these bodies and ids are not valid).
     let raw = h.raw(Some(&h.client_ca.client("orbyn-server")));
     let id = hex(&A);
+    let expected = |method: &str, path: &str| -> u16 {
+        // A HEAD is answered as the GET it stands for.
+        let method = if method == "HEAD" { "GET" } else { method };
+        let rest = path.strip_prefix("/internal/v1/service-keys");
+        match rest {
+            Some("") => {
+                if method == "POST" {
+                    400
+                } else {
+                    405
+                }
+            }
+            Some(tail) if tail.starts_with('/') && !tail[1..].contains('/') && tail.len() > 1 => {
+                if method == "GET" || method == "DELETE" {
+                    400
+                } else {
+                    405
+                }
+            }
+            _ => 404,
+        }
+    };
     let paths = [
         "/".to_owned(),
+        "/internal".to_owned(),
+        "/internal/v1".to_owned(),
         "/internal/v1/open".to_owned(),
         "/internal/v1/derive".to_owned(),
         "/internal/v1/sign".to_owned(),
         "/internal/v1/envelopes/open".to_owned(),
+        "/internal/v1/service-keys".to_owned(),
         "/internal/v1/service-keys/open".to_owned(),
         format!("/internal/v1/service-keys/{id}/open"),
         format!("/internal/v1/service-keys/{id}/private"),
         format!("/internal/v1/service-keys/{id}/sign"),
         format!("/internal/v1/service-keys/{id}/derive"),
+        // A subpath of a route that a handler could be hung on.
+        format!("/internal/v1/service-keys/{id}/wrapped"),
+        format!("/internal/v1/service-keys/{id}/wrapped/extra"),
+        "/internal/v1/service-keys/wrapped".to_owned(),
         "/v1/service-keys".to_owned(),
-        "/internal/v1".to_owned(),
+        format!("/v1/service-keys/{id}"),
     ];
     for path in &paths {
-        for method in ["GET", "POST", "PUT", "PATCH", "DELETE"] {
-            let method: reqwest::Method = method.parse().expect("method");
-            let response = raw
-                .request(method.clone(), format!("{}{path}", h.url()))
+        for method in ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] {
+            let verb: reqwest::Method = method.parse().expect("method");
+            let status = raw
+                .request(verb, format!("{}{path}", h.url()))
                 .body("{}")
                 .send()
                 .await
-                .expect("answered");
-            let status = response.status().as_u16();
-            // `/internal/v1/service-keys/open` is the collection's one-segment path: a GET or DELETE
-            // of an account named "open" is a bad request, never an open.
-            assert!(
-                matches!(status, 400 | 404 | 405),
-                "{method} {path} answered {status}"
-            );
+                .expect("answered")
+                .status()
+                .as_u16();
+            let want = expected(method, path);
+            assert_eq!(status, want, "{method} {path}");
         }
-    }
-    // Verbs the account path does not have, and the collection's other verbs.
-    for method in ["PUT", "PATCH"] {
-        let response = raw
-            .request(
-                method.parse().expect("method"),
-                format!("{}/internal/v1/service-keys/{id}", h.url()),
-            )
-            .send()
-            .await
-            .expect("answered");
-        assert_eq!(response.status().as_u16(), 405);
     }
     // The HSM was asked for nothing: no unwrap, and only the statement kind was ever signed.
     assert_eq!(
@@ -498,4 +527,131 @@ fn the_identity_check_matches_a_name_and_nothing_near_it() {
         api::RECORD_SERVER
     ));
     assert!(!api::certificate_has_identity(&[], api::RECORD_SERVER));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs ORBYN_KEYSERVICE_DATABASE_URL"]
+async fn a_reload_closes_open_connections_so_a_revoked_client_must_present_its_certificate_again() {
+    let h = Harness::start().await;
+    let old = h.client_ca.client("orbyn-server");
+    // One client, so its second request would reuse the connection the first opened.
+    let client = h.client(&old);
+    client.create_or_get(&A).await.expect("served");
+    client.get(&A).await.expect("served again").expect("there");
+    assert_eq!(h.server.connections_accepted(), 1, "one connection so far");
+    // The old client CA is replaced and the settings reloaded.
+    let new_ca = common::Ca::new("client ca 2");
+    std::fs::write(&h.files.client_ca, &new_ca.pem).expect("write");
+    h.reload.reload().expect("reload");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // The same client, on what was its open connection, is not served: it has to connect again,
+    // and its certificate no longer chains to the CA.
+    assert_eq!(client.get(&A).await, Err(ClientError::Unavailable));
+    // A client of the new CA is served.
+    h.client(&new_ca.client("orbyn-server"))
+        .get(&A)
+        .await
+        .expect("served")
+        .expect("there");
+    // A reload that fails closes nothing.
+    let keep = h.client(&new_ca.client("orbyn-server"));
+    keep.get(&A).await.expect("served");
+    let before = h.server.connections_accepted();
+    std::fs::write(&h.files.client_ca, "not a certificate").expect("write");
+    assert!(h.reload.reload().is_err());
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    keep.get(&A).await.expect("same connection").expect("there");
+    assert_eq!(h.server.connections_accepted(), before);
+    h.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs ORBYN_KEYSERVICE_DATABASE_URL"]
+async fn a_connection_ends_after_its_request_limit_and_after_its_lifetime() {
+    use orbyn_keyservice_daemon::tls::Limits;
+    use std::time::Duration;
+    // By count: 7 requests at 3 a connection take 3 connections.
+    let h = Harness::start_with(Limits {
+        max_lifetime: Duration::from_secs(300),
+        max_requests: 3,
+    })
+    .await;
+    let client = h.client(&h.client_ca.client("orbyn-server"));
+    for _ in 0..7 {
+        assert_eq!(client.get(&A).await, Ok(None));
+    }
+    assert_eq!(h.server.connections_accepted(), 3);
+    h.finish().await;
+    // By age: a connection that has lived past the limit is closed after its next request.
+    let h = Harness::start_with(Limits {
+        max_lifetime: Duration::from_millis(300),
+        max_requests: 1000,
+    })
+    .await;
+    let client = h.client(&h.client_ca.client("orbyn-server"));
+    client.get(&A).await.expect("served");
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    client.get(&A).await.expect("served");
+    client.get(&A).await.expect("served");
+    assert!(h.server.connections_accepted() >= 2);
+    h.finish().await;
+    // The defaults are generous but finite, and one client's requests share one connection.
+    let h = Harness::start().await;
+    let client = h.client(&h.client_ca.client("orbyn-server"));
+    for _ in 0..7 {
+        client.get(&A).await.expect("served");
+    }
+    assert_eq!(h.server.connections_accepted(), 1);
+    assert_eq!(Limits::default().max_requests, 1000);
+    assert_eq!(Limits::default().max_lifetime, Duration::from_secs(300));
+    h.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs ORBYN_KEYSERVICE_DATABASE_URL"]
+async fn a_client_limited_to_tls_1_2_is_refused() {
+    let h = Harness::start().await;
+    let leaf = h.client_ca.client("orbyn-server");
+    let url = format!(
+        "{}{}/{}",
+        h.url(),
+        orbyn_keyservice_client::COLLECTION,
+        hex(&A)
+    );
+    let build = |max: reqwest::tls::Version| {
+        reqwest::Client::builder()
+            .use_rustls_tls()
+            .max_tls_version(max)
+            .tls_built_in_root_certs(false)
+            .add_root_certificate(
+                reqwest::Certificate::from_pem(h.server_ca.pem.as_bytes()).expect("ca"),
+            )
+            .identity(reqwest::Identity::from_pem(&leaf.identity_pem()).expect("identity"))
+            .no_proxy()
+            .build()
+            .expect("client")
+    };
+    // The control: the same client allowed TLS 1.3 is answered.
+    let status = build(reqwest::tls::Version::TLS_1_3)
+        .get(&url)
+        .send()
+        .await
+        .expect("answered")
+        .status()
+        .as_u16();
+    assert_eq!(status, 404);
+    // Limited to 1.2, it gets no answer at all.
+    assert!(
+        build(reqwest::tls::Version::TLS_1_2)
+            .get(&url)
+            .send()
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        h.server.connections_accepted(),
+        1,
+        "no handshake finished for it"
+    );
+    h.finish().await;
 }

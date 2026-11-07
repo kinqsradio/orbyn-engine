@@ -13,27 +13,36 @@ Runs the key service that holds the service keys for Standard protection in a ha
 Usage: orbyn-keyservice <COMMAND>
 
 Commands:
-  serve    Run the key service
-  migrate  Create or update the database tables
-  init     Create the service identity key in the HSM
-  help     Print this message or the help of a command
+  serve         Run the key service
+  migrate       Create or update the database tables
+  init          Create the service identity key in the HSM
+  init-log-key  Create log key 1 in the HSM and print its public key
+  help          Print this message or the help of a command
 
 Options:
   -h, --help  Print help
 
-Settings (environment variables). None has a default, and the service does not start without them.
+Settings (environment variables). Only ORBYN_KS_IDENTITY_VERSION has a default (1). The service does not start without the others.
 
   ORBYN_KEYSERVICE_DATABASE_URL          Database the key service uses (never printed)
   ORBYN_KS_INTERNAL_BIND                 Internal address to listen on
   ORBYN_KS_TLS_CERT                      Path to the server certificate file
   ORBYN_KS_TLS_KEY                       Path to the server private key file
   ORBYN_KS_CLIENT_CA                     Path to the authority file that signs client certificates
-  ORBYN_KS_IDENTITY_VERSION              Version of the service identity key in the HSM to use
+  ORBYN_KS_IDENTITY_VERSION              Version of the service identity key in the HSM to use [default: 1]
   ORBYN_KEYSERVICE_MIGRATE_DATABASE_URL  Owner database connection, used only by migrate (never printed)
   ORBYN_KEYSERVICE_RUNTIME_ROLE          Database role the service runs as; not a superuser, not a member of the owner role
   ORBYN_HSM_MODULE                       Path to the HSM's PKCS#11 module
   ORBYN_HSM_SLOT                         HSM slot that holds the keys
   ORBYN_HSM_PIN                          PIN for the HSM slot (never printed)
+
+Head publisher settings:
+
+  ORBYN_KS_WITNESSES                     Witness URLs (https)
+  ORBYN_KS_WITNESS_KEYS                  Public keys of the witnesses, 64 hex digits each
+  ORBYN_KS_WITNESS_THRESHOLD             How many witnesses must cosign (more than half)
+  ORBYN_KS_LOG_KEY_VERSION               Version of the log key in the HSM to sign heads with
+  ORBYN_KS_HEAD_INTERVAL_SECS            How often to publish a head, 60 to 900 seconds
 ";
 
 /// The reload signal's log lines. Written by `tracing`, never to stderr.
@@ -55,7 +64,7 @@ pub fn init_created(public_hex: &str) -> String {
 pub fn already_initialised() -> String {
     error(
         "the key service is already initialised",
-        "Nothing was changed. Set ORBYN_KS_IDENTITY_VERSION to choose the version serve should use.",
+        "Nothing was changed. serve uses the existing key (version 1).",
     )
 }
 
@@ -82,9 +91,20 @@ pub fn hsm_slot() -> String {
 
 pub fn hsm_pin() -> String {
     error(
-        "the HSM did not accept ORBYN_HSM_PIN",
+        "the HSM refused to log in (ORBYN_HSM_PIN)",
         "Check the PIN. It is never printed, and too many wrong tries can lock the slot.",
     )
+}
+
+/// `init-log-key`: the key is always version 1, and its public key is printed once.
+pub fn log_key_created(public_hex: &str) -> String {
+    format!(
+        "Created log key 1. Public key:\n{public_hex}\nThis is the only time the public key is printed. Save it."
+    )
+}
+
+pub fn log_key_exists() -> String {
+    error("log key 1 already exists", "Nothing was changed.")
 }
 
 // migrate
@@ -112,8 +132,8 @@ pub fn role_missing(role: &str) -> String {
 
 pub fn role_superuser(role: &str) -> String {
     error(
-        &format!("the runtime role is a superuser ({role})"),
-        "The service must not run as a superuser. Choose a role without that privilege.",
+        &format!("the runtime role is a superuser or can create roles ({role})"),
+        "The service must not run with those privileges. Choose a role without them with ORBYN_KEYSERVICE_RUNTIME_ROLE.",
     )
 }
 
@@ -134,6 +154,74 @@ pub fn migration_failed(version: i64) -> String {
     )
 }
 
+pub fn migration_changed(version: i64) -> String {
+    error(
+        &format!("migration {version:04} was changed after it was applied"),
+        "Don't edit applied migrations. Restore the original file.",
+    )
+}
+
+pub fn migration_file_missing(version: i64) -> String {
+    error(
+        &format!("migration {version:04} is recorded as applied, but its file is missing"),
+        "Use a build that includes it.",
+    )
+}
+
+pub fn migration_unfinished(version: i64) -> String {
+    error(
+        &format!("migration {version:04} did not finish"),
+        "The database may be half-migrated. Restore it from a backup, then run migrate again.",
+    )
+}
+
+/// The HSM answered with a return code that is none of the causes above; `code` is its
+/// PKCS#11 name, as in `CKR_DEVICE_ERROR`.
+pub fn hsm_error(code: &str) -> String {
+    error(
+        &format!("the HSM returned an error ({code})"),
+        "Check the HSM's own log. If it keeps happening, restart the HSM.",
+    )
+}
+
+// settings and commands
+
+/// The general pattern for a required setting that is not set.
+pub fn not_set(setting: &str) -> String {
+    error(
+        &format!("{setting} is not set"),
+        "Set it in the environment. Run orbyn-keyservice --help to see what it does.",
+    )
+}
+
+pub fn bind_not_set() -> String {
+    error(
+        "ORBYN_KS_INTERNAL_BIND is not set",
+        "Set it to the address to listen on, for example 10.0.0.5:8443.",
+    )
+}
+
+pub fn bind_invalid() -> String {
+    error(
+        "ORBYN_KS_INTERNAL_BIND is not a valid address",
+        "Use host:port, for example 10.0.0.5:8443.",
+    )
+}
+
+pub fn no_command() -> String {
+    error(
+        "no command given",
+        "Run orbyn-keyservice --help to see the commands.",
+    )
+}
+
+pub fn unknown_command(command: &str) -> String {
+    error(
+        &format!("unknown command '{command}'"),
+        "Run orbyn-keyservice --help to see the commands.",
+    )
+}
+
 // serve
 
 pub fn identity_missing(version: &str) -> String {
@@ -150,10 +238,11 @@ pub fn serve_database_unreachable() -> String {
     )
 }
 
-pub fn role_unsafe(role: &str) -> String {
+/// `serve` runs as the user in `ORBYN_KEYSERVICE_DATABASE_URL`, so that is the setting at fault.
+pub fn database_user_unsafe() -> String {
     error(
-        &format!("the runtime role is unsafe ({role})"),
-        "It must not be a superuser or a member of the owner role. Choose another with ORBYN_KEYSERVICE_RUNTIME_ROLE.",
+        "the database user is unsafe (ORBYN_KEYSERVICE_DATABASE_URL)",
+        "The service runs as the user in that setting. Use a role that is not a superuser, cannot create roles, and is not a member of the owner role.",
     )
 }
 

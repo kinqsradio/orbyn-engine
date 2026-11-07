@@ -1,5 +1,6 @@
-//! The operator text, word for word from Account Designs v50 ("Key service"): each expected
-//! string below is copied from the design's own block, so a changed word fails here.
+//! The operator text, word for word from Account Designs v51 (orbyn-designs#45, frames ks-help,
+//! ks-help-settings, ks-init, ks-init-log-key, ks-config-errors, ks-migrate, ks-serve, ks-reload):
+//! each expected string below is copied from the design's own block, so a changed word fails here.
 
 use orbyn_keyservice_daemon::messages;
 
@@ -7,7 +8,7 @@ use orbyn_keyservice_daemon::messages;
 fn each_message_is_the_designed_text() {
     assert_eq!(
         messages::already_initialised(),
-        "error: the key service is already initialised\n  Nothing was changed. Set ORBYN_KS_IDENTITY_VERSION to choose the version serve should use."
+        "error: the key service is already initialised\n  Nothing was changed. serve uses the existing key (version 1)."
     );
     assert_eq!(
         messages::hsm_unreachable(),
@@ -23,7 +24,39 @@ fn each_message_is_the_designed_text() {
     );
     assert_eq!(
         messages::hsm_pin(),
-        "error: the HSM did not accept ORBYN_HSM_PIN\n  Check the PIN. It is never printed, and too many wrong tries can lock the slot."
+        "error: the HSM refused to log in (ORBYN_HSM_PIN)\n  Check the PIN. It is never printed, and too many wrong tries can lock the slot."
+    );
+    assert_eq!(
+        messages::hsm_error("CKR_DEVICE_ERROR"),
+        "error: the HSM returned an error (CKR_DEVICE_ERROR)\n  Check the HSM's own log. If it keeps happening, restart the HSM."
+    );
+    assert_eq!(
+        messages::log_key_exists(),
+        "error: log key 1 already exists\n  Nothing was changed."
+    );
+    assert_eq!(
+        messages::bind_not_set(),
+        "error: ORBYN_KS_INTERNAL_BIND is not set\n  Set it to the address to listen on, for example 10.0.0.5:8443."
+    );
+    assert_eq!(
+        messages::bind_invalid(),
+        "error: ORBYN_KS_INTERNAL_BIND is not a valid address\n  Use host:port, for example 10.0.0.5:8443."
+    );
+    assert_eq!(
+        messages::not_set("ORBYN_KS_TLS_CERT"),
+        "error: ORBYN_KS_TLS_CERT is not set\n  Set it in the environment. Run orbyn-keyservice --help to see what it does."
+    );
+    assert_eq!(
+        messages::not_set("ORBYN_HSM_SLOT"),
+        "error: ORBYN_HSM_SLOT is not set\n  Set it in the environment. Run orbyn-keyservice --help to see what it does."
+    );
+    assert_eq!(
+        messages::no_command(),
+        "error: no command given\n  Run orbyn-keyservice --help to see the commands."
+    );
+    assert_eq!(
+        messages::unknown_command("frobnicate"),
+        "error: unknown command 'frobnicate'\n  Run orbyn-keyservice --help to see the commands."
     );
     assert_eq!(
         messages::migrate_database_unreachable(),
@@ -39,7 +72,7 @@ fn each_message_is_the_designed_text() {
     );
     assert_eq!(
         messages::role_superuser("orbyn_keyservice_runtime"),
-        "error: the runtime role is a superuser (orbyn_keyservice_runtime)\n  The service must not run as a superuser. Choose a role without that privilege."
+        "error: the runtime role is a superuser or can create roles (orbyn_keyservice_runtime)\n  The service must not run with those privileges. Choose a role without them with ORBYN_KEYSERVICE_RUNTIME_ROLE."
     );
     assert_eq!(
         messages::role_owner_member("orbyn_keyservice_runtime"),
@@ -50,6 +83,18 @@ fn each_message_is_the_designed_text() {
         "error: migration 0004 failed\n  Migrations before 0004 are applied. Check the database log for the cause, then run migrate again."
     );
     assert_eq!(
+        messages::migration_changed(4),
+        "error: migration 0004 was changed after it was applied\n  Don't edit applied migrations. Restore the original file."
+    );
+    assert_eq!(
+        messages::migration_file_missing(4),
+        "error: migration 0004 is recorded as applied, but its file is missing\n  Use a build that includes it."
+    );
+    assert_eq!(
+        messages::migration_unfinished(4),
+        "error: migration 0004 did not finish\n  The database may be half-migrated. Restore it from a backup, then run migrate again."
+    );
+    assert_eq!(
         messages::identity_missing("1"),
         "error: the service identity key isn't in the HSM (version 1)\n  Run init first, or set ORBYN_KS_IDENTITY_VERSION to a version the HSM has."
     );
@@ -58,8 +103,8 @@ fn each_message_is_the_designed_text() {
         "error: the database can't be reached (ORBYN_KEYSERVICE_DATABASE_URL)\n  Check the host, port and credentials in that setting, and that the database is running. The setting is never printed."
     );
     assert_eq!(
-        messages::role_unsafe("orbyn_keyservice_runtime"),
-        "error: the runtime role is unsafe (orbyn_keyservice_runtime)\n  It must not be a superuser or a member of the owner role. Choose another with ORBYN_KEYSERVICE_RUNTIME_ROLE."
+        messages::database_user_unsafe(),
+        "error: the database user is unsafe (ORBYN_KEYSERVICE_DATABASE_URL)\n  The service runs as the user in that setting. Use a role that is not a superuser, cannot create roles, and is not a member of the owner role."
     );
     assert_eq!(
         messages::tls_cert_unreadable(),
@@ -91,7 +136,7 @@ fn each_message_is_the_designed_text() {
 fn the_help_is_the_designed_help_then_the_designed_settings() {
     assert_eq!(
         messages::HELP,
-        "Runs the key service that holds the service keys for Standard protection in a hardware security module (HSM).\n\nUsage: orbyn-keyservice <COMMAND>\n\nCommands:\n  serve    Run the key service\n  migrate  Create or update the database tables\n  init     Create the service identity key in the HSM\n  help     Print this message or the help of a command\n\nOptions:\n  -h, --help  Print help\n\nSettings (environment variables). None has a default, and the service does not start without them.\n\n  ORBYN_KEYSERVICE_DATABASE_URL          Database the key service uses (never printed)\n  ORBYN_KS_INTERNAL_BIND                 Internal address to listen on\n  ORBYN_KS_TLS_CERT                      Path to the server certificate file\n  ORBYN_KS_TLS_KEY                       Path to the server private key file\n  ORBYN_KS_CLIENT_CA                     Path to the authority file that signs client certificates\n  ORBYN_KS_IDENTITY_VERSION              Version of the service identity key in the HSM to use\n  ORBYN_KEYSERVICE_MIGRATE_DATABASE_URL  Owner database connection, used only by migrate (never printed)\n  ORBYN_KEYSERVICE_RUNTIME_ROLE          Database role the service runs as; not a superuser, not a member of the owner role\n  ORBYN_HSM_MODULE                       Path to the HSM's PKCS#11 module\n  ORBYN_HSM_SLOT                         HSM slot that holds the keys\n  ORBYN_HSM_PIN                          PIN for the HSM slot (never printed)\n"
+        "Runs the key service that holds the service keys for Standard protection in a hardware security module (HSM).\n\nUsage: orbyn-keyservice <COMMAND>\n\nCommands:\n  serve         Run the key service\n  migrate       Create or update the database tables\n  init          Create the service identity key in the HSM\n  init-log-key  Create log key 1 in the HSM and print its public key\n  help          Print this message or the help of a command\n\nOptions:\n  -h, --help  Print help\n\nSettings (environment variables). Only ORBYN_KS_IDENTITY_VERSION has a default (1). The service does not start without the others.\n\n  ORBYN_KEYSERVICE_DATABASE_URL          Database the key service uses (never printed)\n  ORBYN_KS_INTERNAL_BIND                 Internal address to listen on\n  ORBYN_KS_TLS_CERT                      Path to the server certificate file\n  ORBYN_KS_TLS_KEY                       Path to the server private key file\n  ORBYN_KS_CLIENT_CA                     Path to the authority file that signs client certificates\n  ORBYN_KS_IDENTITY_VERSION              Version of the service identity key in the HSM to use [default: 1]\n  ORBYN_KEYSERVICE_MIGRATE_DATABASE_URL  Owner database connection, used only by migrate (never printed)\n  ORBYN_KEYSERVICE_RUNTIME_ROLE          Database role the service runs as; not a superuser, not a member of the owner role\n  ORBYN_HSM_MODULE                       Path to the HSM's PKCS#11 module\n  ORBYN_HSM_SLOT                         HSM slot that holds the keys\n  ORBYN_HSM_PIN                          PIN for the HSM slot (never printed)\n\nHead publisher settings:\n\n  ORBYN_KS_WITNESSES                     Witness URLs (https)\n  ORBYN_KS_WITNESS_KEYS                  Public keys of the witnesses, 64 hex digits each\n  ORBYN_KS_WITNESS_THRESHOLD             How many witnesses must cosign (more than half)\n  ORBYN_KS_LOG_KEY_VERSION               Version of the log key in the HSM to sign heads with\n  ORBYN_KS_HEAD_INTERVAL_SECS            How often to publish a head, 60 to 900 seconds\n"
     );
 }
 
@@ -100,6 +145,16 @@ fn init_prints_the_designed_success_line_and_the_key() {
     assert_eq!(
         messages::init_created("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
         "Created the service identity key (version 1). Public key:\n0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    );
+}
+
+#[test]
+fn init_log_key_prints_the_designed_success_text_once() {
+    assert_eq!(
+        messages::log_key_created(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        ),
+        "Created log key 1. Public key:\n0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nThis is the only time the public key is printed. Save it."
     );
 }
 

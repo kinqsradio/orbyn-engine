@@ -20,6 +20,8 @@ const MAX_ANSWER: usize = 16 * 1024;
 /// An account's service key as the API answers it: public data only, hex for each byte string.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceKeyAnswer {
+    /// The account the answer is for, 16 bytes in hex. The client refuses an answer for another.
+    pub account_id: String,
     pub identity_version: u32,
     /// The compressed P-256 key, 33 bytes.
     pub public_key: String,
@@ -114,6 +116,8 @@ impl Client {
             reqwest::Identity::from_pem(config.identity_pem).map_err(|_| ClientError::Settings)?;
         let http = reqwest::Client::builder()
             .use_rustls_tls()
+            // The service speaks TLS 1.3 only; so does this client.
+            .min_tls_version(reqwest::tls::Version::TLS_1_3)
             .tls_built_in_root_certs(false)
             .add_root_certificate(ca)
             .identity(identity)
@@ -149,7 +153,7 @@ impl Client {
         let status = response.status().as_u16();
         let bytes = read_limited(response).await?;
         match status {
-            200 | 201 => parse(&bytes),
+            200 | 201 => parse(&bytes, account_id),
             other => Err(error_for(other, &bytes)),
         }
     }
@@ -168,7 +172,7 @@ impl Client {
         let status = response.status().as_u16();
         let bytes = read_limited(response).await?;
         match status {
-            200 => parse(&bytes).map(Some),
+            200 => parse(&bytes, account_id).map(Some),
             404 => Ok(None),
             other => Err(error_for(other, &bytes)),
         }
@@ -191,11 +195,13 @@ impl Client {
     }
 }
 
-fn parse(bytes: &[u8]) -> Result<ServiceKeyAnswer, ClientError> {
+fn parse(bytes: &[u8], asked: &[u8; 16]) -> Result<ServiceKeyAnswer, ClientError> {
     let answer: ServiceKeyAnswer =
         serde_json::from_slice(bytes).map_err(|_| ClientError::Invalid)?;
-    // The shapes are checked here, so a caller can rely on them.
-    if unhex::<33>(&answer.public_key).is_none()
+    // The shapes are checked here, so a caller can rely on them, and so is whose key it is: an
+    // answer for another account is never passed on as this one's.
+    if unhex::<16>(&answer.account_id).as_ref() != Some(asked)
+        || unhex::<33>(&answer.public_key).is_none()
         || unhex::<32>(&answer.statement_hash).is_none()
         || unhex::<64>(&answer.signature).is_none()
     {
@@ -236,4 +242,41 @@ async fn read_limited(mut response: reqwest::Response) -> Result<Vec<u8>, Client
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn answer_for(account: &[u8; 16]) -> Vec<u8> {
+        serde_json::to_vec(&ServiceKeyAnswer {
+            account_id: hex(account),
+            identity_version: 1,
+            public_key: "02".repeat(33),
+            statement_hash: "03".repeat(32),
+            signature: "04".repeat(64),
+            entry_index: 0,
+            head_covers_entry: None,
+        })
+        .expect("json")
+    }
+
+    #[test]
+    fn an_answer_for_another_account_is_refused() {
+        let asked = [1u8; 16];
+        assert!(parse(&answer_for(&asked), &asked).is_ok());
+        assert_eq!(
+            parse(&answer_for(&[2; 16]), &asked),
+            Err(ClientError::Invalid)
+        );
+        // An answer with no account at all, or a malformed one, is refused too.
+        assert_eq!(parse(b"{}", &asked), Err(ClientError::Invalid));
+        let mut wrong_length =
+            serde_json::from_slice::<serde_json::Value>(&answer_for(&asked)).expect("json");
+        wrong_length["account_id"] = "01".repeat(15).into();
+        assert_eq!(
+            parse(&serde_json::to_vec(&wrong_length).expect("json"), &asked),
+            Err(ClientError::Invalid)
+        );
+    }
 }

@@ -26,7 +26,9 @@ mod service_keys;
 
 pub use head::StoredHead;
 pub use log::Appended;
-pub use service_keys::{CreateError, NewServiceKey, ServiceKeyRecord, ServiceKeyState};
+pub use service_keys::{
+    CreateError, NewServiceKey, ServiceKeyOutcome, ServiceKeyRecord, ServiceKeyState,
+};
 
 // The log and the maps are reached only through `Store`: it takes the write lock, starts the
 // transaction at READ COMMITTED with timeouts, and has been through the role check. Their write
@@ -191,7 +193,8 @@ pub async fn migrate(owner: &PgPool, runtime_role: &str) -> Result<()> {
         "REVOKE CREATE ON SCHEMA public FROM PUBLIC".to_owned(),
         format!("GRANT USAGE ON SCHEMA public TO {role}"),
         format!(
-            "GRANT SELECT, INSERT ON service_keys, log_entries, log_nodes, map_nodes, heads TO {role}"
+            "GRANT SELECT, INSERT ON service_keys, retired_accounts, log_entries, log_nodes, map_nodes, \
+             heads TO {role}"
         ),
         // The one change an entry ever gets: the head that covers it.
         format!("GRANT UPDATE (included_in_head) ON log_entries TO {role}"),
@@ -231,8 +234,9 @@ pub async fn migrate(owner: &PgPool, runtime_role: &str) -> Result<()> {
 }
 
 /// The tables the key service owns, by name.
-const TABLES: [&str; 6] = [
+const TABLES: [&str; 7] = [
     "service_keys",
+    "retired_accounts",
     "log_entries",
     "log_nodes",
     "map_nodes",
@@ -449,6 +453,14 @@ impl Store {
     ) -> Result<bool> {
         let window = i64::try_from(window_secs).map_err(|_| StoreError::BadEntry)?;
         let mut tx = self.pool.begin().await?;
+        // The same bounds a write has: a stuck lock or statement is an error, not a queue.
+        sqlx::query(
+            "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true)",
+        )
+        .bind(&self.timeouts.lock)
+        .bind(&self.timeouts.statement)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1 || encode($2, 'hex'), 0))")
             .bind(action)
             .bind(subject)

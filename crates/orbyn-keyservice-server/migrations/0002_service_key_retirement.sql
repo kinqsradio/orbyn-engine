@@ -29,3 +29,18 @@ $$;
 
 CREATE TRIGGER ks_service_keys_update BEFORE UPDATE ON service_keys
     FOR EACH ROW EXECUTE FUNCTION ks_service_keys_update();
+
+-- An account retired before it ever had a key (an Advanced account that asks to retire): there is
+-- no service_keys row to mark, so the fact is a row of its own. A later create-or-get for it is
+-- refused like any retired account's, until generations exist. Append-only like the rest.
+CREATE TABLE retired_accounts (
+    account_id bytea PRIMARY KEY CHECK (length(account_id) = 16),
+    retired_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TRIGGER ks_retired_accounts_update BEFORE UPDATE ON retired_accounts
+    FOR EACH ROW EXECUTE FUNCTION ks_refuse();
+CREATE TRIGGER ks_retired_accounts_delete BEFORE DELETE ON retired_accounts
+    FOR EACH ROW EXECUTE FUNCTION ks_refuse();
+CREATE TRIGGER ks_retired_accounts_truncate BEFORE TRUNCATE ON retired_accounts
+    FOR EACH STATEMENT EXECUTE FUNCTION ks_refuse();

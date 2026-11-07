@@ -15,14 +15,14 @@ use axum::extract::{DefaultBodyLimit, Path, Request, State as AxumState};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{MethodRouter, get, post};
+use axum::routing::{MethodRouter, delete, get, post};
 use axum::{Json, Router};
 use orbyn_keyservice::{CertifiedServiceKey, Hsm};
 use orbyn_keyservice_client::{
     COLLECTION, CreateRequest, ErrorAnswer, ServiceKeyAnswer, hex, unhex,
 };
 use orbyn_keyservice_server::{
-    CreateError, NewServiceKey, ServiceKeyRecord, ServiceKeyState, StoreError,
+    CreateError, NewServiceKey, ServiceKeyOutcome, ServiceKeyRecord, StoreError,
 };
 use orbyn_translog::service_account_map_key;
 use rustls_pki_types::{CertificateDer, ServerName};
@@ -42,15 +42,49 @@ pub const RECORD_SERVER: Identity = Identity("orbyn-server");
 #[derive(Clone, Debug)]
 pub struct PeerCert(pub Arc<Vec<u8>>);
 
+/// Which handler a route runs. Every route is one of these, and [`router`] has one arm for each
+/// (a `match` with no wildcard), so a new handler cannot exist without a variant here, and a
+/// variant cannot be routed without an entry in [`ENDPOINTS`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Handler {
+    Create,
+    Read,
+    Retire,
+}
+
 /// One row of the route table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RouteInfo {
+    pub handler: Handler,
     pub method: &'static str,
     pub path: &'static str,
     pub allowed: Identity,
 }
 
 const ACCOUNT_PATH: &str = "/internal/v1/service-keys/{account_id}";
+
+/// The route table, and the **only** thing [`router`] registers routes from. [`routes`] reports
+/// it, so what a test lists is what is served, and every entry names who may call it.
+pub const ENDPOINTS: [RouteInfo; 3] = [
+    RouteInfo {
+        handler: Handler::Create,
+        method: "POST",
+        path: COLLECTION,
+        allowed: RECORD_SERVER,
+    },
+    RouteInfo {
+        handler: Handler::Read,
+        method: "GET",
+        path: ACCOUNT_PATH,
+        allowed: RECORD_SERVER,
+    },
+    RouteInfo {
+        handler: Handler::Retire,
+        method: "DELETE",
+        path: ACCOUNT_PATH,
+        allowed: RECORD_SERVER,
+    },
+];
 
 /// The longest request this API reads. Its one body is `{"account_id": "<32 hex digits>"}`.
 const MAX_BODY: usize = 1024;
@@ -59,58 +93,26 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The routes and who may call each. This is the whole surface of the API.
 pub fn routes() -> Vec<RouteInfo> {
-    vec![
-        RouteInfo {
-            method: "POST",
-            path: COLLECTION,
-            allowed: RECORD_SERVER,
-        },
-        RouteInfo {
-            method: "GET",
-            path: ACCOUNT_PATH,
-            allowed: RECORD_SERVER,
-        },
-        RouteInfo {
-            method: "DELETE",
-            path: ACCOUNT_PATH,
-            allowed: RECORD_SERVER,
-        },
-    ]
+    ENDPOINTS.to_vec()
 }
 
-struct Table<H: Hsm> {
-    router: Router<Arc<State<H>>>,
-}
-
-impl<H: Hsm + Send + Sync + 'static> Table<H> {
-    /// Adds one endpoint. `allowed` is required: there is no way to add a route without it.
-    fn route(
-        self,
-        path: &'static str,
-        handler: MethodRouter<Arc<State<H>>>,
-        allowed: Identity,
-    ) -> Self {
-        let guarded = handler.layer(middleware::from_fn_with_state(allowed, require_identity));
-        Self {
-            router: self.router.route(path, guarded),
-        }
-    }
-}
-
-/// The internal API's router. Without a verified client certificate on the request (only the TLS
-/// accept loop attaches one) every endpoint answers 403.
+/// The internal API's router, built from [`ENDPOINTS`] alone. Without a verified client
+/// certificate on the request (only the TLS accept loop attaches one) every endpoint answers 403.
 pub fn router<H: Hsm + Send + Sync + 'static>(state: Arc<State<H>>) -> Router {
-    let table = Table::<H> {
-        router: Router::new(),
+    let mut router = Router::<Arc<State<H>>>::new();
+    for endpoint in ENDPOINTS {
+        let handler: MethodRouter<Arc<State<H>>> = match endpoint.handler {
+            Handler::Create => post(create::<H>),
+            Handler::Read => get(read::<H>),
+            Handler::Retire => delete(retire::<H>),
+        };
+        let guarded = handler.layer(middleware::from_fn_with_state(
+            endpoint.allowed,
+            require_identity,
+        ));
+        router = router.route(endpoint.path, guarded);
     }
-    .route(COLLECTION, post(create::<H>), RECORD_SERVER)
-    .route(
-        ACCOUNT_PATH,
-        get(read::<H>).delete(retire::<H>),
-        RECORD_SERVER,
-    );
-    table
-        .router
+    router
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .layer(middleware::from_fn(time_limit))
         .with_state(state)
@@ -170,6 +172,7 @@ fn blocking<T>(f: impl FnOnce() -> T) -> T {
 
 fn answer(record: &ServiceKeyRecord, read: bool) -> ServiceKeyAnswer {
     ServiceKeyAnswer {
+        account_id: hex(&record.account_id),
         identity_version: record.identity_version,
         public_key: hex(&record.public),
         statement_hash: hex(&orbyn_crypto::service_key_statement_hash(&record.statement)),
@@ -229,10 +232,13 @@ async fn create<H: Hsm + Send + Sync + 'static>(
         })
         .await;
     match made {
-        Ok((record, _)) if record.state == ServiceKeyState::Retired => {
+        Ok((outcome, _)) if outcome.is_retired() => {
             error(StatusCode::CONFLICT, "service_key_retired")
         }
-        Ok((record, created)) => {
+        Ok((ServiceKeyOutcome::RetiredWithoutKey, _)) => {
+            error(StatusCode::CONFLICT, "service_key_retired")
+        }
+        Ok((ServiceKeyOutcome::Key(record), created)) => {
             if created {
                 state.audit.record(&AuditEvent::Certified {
                     map_key: service_account_map_key(&record.public),
@@ -262,12 +268,17 @@ async fn read<H: Hsm + Send + Sync + 'static>(
     let Some(account_id) = unhex::<16>(&account_id) else {
         return error(StatusCode::BAD_REQUEST, "bad_request");
     };
-    match state.store.service_key(&account_id).await {
+    match state.store.service_key_outcome(&account_id).await {
         Ok(None) => error(StatusCode::NOT_FOUND, "not_found"),
-        Ok(Some(record)) if record.state == ServiceKeyState::Retired => {
+        Ok(Some(outcome)) if outcome.is_retired() => {
             error(StatusCode::CONFLICT, "service_key_retired")
         }
-        Ok(Some(record)) => (StatusCode::OK, Json(answer(&record, true))).into_response(),
+        Ok(Some(ServiceKeyOutcome::Key(record))) => {
+            (StatusCode::OK, Json(answer(&record, true))).into_response()
+        }
+        Ok(Some(ServiceKeyOutcome::RetiredWithoutKey)) => {
+            error(StatusCode::CONFLICT, "service_key_retired")
+        }
         Err(e) => store_failure(&e),
     }
 }
