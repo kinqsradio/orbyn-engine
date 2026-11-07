@@ -2,7 +2,7 @@
 
 The open-source core every Orbyn app shares: one account, encrypted sync and the keychain under every Orbyn app. Orbyn Planner is the first app on it; Orbyn Engineering, Orbyn Notes and Orbyn Studio are planned to join. It has two halves: the device core that every app embeds, which keeps everything on the device and syncs it encrypted end to end, and the server, which holds accounts, encrypted records and keys and ships as one Docker image.
 
-**Private by design · Local first · One account · Agent ready.** Records are encrypted on the device before upload, every device works offline and keeps a full copy, one account signs in to every Orbyn app, and agents reach it only through grants the person controls.
+**Private by design · Local first · One account · Agent ready.** Records are encrypted on the device before upload, every device works offline and keeps a full copy, one account signs in to every Orbyn app, and agents will reach it only through grants the person controls (planned).
 
 Status: early. Nothing here is released.
 
