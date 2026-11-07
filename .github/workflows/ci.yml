@@ -37,6 +37,7 @@ jobs:
       platform: ${{ steps.scope.outputs.platform }}
       docker: ${{ steps.scope.outputs.docker }}
       audit: ${{ steps.scope.outputs.audit }}
+      migrations: ${{ steps.scope.outputs.migrations }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -48,7 +49,7 @@ jobs:
           EVENT: ${{ github.event_name }}
           BASE: ${{ github.event.pull_request.base.sha }}
         run: |
-          all() { printf 'rust=true\nplatform=true\ndocker=true\naudit=true\n' >> "$GITHUB_OUTPUT"; echo "Running every lane: $1"; }
+          all() { printf 'rust=true\nplatform=true\ndocker=true\naudit=true\nmigrations=true\n' >> "$GITHUB_OUTPUT"; echo "Running every lane: $1"; }
           if [ "$EVENT" != "pull_request" ]; then all "not a pull request"; exit 0; fi
           # --no-renames lists both paths of a move, so moving code into docs still counts.
           if ! files=$(git diff --no-renames --name-only "$BASE"...HEAD); then all "could not compare with the base"; exit 0; fi
@@ -68,11 +69,13 @@ jobs:
           if [ -n "$unknown" ]; then all "unrecognised paths: ${unknown//$'\n'/ }"; exit 0; fi
           has() { printf '%s\n' "$code" | grep -Eq "$1" && echo true || echo false; }
           r=$(has "$rust"); p=$(has "$platform"); a=$(has "$audit")
+          # Any migrations directory (the engine's and the key service's), and the check itself.
+          m=$(has '(^|/)migrations/|^scripts/(test_)?check_migrations\.py$')
           d=$(has "$docker")
           # The image also holds every crate but the WebAssembly one.
           if [ "$d" = false ] && printf '%s\n' "$code" | grep -E '^crates/' | grep -Evq '^crates/orbyn-wasm/'; then d=true; fi
-          printf 'rust=%s\nplatform=%s\ndocker=%s\naudit=%s\n' "$r" "$p" "$d" "$a" >> "$GITHUB_OUTPUT"
-          echo "rust=$r platform=$p docker=$d audit=$a"
+          printf 'rust=%s\nplatform=%s\ndocker=%s\naudit=%s\nmigrations=%s\n' "$r" "$p" "$d" "$a" "$m" >> "$GITHUB_OUTPUT"
+          echo "rust=$r platform=$p docker=$d audit=$a migrations=$m"
           printf '%s\n' "$files"
 
   # Formatting, in seconds, before anything heavy. The heavy jobs wait for it and fail at once when it failed.
@@ -84,10 +87,14 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       RUST: ${{ needs.changes.outputs.rust }}
+      MIGRATIONS: ${{ needs.changes.outputs.migrations }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # The migration check compares with the base, so it needs the history ('0', a string: the number 0 is false in an
+          # expression and would fall through to 1).
+          fetch-depth: ${{ needs.changes.outputs.migrations == 'true' && '0' || '1' }}
       - if: env.RUST == 'true'
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
@@ -97,6 +104,18 @@ jobs:
       # Every crate is MIT OR Apache-2.0; a new crate fails until it says so.
       - if: env.RUST == 'true'
         run: python3 scripts/check_licence.py
+      # An applied migration is never edited: compared with the pull request's base (the previous commit on a push to
+      # main), a changed, renamed, deleted or mode-changed migration file fails. A new file is fine.
+      - if: env.MIGRATIONS == 'true' && github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          python3 scripts/test_check_migrations.py
+          python3 scripts/check_migrations.py --base "$BASE"
+      - if: env.MIGRATIONS == 'true' && github.event_name == 'push'
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: python3 scripts/check_migrations.py --base "$BEFORE"
 
   # The Rust lane: lint, the whole workspace with the Postgres tests against a service container, the web build of the
   # device crates, and the committed wire types. The one lane a pull request always runs (unless it only touches docs).
