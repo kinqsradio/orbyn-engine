@@ -134,7 +134,7 @@ A device accepts a version only if all of these hold:
 - the author has a role that may write in the participant statement bound by the zone key the version is sealed under;
 - it is sealed under the zone's current key, or it is history proven by a rotation, as below.
 
-**Rotations seal history.** An owner's rotation away from a key commits to a Merkle root over every version accepted under that key: (record id, version, hash of the ciphertext and of the wrapped record key). This is the per-zone signed version log that architecture.md lists as open, built here for shared zones.
+**Rotations seal history.** An owner's rotation away from a key signs a Merkle root over every version accepted under that key. A record version's leaf is (record id, version, hash of the ciphertext and of the wrapped record key). A tombstone's leaf is (record id, version, hash of its signed delete proof), so tombstones are covered and proven the same way. This is the per-zone signed version log that architecture.md lists as open, built here for shared zones.
 - A device that already holds the zone refuses any newly arriving version under a retired key, whatever its version number, because version numbers are server-assigned and unsigned.
 - A device that is **bootstrapping**, a new member or a new device, accepts an old-key version only with an inclusion proof against the root its rotation commits to. History is therefore readable, but nothing can be added to it after the rotation.
 
@@ -151,7 +151,8 @@ A demoted or removed member therefore cannot write, even with old keys and a coo
 - **Rotations** are signed by the owner's account key, and bind:
   - the new and previous key ids;
   - the participant statement hash;
-  - the zone version at which it took effect.
+  - the zone version at which it took effect;
+  - the Merkle root over the retired key's accepted versions (see *Rotations seal history*), so the root is signed by the owner and the server cannot swap it.
 - **Escrow.** Only the owner's devices write service envelopes for a shared zone, and only when the participant statement says `standard`. The server refuses a service envelope for a zone that the session's account does not own. A participant's recovery therefore never exposes someone else's zone.
 
 ## Protection level of a shared zone
