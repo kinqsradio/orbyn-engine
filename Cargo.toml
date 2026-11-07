@@ -20,6 +20,7 @@ orbyn-server = { path = "crates/orbyn-server" }
 orbyn-keyservice = { path = "crates/orbyn-keyservice" }
 orbyn-translog = { path = "crates/orbyn-translog" }
 orbyn-keyservice-server = { path = "crates/orbyn-keyservice-server" }
+orbyn-witness = { path = "crates/orbyn-witness" }
 orbyn-store = { path = "crates/orbyn-store" }
 orbyn-worker = { path = "crates/orbyn-worker" }
 

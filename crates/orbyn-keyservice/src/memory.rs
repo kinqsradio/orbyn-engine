@@ -3,7 +3,7 @@
 //! objects that must be destroyed) with ordinary software crypto. It is not a security boundary
 //! and exists only behind the `test-support` feature.
 
-use crate::{Hsm, HsmError, IdentityMessage, SessionKey, WrappedAccountKey};
+use crate::{Hsm, HsmError, HsmMessage, MessageKind, SessionKey, WrappedAccountKey};
 use ed25519_dalek::{Signer, SigningKey};
 use orbyn_crypto::{P256Keys, P256Point, Sealed, SymmetricKey};
 use std::collections::HashMap;
@@ -16,6 +16,7 @@ const WRAP_CONTEXT: &str = "orbyn/test-hsm-wrap/v1";
 struct State {
     kek: Option<SymmetricKey>,
     identities: HashMap<u32, SigningKey>,
+    log_keys: HashMap<u32, SigningKey>,
     sessions: HashMap<u64, P256Keys>,
     next_session: u64,
 }
@@ -85,14 +86,38 @@ impl Hsm for MemoryHsm {
             .ok_or(HsmError::NotFound)
     }
 
-    fn sign_with_identity(
-        &self,
-        version: u32,
-        message: &IdentityMessage,
-    ) -> Result<[u8; 64], HsmError> {
+    fn generate_log_key(&self, version: u32) -> Result<[u8; 32], HsmError> {
+        let mut state = self.state();
+        if state.log_keys.contains_key(&version) {
+            return Err(HsmError::AlreadyExists);
+        }
+        let seed = SymmetricKey::generate().map_err(failed)?;
+        let key = SigningKey::from_bytes(seed.as_bytes());
+        let public = key.verifying_key().to_bytes();
+        state.log_keys.insert(version, key);
+        Ok(public)
+    }
+
+    fn log_key_exists(&self, version: u32) -> Result<bool, HsmError> {
+        Ok(self.state().log_keys.contains_key(&version))
+    }
+
+    fn log_key_public(&self, version: u32) -> Result<[u8; 32], HsmError> {
         self.state()
-            .identities
+            .log_keys
             .get(&version)
+            .map(|k| k.verifying_key().to_bytes())
+            .ok_or(HsmError::NotFound)
+    }
+
+    fn sign(&self, version: u32, message: &HsmMessage) -> Result<[u8; 64], HsmError> {
+        // The key set follows the message's kind.
+        let state = self.state();
+        let keys = match message.kind() {
+            MessageKind::ServiceKeyStatement => &state.identities,
+            MessageKind::LogHead => &state.log_keys,
+        };
+        keys.get(&version)
             .map(|k| k.sign(message.signed_bytes()).to_bytes())
             .ok_or(HsmError::NotFound)
     }

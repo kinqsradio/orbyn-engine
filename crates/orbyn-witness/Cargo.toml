@@ -1,0 +1,37 @@
+[package]
+name = "orbyn-witness"
+description = "The transparency log's witness: checks each head, including the map updates, and cosigns it."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+# `TestWitness`: the real witness core over an in-memory store and an injectable clock, for tests
+# of the key service. Never in a build the witness ships in.
+test-support = []
+
+[[bin]]
+name = "orbyn-witness"
+path = "src/main.rs"
+
+[dependencies]
+axum.workspace = true
+clap.workspace = true
+ed25519-dalek.workspace = true
+getrandom.workspace = true
+orbyn-translog.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+[dev-dependencies]
+orbyn-keyservice = { workspace = true, features = ["test-support"] }
+orbyn-witness = { path = ".", features = ["test-support"] }
+
+[lints]
+workspace = true

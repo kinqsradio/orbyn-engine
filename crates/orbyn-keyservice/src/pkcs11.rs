@@ -26,7 +26,7 @@
 //! (`CKR_KEY_NOT_WRAPPABLE`). A cloud HSM with an administrative role that can mark the key
 //! should turn it on (see docs/key-service.md).
 
-use crate::{Hsm, HsmError, IdentityMessage, SessionKey, WrappedAccountKey};
+use crate::{Hsm, HsmError, HsmMessage, MessageKind, SessionKey, WrappedAccountKey};
 use cryptoki::context::{CInitializeArgs, CInitializeFlags, Pkcs11};
 use cryptoki::error::{Error as CkError, RvError};
 use cryptoki::mechanism::Mechanism;
@@ -50,6 +50,12 @@ const KEK_LABEL: &[u8] = b"orbyn-kek-v1";
 
 fn identity_label(version: u32) -> Vec<u8> {
     format!("orbyn-identity-v{version}").into_bytes()
+}
+
+/// The log key's label: a different set from the identities, so a version number alone cannot
+/// reach the wrong key.
+fn log_key_label(version: u32) -> Vec<u8> {
+    format!("orbyn-log-v{version}").into_bytes()
 }
 
 /// What a key may be used for. Every template sets **every** usage flag, true only for what the
@@ -267,6 +273,44 @@ impl Pkcs11Hsm {
         Self::find(session, ObjectClass::SECRET_KEY, KEK_LABEL)?.ok_or(HsmError::NotFound)
     }
 
+    /// Makes an Ed25519 signing key pair labelled `label`: non-extractable, for signing only.
+    fn generate_signing_key(&self, label: Vec<u8>) -> Result<[u8; 32], HsmError> {
+        let session = self.session()?;
+        if Self::find(&session, ObjectClass::PRIVATE_KEY, &label)?.is_some() {
+            return Err(HsmError::AlreadyExists);
+        }
+        let mut public_template = vec![
+            Attribute::Token(true),
+            Attribute::EcParams(ED25519_PARAMS.to_vec()),
+            Attribute::Label(label.clone()),
+        ];
+        public_template.extend(public_usage(&[Use::Verify]));
+        let mut private_template = vec![
+            Attribute::Token(true),
+            Attribute::Private(true),
+            Attribute::Sensitive(true),
+            Attribute::Extractable(false),
+            Attribute::Label(label),
+        ];
+        private_template.extend(private_usage(&[Use::Sign]));
+        let (public, _private) = session
+            .generate_key_pair(
+                &Mechanism::EccEdwardsKeyPairGen,
+                &public_template,
+                &private_template,
+            )
+            .map_err(failed)?;
+        ed25519_public(&Self::point_of(&session, public)?)
+    }
+
+    /// The public key labelled `label`.
+    fn signing_public(&self, label: &[u8]) -> Result<[u8; 32], HsmError> {
+        let session = self.session()?;
+        let public =
+            Self::find(&session, ObjectClass::PUBLIC_KEY, label)?.ok_or(HsmError::NotFound)?;
+        ed25519_public(&Self::point_of(&session, public)?)
+    }
+
     fn point_of(session: &Session, public: ObjectHandle) -> Result<Vec<u8>, HsmError> {
         let attrs = session
             .get_attributes(public, &[AttributeType::EcPoint])
@@ -312,50 +356,35 @@ impl Hsm for Pkcs11Hsm {
     }
 
     fn generate_identity(&self, version: u32) -> Result<[u8; 32], HsmError> {
-        let session = self.session()?;
-        let label = identity_label(version);
-        if Self::find(&session, ObjectClass::PRIVATE_KEY, &label)?.is_some() {
-            return Err(HsmError::AlreadyExists);
-        }
-        let mut public_template = vec![
-            Attribute::Token(true),
-            Attribute::EcParams(ED25519_PARAMS.to_vec()),
-            Attribute::Label(label.clone()),
-        ];
-        public_template.extend(public_usage(&[Use::Verify]));
-        let mut private_template = vec![
-            Attribute::Token(true),
-            Attribute::Private(true),
-            Attribute::Sensitive(true),
-            Attribute::Extractable(false),
-            Attribute::Label(label),
-        ];
-        private_template.extend(private_usage(&[Use::Sign]));
-        let (public, _private) = session
-            .generate_key_pair(
-                &Mechanism::EccEdwardsKeyPairGen,
-                &public_template,
-                &private_template,
-            )
-            .map_err(failed)?;
-        ed25519_public(&Self::point_of(&session, public)?)
+        self.generate_signing_key(identity_label(version))
     }
 
     fn identity_public(&self, version: u32) -> Result<[u8; 32], HsmError> {
-        let session = self.session()?;
-        let public = Self::find(&session, ObjectClass::PUBLIC_KEY, &identity_label(version))?
-            .ok_or(HsmError::NotFound)?;
-        ed25519_public(&Self::point_of(&session, public)?)
+        self.signing_public(&identity_label(version))
     }
 
-    fn sign_with_identity(
-        &self,
-        version: u32,
-        message: &IdentityMessage,
-    ) -> Result<[u8; 64], HsmError> {
+    fn generate_log_key(&self, version: u32) -> Result<[u8; 32], HsmError> {
+        self.generate_signing_key(log_key_label(version))
+    }
+
+    fn log_key_exists(&self, version: u32) -> Result<bool, HsmError> {
         let session = self.session()?;
-        let key = Self::find(&session, ObjectClass::PRIVATE_KEY, &identity_label(version))?
-            .ok_or(HsmError::NotFound)?;
+        Ok(Self::find(&session, ObjectClass::PRIVATE_KEY, &log_key_label(version))?.is_some())
+    }
+
+    fn log_key_public(&self, version: u32) -> Result<[u8; 32], HsmError> {
+        self.signing_public(&log_key_label(version))
+    }
+
+    fn sign(&self, version: u32, message: &HsmMessage) -> Result<[u8; 64], HsmError> {
+        // The key set follows the message's kind.
+        let label = match message.kind() {
+            MessageKind::ServiceKeyStatement => identity_label(version),
+            MessageKind::LogHead => log_key_label(version),
+        };
+        let session = self.session()?;
+        let key =
+            Self::find(&session, ObjectClass::PRIVATE_KEY, &label)?.ok_or(HsmError::NotFound)?;
         let signature = session
             .sign(
                 &Mechanism::Eddsa(EddsaParams::new(EddsaSignatureScheme::Pure)),

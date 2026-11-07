@@ -5,7 +5,7 @@
 use orbyn_crypto::P256Point;
 use zeroize::Zeroizing;
 
-use crate::{Hsm, HsmError, IdentityMessage, MessageKind, SessionKey, WrappedAccountKey, sealed};
+use crate::{Hsm, HsmError, HsmMessage, MessageKind, SessionKey, WrappedAccountKey, sealed};
 
 /// An HSM that delegates to another, records what it was asked, and can be made to fail.
 pub struct Spy<H: Hsm> {
@@ -44,13 +44,18 @@ impl<H: Hsm> Hsm for Spy<H> {
     fn identity_public(&self, version: u32) -> Result<[u8; 32], HsmError> {
         self.inner.identity_public(version)
     }
-    fn sign_with_identity(
-        &self,
-        version: u32,
-        message: &IdentityMessage,
-    ) -> Result<[u8; 64], HsmError> {
+    fn sign(&self, version: u32, message: &HsmMessage) -> Result<[u8; 64], HsmError> {
         self.signed.lock().expect("signed").push(message.kind());
-        self.inner.sign_with_identity(version, message)
+        self.inner.sign(version, message)
+    }
+    fn generate_log_key(&self, version: u32) -> Result<[u8; 32], HsmError> {
+        self.inner.generate_log_key(version)
+    }
+    fn log_key_exists(&self, version: u32) -> Result<bool, HsmError> {
+        self.inner.log_key_exists(version)
+    }
+    fn log_key_public(&self, version: u32) -> Result<[u8; 32], HsmError> {
+        self.inner.log_key_public(version)
     }
     fn generate_account_key(&self) -> Result<WrappedAccountKey, HsmError> {
         self.inner.generate_account_key()
@@ -96,12 +101,17 @@ impl<H: Hsm> Hsm for Shared<H> {
     fn identity_public(&self, version: u32) -> Result<[u8; 32], HsmError> {
         self.0.identity_public(version)
     }
-    fn sign_with_identity(
-        &self,
-        version: u32,
-        message: &IdentityMessage,
-    ) -> Result<[u8; 64], HsmError> {
-        self.0.sign_with_identity(version, message)
+    fn sign(&self, version: u32, message: &HsmMessage) -> Result<[u8; 64], HsmError> {
+        self.0.sign(version, message)
+    }
+    fn generate_log_key(&self, version: u32) -> Result<[u8; 32], HsmError> {
+        self.0.generate_log_key(version)
+    }
+    fn log_key_exists(&self, version: u32) -> Result<bool, HsmError> {
+        self.0.log_key_exists(version)
+    }
+    fn log_key_public(&self, version: u32) -> Result<[u8; 32], HsmError> {
+        self.0.log_key_public(version)
     }
     fn generate_account_key(&self) -> Result<WrappedAccountKey, HsmError> {
         self.0.generate_account_key()

@@ -50,3 +50,13 @@ fn a_bad_sender_signature_never_reaches_the_hsm() {
 fn an_identity_signs_only_service_key_statements() {
     suite::an_identity_signs_only_service_key_statements(MemoryHsm::new());
 }
+
+#[test]
+fn a_log_key_signs_heads_and_nothing_else() {
+    suite::a_log_key_signs_heads_and_nothing_else(&KeyService::new(MemoryHsm::new()));
+}
+
+#[test]
+fn the_hsm_is_asked_to_sign_only_what_the_kind_allows() {
+    suite::the_hsm_is_asked_to_sign_only_what_the_kind_allows(MemoryHsm::new());
+}
