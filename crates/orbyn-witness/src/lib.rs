@@ -122,10 +122,12 @@ pub enum ReplayCause {
     /// The entries give another log root than the pinned one.
     #[error("its root is not the pinned root")]
     LogRoot,
-    /// An entry cannot be encoded, or does not continue its account's chain: the entries are
-    /// not a log.
+    /// An entry cannot be encoded: the file is damaged.
     #[error("an entry is damaged")]
     Entries,
+    /// An entry does not continue its account's chain: the entries are not in order.
+    #[error("an entry does not continue its account's chain")]
+    Chain,
 }
 
 /// What can stop a witness from starting.
@@ -513,7 +515,7 @@ fn replay(entries: &[Entry], pinned: &PinnedHead) -> Result<State, StartError> {
         let key = (slot(entry.map), entry.map_key);
         let (last, len) = chains.get(&key).copied().unwrap_or(([0; 32], 0));
         if entry.prev != last {
-            return Err(StartError::Replay(ReplayCause::Entries));
+            return Err(StartError::Replay(ReplayCause::Chain));
         }
         chains.insert(key, (hash, len + 1));
         maps[key.0].insert(entry.map_key, map_value(&hash, len + 1));

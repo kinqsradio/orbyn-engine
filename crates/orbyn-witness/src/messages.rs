@@ -18,13 +18,13 @@ Options:
   --key-file <FILE>          File holding the signing key (64 hex digits)
   --log-keys <KEYS>          Public keys of the logs this witness cosigns for
   --recosign-secs <SECONDS>  How often to cosign the newest head again [default: 600]
-  --newest-per-hour <COUNT>  Most cosignatures of the newest head per hour [default: 60]
+  --newest-per-hour <COUNT>  Most reads of the newest cosignature per address per hour [default: 60]
   --bootstrap-empty          First start with an empty log
   --bootstrap-replay <FILE>  First start by replaying the entries in FILE
   --pin-size <COUNT>         Size the replayed log must have
   --pin-log-root <HEX>       Root the replayed log must have
   --pin-head-hash <HEX>      Hash of the head the replayed log must end at
-  --pin-head-time-ms <MS>   Time of that head, in milliseconds
+  --pin-head-time-ms <MS>    Time of that head, in milliseconds
   -h, --help                 Print help
 ";
 
@@ -69,6 +69,12 @@ pub fn replay_mismatch(cause: &str, pin: &str) -> String {
     )
 }
 
+pub fn chain_broken() -> String {
+    format!(
+        "{ERROR}an entry in the entries file does not continue its account's history\n  Check the file you gave to --bootstrap-replay: it must hold the log's entries in order."
+    )
+}
+
 pub fn entries_file_unreadable() -> String {
     format!(
         "{ERROR}the entries file can't be read, or an entry in it is damaged\n  Check the file you gave to --bootstrap-replay, then start again."
@@ -106,6 +112,13 @@ pub fn key_file_exists(path: &Path) -> String {
     )
 }
 
+pub fn key_file_not_written(path: &Path) -> String {
+    format!(
+        "{ERROR}the key file could not be written ({})\n  Check that the directory exists and is writable, and that the disk has room.",
+        path.display()
+    )
+}
+
 pub fn key_written(public_hex: &str) -> String {
     format!("public key: {public_hex}")
 }
@@ -113,6 +126,13 @@ pub fn key_written(public_hex: &str) -> String {
 pub fn state_unsaveable(dir: &Path) -> String {
     format!(
         "{ERROR}the state can't be saved to the state directory ({})\n  Make the directory writable by the user running the witness, or choose another.",
+        dir.display()
+    )
+}
+
+pub fn state_dir_not_created(dir: &Path) -> String {
+    format!(
+        "{ERROR}the state directory can't be created ({})\n  Check that its parent exists and is writable, or choose another with --state-dir.",
         dir.display()
     )
 }

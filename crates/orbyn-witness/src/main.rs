@@ -111,9 +111,9 @@ fn main() -> ExitCode {
 
 fn keygen(args: &KeygenArgs) -> Result<(), String> {
     use std::io::Write;
-    let unreadable = || messages::key_file_unreadable(&args.out);
+    let unwritten = || messages::key_file_not_written(&args.out);
     let mut seed = [0u8; 32];
-    getrandom::fill(&mut seed).map_err(|_| unreadable())?;
+    getrandom::fill(&mut seed).map_err(|_| unwritten())?;
     let key = SigningKey::from_bytes(&seed);
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -126,11 +126,11 @@ fn keygen(args: &KeygenArgs) -> Result<(), String> {
         if e.kind() == std::io::ErrorKind::AlreadyExists {
             messages::key_file_exists(&args.out)
         } else {
-            unreadable()
+            unwritten()
         }
     })?;
-    writeln!(file, "{}", hex(&seed)).map_err(|_| unreadable())?;
-    file.sync_all().map_err(|_| unreadable())?;
+    writeln!(file, "{}", hex(&seed)).map_err(|_| unwritten())?;
+    file.sync_all().map_err(|_| unwritten())?;
     println!(
         "{}",
         messages::key_written(&hex(&key.verifying_key().to_bytes()))
@@ -188,6 +188,7 @@ fn start_error(error: StartError, state_dir: &Path) -> String {
             messages::replay_mismatch("root", "--pin-log-root")
         }
         StartError::Replay(ReplayCause::Entries) => messages::entries_file_unreadable(),
+        StartError::Replay(ReplayCause::Chain) => messages::chain_broken(),
         // The state could not be written, or could not be read back (a checksum that fails).
         StartError::Store(StoreError::Corrupt) => messages::state_unreadable(),
         StartError::Store(_) => messages::state_unsaveable(state_dir),
@@ -206,7 +207,7 @@ async fn run(args: RunArgs) -> Result<(), String> {
     let state_dir = args.state_dir.clone();
     let start = |e| start_error(e, &state_dir);
     std::fs::create_dir_all(&args.state_dir)
-        .map_err(|_| messages::state_unsaveable(&args.state_dir))?;
+        .map_err(|_| messages::state_dir_not_created(&args.state_dir))?;
     let store = FileStore::new(args.state_dir.join("state"));
     let clock = SystemClock;
     let witness = match (args.bootstrap_empty, &args.bootstrap_replay) {

@@ -848,7 +848,10 @@ fn the_binary_says_what_the_designs_say_for_help_and_for_each_start_up_error() {
         .expect("run");
     assert_eq!(
         stderr_of(&output),
-        format!("{}\n", messages::state_unsaveable(&blocked.join("inside")))
+        format!(
+            "{}\n",
+            messages::state_dir_not_created(&blocked.join("inside"))
+        )
     );
 
     // An address it can't listen on: the port is taken.
@@ -875,5 +878,87 @@ fn the_binary_says_what_the_designs_say_for_help_and_for_each_start_up_error() {
         format!("{}\n", messages::cannot_listen(&address))
     );
     drop(taken);
+
+    // The words of the final designs, word for word, for what v42 changed.
+    let p = std::path::Path::new("/etc/orbyn-witness/witness.key");
+    let d = std::path::Path::new("/var/lib/orbyn-witness");
+    assert_eq!(
+        messages::key_file_not_written(p),
+        "error: the key file could not be written (/etc/orbyn-witness/witness.key)\n  Check that the directory exists and is writable, and that the disk has room."
+    );
+    assert_eq!(
+        messages::state_dir_not_created(d),
+        "error: the state directory can't be created (/var/lib/orbyn-witness)\n  Check that its parent exists and is writable, or choose another with --state-dir."
+    );
+    assert_eq!(
+        messages::chain_broken(),
+        "error: an entry in the entries file does not continue its account's history\n  Check the file you gave to --bootstrap-replay: it must hold the log's entries in order."
+    );
+    assert!(messages::HELP.contains("\n  --newest-per-hour <COUNT>  Most reads of the newest cosignature per address per hour [default: 60]\n"));
+    assert!(
+        messages::HELP
+            .contains("\n  --pin-head-time-ms <MS>    Time of that head, in milliseconds\n")
+    );
+    assert!(!messages::HELP.contains("head hash is not"));
+
+    // A key file that can't be written: the directory is not there.
+    let nowhere = dir.join("no-such-directory").join("key");
+    let output = binary()
+        .arg("keygen")
+        .arg("--out")
+        .arg(&nowhere)
+        .output()
+        .expect("keygen");
+    assert_eq!(
+        stderr_of(&output),
+        format!("{}\n", messages::key_file_not_written(&nowhere))
+    );
+
+    // A broken chain: an entry that does not continue its account's history.
+    let mut broken = svc.entries.clone();
+    broken[5].prev = [7; 32];
+    let mut file = Vec::new();
+    for entry in &broken {
+        let bytes = entry.encode().expect("encode");
+        file.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        file.extend_from_slice(&bytes);
+    }
+    std::fs::write(&entries, &file).expect("write");
+    assert_eq!(
+        stderr_of(&run_pins("6", &hex(&head.log_root))),
+        format!("{}\n", messages::chain_broken())
+    );
+
+    // A state directory that exists but can't be written to: the state can't be saved.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let locked = dir.join("locked");
+        std::fs::create_dir_all(&locked).expect("dir");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+        // Skipped when the permission is not enforced (running as the superuser).
+        if std::fs::write(locked.join("probe"), b"x").is_err() {
+            let output = binary()
+                .arg("--state-dir")
+                .arg(&locked)
+                .arg("--key-file")
+                .arg(&key)
+                .args([
+                    "--log-keys",
+                    &format!(
+                        "{LOG_VERSION}:{}",
+                        hex(&log_key().verifying_key().to_bytes())
+                    ),
+                ])
+                .arg("--bootstrap-empty")
+                .output()
+                .expect("run");
+            assert_eq!(
+                stderr_of(&output),
+                format!("{}\n", messages::state_unsaveable(&locked))
+            );
+        }
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
     std::fs::remove_dir_all(dir).expect("clean");
 }
