@@ -49,6 +49,7 @@ const TOMBSTONE_KEY_INFO: &[u8] = b"orbyn/account-tombstone-key/v1";
 const TOMBSTONE_LABEL: &[u8] = b"orbyn/account-tombstone/v1";
 const TOTP_SECRET_CONTEXT: &str = "orbyn/totp-secret/v1";
 const MAIL_CONTEXT: &str = "orbyn/mail-job/v1";
+const PUSH_TOKEN_CONTEXT: &str = "orbyn/push-token/v1";
 
 impl AuthSecrets {
     /// A new value for `ORBYN_AUTH_SETUP`, base64url without padding.
@@ -124,6 +125,27 @@ impl AuthSecrets {
             .map(Zeroizing::new)
     }
 
+    /// A device's push token sealed under a context of its own, bound to the device: a sealed token
+    /// copied to another device's row does not open there.
+    pub(crate) fn seal_push_token(&self, device: Uuid, token: &[u8]) -> Option<Vec<u8>> {
+        self.state_key
+            .seal(PUSH_TOKEN_CONTEXT, device.as_bytes(), token)
+            .ok()
+            .map(|sealed| sealed.to_bytes())
+    }
+
+    pub(crate) fn open_push_token(
+        &self,
+        device: Uuid,
+        sealed: &[u8],
+    ) -> Option<Zeroizing<Vec<u8>>> {
+        let sealed = Sealed::from_bytes(sealed).ok()?;
+        self.state_key
+            .open(PUSH_TOKEN_CONTEXT, device.as_bytes(), &sealed)
+            .ok()
+            .map(Zeroizing::new)
+    }
+
     pub(crate) fn open_mail(&self, aad: &[u8], sealed: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
         let sealed = Sealed::from_bytes(sealed).ok()?;
         self.state_key
@@ -195,6 +217,31 @@ mod tests {
         assert_ne!(subject, a.tombstone_subject(Uuid::new_v4()));
         let other = AuthSecrets::from_encoded(&AuthSecrets::generate())?;
         assert_ne!(subject, other.tombstone_subject(id));
+        Ok(())
+    }
+
+    #[test]
+    fn a_push_token_and_a_queued_mail_do_not_open_each_other() -> Result<(), SecretsError> {
+        let secrets = AuthSecrets::from_encoded(&AuthSecrets::generate())?;
+        let device = Uuid::new_v4();
+        let token = secrets.seal_push_token(device, b"a-token").expect("sealed");
+        // Its own context: the mail's opener, with any associated data, cannot read it.
+        assert!(secrets.open_mail(device.as_bytes(), &token).is_none());
+        assert!(secrets.open_mail(&[], &token).is_none());
+        // It opens only for its own device.
+        assert_eq!(
+            secrets
+                .open_push_token(device, &token)
+                .as_deref()
+                .map(Vec::as_slice),
+            Some(&b"a-token"[..])
+        );
+        assert!(secrets.open_push_token(Uuid::new_v4(), &token).is_none());
+        // And a mail does not open as a token, whatever it is bound to.
+        let mail = secrets
+            .seal_mail(device.as_bytes(), b"a-token")
+            .expect("sealed");
+        assert!(secrets.open_push_token(device, &mail).is_none());
         Ok(())
     }
 

@@ -357,6 +357,18 @@ pub struct AccountStatus {
     pub deleted_at: String,
 }
 
+/// `PUT /v1/devices/current/push-token`: the push token of the signed-in (trusted) device, so a
+/// silent wake-up can reach it. `provider` is `apns` or `fcm` (Web Push is Planned). The token is
+/// 1 to 512 printable characters with no space. Answer 204; it replaces the device's token and
+/// subscribes the device to every zone. `DELETE` on the same path answers 204 and ends both. The
+/// server seals the token and logs it nowhere; a push carries no content.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PushTokenRequest {
+    pub provider: String,
+    pub token: String,
+}
+
 /// A device of the account.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]

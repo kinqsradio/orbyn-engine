@@ -217,6 +217,7 @@ fn mailer(config: &Config) -> Result<orbyn_worker::Mailer, String> {
             Ok(orbyn_worker::Mailer {
                 secrets,
                 account_url: config.account_url.clone(),
+                push: std::sync::Arc::new(orbyn_core::push::NoPush),
                 sender: std::sync::Arc::new(sender),
             })
         }
@@ -229,6 +230,7 @@ fn mailer(config: &Config) -> Result<orbyn_worker::Mailer, String> {
             Ok(orbyn_worker::Mailer {
                 secrets,
                 account_url: config.account_url.clone(),
+                push: std::sync::Arc::new(orbyn_core::push::NoPush),
                 sender: std::sync::Arc::new(orbyn_core::mail::LogOnly),
             })
         }

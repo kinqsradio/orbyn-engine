@@ -67,6 +67,8 @@ pub struct Mailer {
     /// deletion email. Without it that email has no link.
     pub account_url: Option<String>,
     pub sender: Arc<dyn Sender>,
+    /// Who delivers silent pushes; the default sends nothing and logs nothing.
+    pub push: Arc<dyn orbyn_core::push::PushSender>,
 }
 
 impl std::fmt::Debug for Mailer {
@@ -82,6 +84,7 @@ impl Mailer {
             secrets: None,
             account_url: None,
             sender: Arc::new(mail::LogOnly),
+            push: Arc::new(orbyn_core::push::NoPush),
         }
     }
 }
@@ -110,6 +113,23 @@ async fn delete_unused_request(job: &jobs::Job, db: &Database, mailer: &Mailer) 
     match accounts.run_delete_unused_request(job).await {
         Ok(()) => Outcome::Done,
         Err(_) => Outcome::Retry("the request could not be decided".into()),
+    }
+}
+
+/// Wakes the devices that subscribed to a zone that changed: through the push sender, content-free.
+/// With the default sender nothing is read or sent.
+async fn zone_changed(job: &jobs::Job, db: &Database, mailer: &Mailer) -> Outcome {
+    match orbyn_core::push::handle_zone_changed(
+        db.pool(),
+        mailer.secrets.as_deref(),
+        mailer.push.as_ref(),
+        job,
+    )
+    .await
+    {
+        orbyn_core::push::PushDelivery::Done => Outcome::Done,
+        orbyn_core::push::PushDelivery::Retry(reason) => Outcome::Retry(reason),
+        orbyn_core::push::PushDelivery::GiveUp(reason) => Outcome::GiveUp(reason),
     }
 }
 
@@ -253,6 +273,8 @@ pub async fn run(
                 let work = async {
                     if job.kind == mail::JOB_KIND {
                         deliver_email(&job, &mailer).await
+                    } else if job.kind == orbyn_store::ZONE_CHANGED_JOB {
+                        zone_changed(&job, &db, &mailer).await
                     } else if job.kind == orbyn_core::accounts::DELETE_UNUSED_JOB_KIND {
                         delete_unused_request(&job, &db, &mailer).await
                     } else {
@@ -359,6 +381,7 @@ mod tests {
         let mailer = |sender: Arc<dyn Sender>| Mailer {
             secrets: Some(secrets.clone()),
             account_url: None,
+            push: Arc::new(orbyn_core::push::NoPush),
             sender,
         };
 

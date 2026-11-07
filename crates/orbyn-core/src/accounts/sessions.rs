@@ -135,6 +135,16 @@ impl Accounts {
         .bind(session.account_id)
         .execute(&mut *tx)
         .await?;
+        // A device that signs out gets no more wake-ups, and could not delete its own token
+        // afterwards.
+        sqlx::query("DELETE FROM push_tokens WHERE device_id = $1")
+            .bind(session.device_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM subscriptions WHERE device_id = $1 AND zone_id IS NULL")
+            .bind(session.device_id)
+            .execute(&mut *tx)
+            .await?;
         self.audit(
             &mut *tx,
             client,
@@ -160,6 +170,15 @@ impl Accounts {
         .execute(&mut *tx)
         .await?
         .rows_affected();
+        // Every device is signed out, so none gets wake-ups.
+        sqlx::query("DELETE FROM push_tokens WHERE account_id = $1")
+            .bind(session.account_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM subscriptions WHERE account_id = $1 AND zone_id IS NULL")
+            .bind(session.account_id)
+            .execute(&mut *tx)
+            .await?;
         self.audit(
             &mut *tx,
             client,

@@ -51,6 +51,10 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/v1/sessions", delete(revoke_all))
         .route("/v1/devices", get(list_devices))
         .route("/v1/devices/current", get(current_device))
+        .route(
+            "/v1/devices/current/push-token",
+            axum::routing::put(register_push_token).delete(remove_push_token),
+        )
         .route("/v1/devices/approvals", post(create_approval))
         .route("/v1/devices/approvals/{id}", get(approval))
         .route("/v1/devices/approvals/{id}/nonce", post(submit_nonce))
@@ -763,6 +767,31 @@ async fn cancel_deletion_by_mail(
 ) -> Answer<StatusCode> {
     service(&state)?
         .cancel_deletion_by_mail(&client, &body.token)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn register_push_token(
+    State(state): State<AppState>,
+    Caller(client): Caller,
+    Authed(session): Authed,
+    Body(body): Body<wire::PushTokenRequest>,
+) -> Answer<StatusCode> {
+    let provider = orbyn_core::push::PushProvider::parse(&body.provider)
+        .ok_or(AccountError::InvalidRequest)?;
+    service(&state)?
+        .register_push_token(&client, &session, provider, &body.token)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn remove_push_token(
+    State(state): State<AppState>,
+    Caller(client): Caller,
+    Authed(session): Authed,
+) -> Answer<StatusCode> {
+    service(&state)?
+        .remove_push_token(&client, &session)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
