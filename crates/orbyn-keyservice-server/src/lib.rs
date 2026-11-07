@@ -24,8 +24,13 @@ mod log;
 mod map;
 
 pub use head::StoredHead;
-pub use log::{Appended, LogStore, StoredEntry};
-pub use map::{MapStore, Node, plan_update};
+pub use log::Appended;
+
+// The log and the maps are reached only through `Store`: it takes the write lock, starts the
+// transaction at READ COMMITTED with timeouts, and has been through the role check. Their write
+// functions take any connection, so they are not exported.
+use log::LogStore;
+use map::MapStore;
 
 use orbyn_translog::{Entry, Hash, MapId, UnsignedHead};
 use sqlx::Row;
@@ -237,15 +242,15 @@ const TABLES: [&str; 6] = [
     "rate_events",
 ];
 
-/// Refuses a role that could undo the guards: a superuser, or a member of the owner of this
-/// database, of schema `public`, of any of the key service's tables, or of any of its trigger
+/// Refuses a role that could undo the guards: a superuser, one that can create roles, or a member
+/// of the owner of this database, of schema `public`, of any of the key service's tables, or of any of its trigger
 /// functions (`ks_*`). Looks at the owners as they are, not at who ran the migration.
 async fn check_plain_role<'e, E>(executor: E, role: &str) -> Result<()>
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {
     let row = sqlx::query(
-        "SELECT r.rolsuper, \
+        "SELECT r.rolsuper, r.rolcreaterole, \
          pg_has_role(r.rolname, (SELECT datdba FROM pg_database WHERE datname = current_database()), 'MEMBER') AS database_owner, \
          pg_has_role(r.rolname, (SELECT nspowner FROM pg_namespace WHERE nspname = 'public'), 'MEMBER') AS schema_owner, \
          COALESCE((SELECT bool_or(pg_has_role(r.rolname, c.relowner, 'MEMBER')) \
@@ -259,8 +264,11 @@ where
     .fetch_optional(executor)
     .await?
     .ok_or(StoreError::UnsafeRole)?;
+    // `rolcreaterole` too: a role that can create roles can make itself a member of one that owns
+    // the tables, and from there drop the guards.
     for column in [
         "rolsuper",
+        "rolcreaterole",
         "database_owner",
         "schema_owner",
         "table_owner",

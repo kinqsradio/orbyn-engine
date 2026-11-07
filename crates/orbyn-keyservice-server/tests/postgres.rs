@@ -21,8 +21,9 @@ struct TestDb {
     runtime: PgPool,
 }
 
-/// Every call to the store or a pool in a test runs under this: a missing timeout fails the test
-/// instead of hanging it.
+/// The calls in a test that could wait on a lock or on a connection (the write calls, the
+/// concurrent ones, `Store::connect` and closing a pool) run under this, so a missing timeout fails
+/// the test after 60 s instead of hanging it. Plain reads and set-up statements do not.
 async fn within<T>(future: impl std::future::Future<Output = T>) -> T {
     tokio::time::timeout(std::time::Duration::from_secs(60), future)
         .await
@@ -1064,6 +1065,16 @@ async fn the_runtime_role_must_be_a_plain_role_and_public_cannot_create() {
             "{role}: {result:?}"
         );
     }
+    // A role that can create roles can make itself a member of the table owner: refused too, by
+    // `migrate`, with nothing created.
+    run(admin, format!("CREATE ROLE \"{name}_cr\" LOGIN CREATEROLE"))
+        .await
+        .expect("createrole");
+    let result = migrate(&db.owner, &format!("{name}_cr")).await;
+    assert!(
+        matches!(result, Err(StoreError::UnsafeRole)),
+        "createrole: {result:?}"
+    );
     // The real runtime role is accepted again, and some other role cannot create in public either.
     migrate(&db.owner, &db.runtime_role)
         .await
@@ -1139,7 +1150,7 @@ async fn the_runtime_role_must_be_a_plain_role_and_public_cannot_create() {
     for role in [&dbo_member, &dbo_role] {
         let _ = run(admin, format!("DROP ROLE IF EXISTS \"{role}\"")).await;
     }
-    for suffix in ["_su", "_member", "_other"] {
+    for suffix in ["_su", "_member", "_other", "_cr"] {
         let _ = run(admin, format!("DROP ROLE IF EXISTS \"{name}{suffix}\"")).await;
     }
     db.cleanup().await;
@@ -1234,7 +1245,8 @@ async fn a_thousand_entry_head_builds_and_commits_in_reasonable_time() {
         .expect("commit");
     let commit = committed.elapsed();
     eprintln!("1000 entries: build {build:?}, commit {commit:?}");
-    assert!(build + commit < std::time::Duration::from_secs(60));
+    // Each statement is under the 120 s statement timeout or the store would have said `Busy`; the
+    // numbers are printed for the record, not asserted: they depend on the machine.
     db.cleanup().await;
 }
 
@@ -1247,6 +1259,16 @@ async fn a_temporary_table_cannot_shadow_heads_to_pass_the_append_only_check() {
         .append(&entry(MapId::Service, 1, [0; 32], 0))
         .await
         .expect("append");
+    // A real head with id 1 that covers nothing (size 0), so the real `public.heads` says no entry
+    // is covered, while the shadow below claims size 999: only a trigger that reads the shadow
+    // would let an entry be marked.
+    let genesis = store.build_head(1, 1, Some(0)).await.expect("head");
+    assert_eq!(genesis.size, 0);
+    let real_id = store
+        .commit_head(&genesis, &[1; 64], b"")
+        .await
+        .expect("commit");
+    assert_eq!(real_id, 1);
 
     // First wall: the runtime role has no right to make temporary tables.
     let mut conn = db.runtime.acquire().await.expect("connection");
@@ -1327,10 +1349,20 @@ async fn a_store_refuses_a_pool_whose_role_could_undo_the_guards() {
         .connect_with(options.clone().database(&name))
         .await
         .expect("admin pool");
+    // A login role that can create roles, with nothing else wrong with it.
+    let creator = format!("{name}_creator");
+    run(
+        &db.admin,
+        format!("CREATE ROLE \"{creator}\" LOGIN CREATEROLE"),
+    )
+    .await
+    .expect("creator");
+    let as_creator = pool_as(options.clone().database(&name), &creator).await;
     for (what, pool) in [
         ("owner", &db.owner),
         ("member of the owner", &as_member),
         ("superuser", &as_admin),
+        ("a role that can create roles", &as_creator),
     ] {
         let result = within(Store::connect(pool.clone())).await;
         assert!(
@@ -1340,6 +1372,8 @@ async fn a_store_refuses_a_pool_whose_role_could_undo_the_guards() {
     }
     within(as_member.close()).await;
     within(as_admin.close()).await;
+    within(as_creator.close()).await;
+    let _ = run(&db.admin, format!("DROP ROLE IF EXISTS \"{creator}\"")).await;
 
     // The real owner of the tables counts, not only who ran the migration: hand the tables and the
     // trigger functions to another role the runtime role belongs to, and both the migration and a

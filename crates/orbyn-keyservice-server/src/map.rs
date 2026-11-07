@@ -16,7 +16,7 @@ type Key = [u8; 32];
 
 /// A node of the tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Node {
+pub(crate) enum Node {
     Leaf {
         key: Key,
         value: Hash,
@@ -67,7 +67,7 @@ fn fold(key: &Key, mut hash: Hash, steps: &[Step], out: &mut Vec<Node>) -> Hash 
 /// The new nodes, and the new root, for setting `key` to `value` in the map with `root`, given
 /// the proof for `key` under it. The proof is verified, and the root computed here must equal what
 /// `orbyn_translog::map::update` (the function a witness runs) gives, or the plan is refused.
-pub fn plan_update(
+pub(crate) fn plan_update(
     root: &Hash,
     key: &Key,
     value: &Hash,
@@ -144,7 +144,7 @@ pub fn plan_update(
 }
 
 /// The maps on a connection that is inside a transaction holding the write lock (for updates).
-pub struct MapStore;
+pub(crate) struct MapStore;
 
 impl MapStore {
     /// The proof for `key` under `root`: the walk from the root along the key's bits.

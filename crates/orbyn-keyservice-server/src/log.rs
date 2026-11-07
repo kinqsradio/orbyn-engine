@@ -19,7 +19,7 @@ pub struct Appended {
 
 /// An entry as stored, with what head building needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredEntry {
+pub(crate) struct StoredEntry {
     pub seq: u64,
     pub map: MapId,
     pub map_key: [u8; 32],
@@ -29,7 +29,7 @@ pub struct StoredEntry {
 
 /// The log on a connection that is inside a transaction holding the write lock (see
 /// [`Store`](crate::Store)).
-pub struct LogStore;
+pub(crate) struct LogStore;
 
 impl LogStore {
     pub async fn size(conn: &mut PgConnection) -> Result<u64> {
