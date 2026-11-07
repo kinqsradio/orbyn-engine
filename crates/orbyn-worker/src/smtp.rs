@@ -1,7 +1,7 @@
 //! The SMTP sender, over lettre with rustls. A message has a plain-text body only. Errors carry a
 //! fixed description, never the address, the code or what the server said.
 
-use lettre::message::Mailbox;
+use lettre::message::{Mailbox, MultiPart};
 use lettre::transport::smtp::AsyncSmtpTransport;
 use lettre::transport::smtp::client::{Certificate, Tls, TlsParameters};
 use lettre::{AsyncTransport, Message, Tokio1Executor};
@@ -48,6 +48,25 @@ impl Smtp {
     }
 }
 
+/// Start-up errors the operator reads are written as designed: they begin with this, and the
+/// binary prints them to stderr as they are, then exits with status 1.
+pub const OPERATOR_ERROR: &str = "error: ";
+
+/// The last two lines of the CA file errors, as designed.
+const ROOTS_NOTE: &str = "  Orbyn always trusts the public web roots; this file only adds to them.\n  To use just the public roots, unset ORBYN_SMTP_CA_FILE.";
+
+/// The operating system's reason for an I/O error in lower case without its code, such as
+/// "permission denied".
+fn os_reason(error: &std::io::Error) -> String {
+    let text = error.to_string();
+    let text = text.split(" (os error").next().unwrap_or(&text);
+    let mut chars = text.chars();
+    chars
+        .next()
+        .map(|first| first.to_lowercase().chain(chars).collect())
+        .unwrap_or_default()
+}
+
 /// The TLS setting lettre builds from the URL, with the CA bundle's certificates added to its
 /// roots. The default root store is kept (`certificate_store` is never changed), so a public
 /// server still verifies. The mode follows the scheme, as lettre reads it: `smtps` is TLS from
@@ -55,7 +74,12 @@ impl Smtp {
 /// already refused every other URL.
 fn tls_with_extra_roots(url: &str, path: &str) -> Result<Tls, String> {
     let bad = |what: &str| format!("ORBYN_SMTP_CA_FILE ({path}) {what}");
-    let bytes = std::fs::read(path).map_err(|e| bad(&format!("cannot be read: {}", e.kind())))?;
+    let bytes = std::fs::read(path).map_err(|e| {
+        format!(
+            "{OPERATOR_ERROR}can't read ORBYN_SMTP_CA_FILE ({path}): {}\n  Check the path, and that the user running Orbyn can read the file.\n{ROOTS_NOTE}",
+            os_reason(&e)
+        )
+    })?;
     // Only certificates: a private key or anything else pasted into the bundle is a mistake, and a
     // key must not sit in a file the worker reads for trust.
     for line in String::from_utf8_lossy(&bytes).lines() {
@@ -79,7 +103,9 @@ fn tls_with_extra_roots(url: &str, path: &str) -> Result<Tls, String> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| bad("is not a PEM bundle of certificates"))?;
     if certs.is_empty() {
-        return Err(bad("holds no certificate"));
+        return Err(format!(
+            "{OPERATOR_ERROR}ORBYN_SMTP_CA_FILE ({path}) has no certificates in it\n  The file should hold the PEM certificate that signed your mail server's\n  certificate: a block starting -----BEGIN CERTIFICATE-----.\n{ROOTS_NOTE}"
+        ));
     }
     let parsed = url::Url::parse(url).map_err(|_| "ORBYN_SMTP_URL is not an address".to_owned())?;
     let host = parsed
@@ -308,11 +334,20 @@ impl Sender for Smtp {
                 reason: "the address is not an email address",
                 permanent: true,
             })?;
+            // Subject, plain text and HTML, sent together as designed. A message without the value
+            // its kind needs cannot be sent.
+            let rendered = mail.render().ok_or(SendError {
+                reason: "the message could not be built",
+                permanent: true,
+            })?;
             let message = Message::builder()
                 .from(self.from.clone())
                 .to(to)
-                .subject(mail.subject())
-                .body(mail.body())
+                .subject(rendered.subject)
+                .multipart(MultiPart::alternative_plain_html(
+                    rendered.text,
+                    rendered.html,
+                ))
                 .map_err(|_| SendError {
                     reason: "the message could not be built",
                     permanent: true,
@@ -1021,5 +1056,78 @@ mod tests {
             assert!(cert_info(&der[..cut]).is_none(), "{cut}");
         }
         assert!(cert_info(&[0x30, 0x84, 0xff, 0xff, 0xff, 0xff]).is_none());
+    }
+
+    /// What the server received, as one string with the DATA lines in order.
+    fn received(server: &TlsServer) -> String {
+        server.commands.lock().expect("log").join("\n")
+    }
+
+    #[tokio::test]
+    async fn a_message_goes_out_as_text_and_html_together() {
+        let pki = pki("Orbyn test CA");
+        let server = tls_server(&pki, true).await;
+        let file = PemFile::new(&pki.ca_pem);
+        let url = format!("smtps://127.0.0.1:{}", server.port);
+        send(&url, Some(file.path())).await.expect("sent");
+        let all = received(&server);
+        assert!(all.contains("Subject: Your Orbyn code is 482913"), "{all}");
+        assert!(all.contains("Content-Type: multipart/alternative"), "{all}");
+        assert!(all.contains("Content-Type: text/plain"), "{all}");
+        assert!(all.contains("Content-Type: text/html"), "{all}");
+        // Plain text first, HTML last, as a client that can show both expects.
+        assert!(all.find("text/plain") < all.find("text/html"));
+    }
+
+    #[test]
+    fn the_ca_file_start_up_errors_are_as_designed() {
+        let url = "smtps://mail.example.com";
+        let from = "no-reply@example.com";
+        let notes = "  Orbyn always trusts the public web roots; this file only adds to them.\n  To use just the public roots, unset ORBYN_SMTP_CA_FILE.";
+        // A file that cannot be read: the path and the operating system's own reason.
+        let missing = "/nonexistent/orbyn-smtp-ca.pem";
+        let error = Smtp::new(url, from, Some(missing)).expect_err("missing");
+        assert_eq!(
+            error,
+            format!(
+                "error: can't read ORBYN_SMTP_CA_FILE ({missing}): no such file or directory\n  Check the path, and that the user running Orbyn can read the file.\n{notes}"
+            )
+        );
+        // A file with no certificate in it.
+        let empty = PemFile::new("");
+        let error = Smtp::new(url, from, Some(empty.path())).expect_err("empty");
+        assert_eq!(
+            error,
+            format!(
+                "error: ORBYN_SMTP_CA_FILE ({}) has no certificates in it\n  The file should hold the PEM certificate that signed your mail server's\n  certificate: a block starting -----BEGIN CERTIFICATE-----.\n{notes}",
+                empty.path()
+            )
+        );
+        assert!(error.starts_with(OPERATOR_ERROR));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_ca_file_says_permission_denied() {
+        use std::os::unix::fs::PermissionsExt;
+        let file = PemFile::new("x");
+        std::fs::set_permissions(&file.0, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        // Root can read anything, which makes the case impossible to build.
+        if std::fs::read(&file.0).is_ok() {
+            return;
+        }
+        let error = Smtp::new(
+            "smtps://mail.example.com",
+            "no-reply@example.com",
+            Some(file.path()),
+        )
+        .expect_err("unreadable");
+        assert!(
+            error.starts_with(&format!(
+                "error: can't read ORBYN_SMTP_CA_FILE ({}): permission denied\n",
+                file.path()
+            )),
+            "{error}"
+        );
     }
 }

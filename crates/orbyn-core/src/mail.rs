@@ -10,6 +10,10 @@
 //! - The SMTP sender lives in `orbyn-worker`. [`LogOnly`] is what the worker uses with no SMTP
 //!   configured, and [`Capture`] is what tests use to read what would have been sent.
 
+mod render;
+
+pub use render::Rendered;
+
 use crate::accounts::secrets::AuthSecrets;
 use crate::jobs::{self, Job};
 use serde_json::{Value, json};
@@ -66,9 +70,10 @@ pub struct Mail {
     /// that has one, `None` for an address with neither. Bound into the sealed payload.
     pub account: Option<Uuid>,
     pub to: String,
-    /// The one value a message carries: a verification code, or for a deletion notice the time the
-    /// account will be deleted (RFC 3339), a newline, and the cancel link (or its token alone when
-    /// the deployment has no account URL).
+    /// The one value a message carries, sealed in the queue like the address: a verification code;
+    /// for an address that already has an account, the time of the attempt (RFC 3339), a newline
+    /// and the sign-in link (empty when the deployment has no account URL); for a deletion notice,
+    /// the time the account will be deleted, a newline and the cancel link (empty likewise).
     pub code: Option<String>,
 }
 
@@ -82,54 +87,12 @@ impl std::fmt::Debug for Mail {
 }
 
 impl Mail {
-    pub fn subject(&self) -> &'static str {
-        match self.kind {
-            Kind::VerifyEmail => "Your Orbyn verification code",
-            Kind::SignUpAttempt => "Someone tried to sign up with your email",
-            Kind::DeletionScheduled => "Your Orbyn account will be deleted",
-        }
+    /// The message as designed: subject, plain text and HTML, to be sent together. `None` for a
+    /// message that lacks the value its kind needs (a code email without its code, or a notice
+    /// without its time), which cannot be sent.
+    pub fn render(&self) -> Option<Rendered> {
+        render::render(self)
     }
-
-    pub fn body(&self) -> String {
-        match (self.kind, &self.code) {
-            (Kind::VerifyEmail, Some(code)) => format!(
-                "Your Orbyn verification code is {code}.\n\nIt works for 30 minutes. If you did not sign up for Orbyn, ignore this message.\n"
-            ),
-            (Kind::VerifyEmail, None) => "Your Orbyn verification code has expired. Ask for a new one in the app.\n".to_owned(),
-            (Kind::DeletionScheduled, value) => {
-                let (when, link) = deletion_parts(value.as_deref());
-                format!(
-                    "Your Orbyn account will be deleted on {when}, with everything in it.\n\nIf this was not you, cancel the deletion now: {link}\n\nThat opens a page with a \"Cancel deletion\" button; it works once and needs no sign-in. You can also cancel from any signed-in device, or sign in on the Orbyn sign-in page and choose \"cancel deletion\". Until then your account works as usual. If this was you, there is nothing to do.\n"
-                )
-            }
-            (Kind::SignUpAttempt, _) => "Someone tried to sign up for Orbyn with this email address, which already has an account.\n\nIf it was you, sign in instead. If it was not, you can ignore this message: nothing was changed.\n".to_owned(),
-        }
-    }
-}
-
-/// The date and the cancel link of a deletion notice, from its value: the time, a newline, the link.
-fn deletion_parts(value: Option<&str>) -> (String, String) {
-    let (when, link) = value
-        .and_then(|v| v.split_once('\n'))
-        .unwrap_or(("", "the app"));
-    let when = if when.is_empty() {
-        "the date shown in the app".to_owned()
-    } else {
-        deletion_date(when)
-    };
-    (when, link.to_owned())
-}
-
-/// "2026-11-14 12:00 UTC" from an RFC 3339 time; the text itself when it is not one.
-fn deletion_date(rfc3339: &str) -> String {
-    chrono::DateTime::parse_from_rfc3339(rfc3339).map_or_else(
-        |_| rfc3339.to_owned(),
-        |at| {
-            at.with_timezone(&chrono::Utc)
-                .format("%Y-%m-%d %H:%M UTC")
-                .to_string()
-        },
-    )
 }
 
 /// Why a message could not be sent. Never carries an address or a code.

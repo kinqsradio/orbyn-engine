@@ -3,7 +3,7 @@
 
 mod smtp;
 
-pub use smtp::Smtp;
+pub use smtp::{OPERATOR_ERROR, Smtp};
 
 use orbyn_core::accounts::AuthSecrets;
 use orbyn_core::mail::{self, Delivery, Sender};

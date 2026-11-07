@@ -111,7 +111,12 @@ async fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
-            tracing::error!(error = %message, "stopped");
+            // A start-up error written for the operator is printed as it is, to stderr.
+            if message.starts_with(orbyn_worker::OPERATOR_ERROR) {
+                eprintln!("{message}");
+            } else {
+                tracing::error!(error = %message, "stopped");
+            }
             ExitCode::FAILURE
         }
     }
