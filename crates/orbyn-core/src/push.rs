@@ -118,8 +118,8 @@ type TokenRow = (Uuid, String, Vec<u8>, Vec<u8>);
 
 /// How long one send may take before it counts as "try again later".
 pub const SEND_TIMEOUT: Duration = Duration::from_secs(10);
-/// The most devices one job wakes. Past it a device is simply not woken: it syncs when it is next
-/// opened, as a device without a push token does.
+/// The most devices one attempt of a job wakes. A full page makes the attempt a retry, so the next
+/// one takes the next page (the queue's backoff and attempt limit bound how many).
 pub const MAX_DEVICES_PER_JOB: usize = 50;
 
 /// The handler's bounds, so a test can shorten them.
@@ -207,7 +207,9 @@ pub async fn handle_zone_changed_with(
     let Ok(rows) = rows else {
         return PushDelivery::Retry("the devices to wake could not be read".to_owned());
     };
-    let mut retry = false;
+    // A full page means there may be more devices behind it: the job is retried, and the next
+    // attempt takes the next page, since the devices this one reached are in `push_deliveries`.
+    let mut retry = rows.len() >= options.max_devices;
     for (device, provider, sealed, digest) in rows {
         // A token that does not open (another setup sealed it, or it was copied from another
         // device) or a provider we do not know is no token: it is deleted, and the device

@@ -221,6 +221,31 @@ mod tests {
     }
 
     #[test]
+    fn a_push_token_and_a_queued_mail_do_not_open_each_other() -> Result<(), SecretsError> {
+        let secrets = AuthSecrets::from_encoded(&AuthSecrets::generate())?;
+        let device = Uuid::new_v4();
+        let token = secrets.seal_push_token(device, b"a-token").expect("sealed");
+        // Its own context: the mail's opener, with any associated data, cannot read it.
+        assert!(secrets.open_mail(device.as_bytes(), &token).is_none());
+        assert!(secrets.open_mail(&[], &token).is_none());
+        // It opens only for its own device.
+        assert_eq!(
+            secrets
+                .open_push_token(device, &token)
+                .as_deref()
+                .map(Vec::as_slice),
+            Some(&b"a-token"[..])
+        );
+        assert!(secrets.open_push_token(Uuid::new_v4(), &token).is_none());
+        // And a mail does not open as a token, whatever it is bound to.
+        let mail = secrets
+            .seal_mail(device.as_bytes(), b"a-token")
+            .expect("sealed");
+        assert!(secrets.open_push_token(device, &mail).is_none());
+        Ok(())
+    }
+
+    #[test]
     fn a_generated_setup_round_trips_and_keys_digests() -> Result<(), SecretsError> {
         let encoded = AuthSecrets::generate();
         let a = AuthSecrets::from_encoded(&encoded)?;
