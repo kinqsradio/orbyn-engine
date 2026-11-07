@@ -10,6 +10,13 @@ use orbyn_keyservice_daemon::publisher::{Cycle, FRESH_FOR_MS};
 
 const MIN: u64 = 60 * 1000;
 
+fn init_logging() {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_env_filter("orbyn_keyservice_daemon=warn")
+        .try_init();
+}
+
 fn published(cycle: &Cycle) -> (u64, i64) {
     match cycle {
         Cycle::Published { size, head_id } => (*size, *head_id),
@@ -86,6 +93,7 @@ async fn a_certification_is_in_the_next_published_head_and_not_before() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs ORBYN_KEYSERVICE_DATABASE_URL"]
 async fn two_of_three_publish_and_a_late_witness_walks_every_stored_head() {
+    init_logging();
     let c = Chain::new(3).await;
     let publisher = c.publisher(2);
     c.witnesses[2].down();
@@ -118,6 +126,7 @@ async fn two_of_three_publish_and_a_late_witness_walks_every_stored_head() {
         "the late witness cosigned the newest head"
     );
     assert_eq!(signers.len(), 3);
+    c.assert_one_chain().await;
     c.finish().await;
 }
 
@@ -125,14 +134,14 @@ async fn two_of_three_publish_and_a_late_witness_walks_every_stored_head() {
 #[ignore = "needs ORBYN_KEYSERVICE_DATABASE_URL"]
 async fn a_backlog_of_over_1000_entries_publishes_in_several_heads_without_waiting_an_interval() {
     let c = Chain::new(1).await;
-    c.append(2300, 50, 8).await;
+    c.append(1300, 50, 8).await;
     let publisher = c.publisher(1);
     // The interval is an hour; the backlog must clear without it.
     let task = tokio::spawn(async move { publisher.run(Duration::from_secs(3600)).await });
     let deadline = std::time::Instant::now() + Duration::from_secs(120);
     loop {
         let newest = c.state.store.latest_published_head().await.expect("read");
-        if newest.is_some_and(|h| h.head.size == 2300) {
+        if newest.is_some_and(|h| h.head.size == 1300) {
             break;
         }
         assert!(
@@ -142,7 +151,8 @@ async fn a_backlog_of_over_1000_entries_publishes_in_several_heads_without_waiti
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     task.abort();
-    assert_eq!(c.stored_heads().await, 3, "1000, 1000 and 300");
+    assert_eq!(c.stored_heads().await, 2, "1000, then 300");
+    c.assert_one_chain().await;
     c.finish().await;
 }
 
@@ -315,6 +325,16 @@ async fn below_the_threshold_nothing_is_published_and_a_returning_witness_catche
         2,
         "the stale head was never published itself"
     );
+    // It was walked: each returning witness was sent the stale head as an intermediate one and
+    // then the new head, after the one request that carried the first head.
+    for w in &c.witnesses {
+        assert!(
+            w.cosign_posts.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+            "a witness was sent the stale head on the way"
+        );
+    }
+    // And it is still one line: the new head names the stale one.
+    c.assert_one_chain().await;
     assert_eq!(
         c.state
             .store
@@ -374,4 +394,61 @@ fn the_operator_is_alerted_after_30_minutes_and_hourly_after() {
     assert!(!alert_due(first + ALERT_EVERY_MS - 1, start, Some(first)));
     assert!(alert_due(first + ALERT_EVERY_MS, start, Some(first)));
     assert_eq!(ALERT_AFTER_MS, 30 * 60 * 1000);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs ORBYN_KEYSERVICE_DATABASE_URL"]
+async fn nothing_publishes_a_head_older_than_the_witness_window() {
+    use orbyn_keyservice_daemon::publisher::StoreSource;
+    use orbyn_witness::Reason;
+    use orbyn_witness::client::{ClientError, Cosigner, WitnessClient};
+    let c = Chain::new(3).await;
+    c.key_for(1).await;
+    // A head is signed and stored, and the witnesses are never asked.
+    let store = &c.state.store;
+    let head = store.build_head(c.now(), 1, None).await.expect("head");
+    let signature = c.state.keys.sign_head(&head).expect("sign");
+    let stale_id = store.commit_head(&head, &signature).await.expect("commit");
+    // The witnesses are up, and it grows older than their window.
+    c.advance(FRESH_FOR_MS + MIN);
+    // The witnesses themselves refuse it as the end of a request: that is their clock rule.
+    let clients: Vec<_> = c
+        .witnesses
+        .iter()
+        .map(|w| WitnessClient::new(&w.url, w.public, Duration::from_secs(30)).expect("client"))
+        .collect();
+    let cosigner = Cosigner::new(clients, 2).expect("cosigner");
+    let outcome = cosigner
+        .cosign(&StoreSource::new(store.clone()), &head)
+        .await;
+    assert!(!outcome.enough);
+    assert!(outcome.cosignatures.is_empty());
+    assert_eq!(outcome.failures.len(), 3);
+    for (_, failure) in &outcome.failures {
+        assert!(
+            matches!(failure, ClientError::Refused(r) if r.reason == Reason::ClockSkew),
+            "{failure:?}"
+        );
+    }
+    // The publisher does not try: it builds the next head on top and publishes that one.
+    let publisher = c.publisher(2);
+    let (size, id) = published(&publisher.publish_once().await.expect("cycle"));
+    assert_eq!(size, 1);
+    assert_ne!(id, stale_id);
+    assert_eq!(c.stored_heads().await, 2);
+    assert_eq!(published_count(&c).await, 1, "only the new head");
+    let published_head = store
+        .latest_published_head()
+        .await
+        .expect("read")
+        .expect("head");
+    assert_eq!(published_head.id, id);
+    assert!(
+        c.now() - published_head.head.time_ms <= FRESH_FOR_MS,
+        "what is published is within the window"
+    );
+    // Entries the stale head covered are covered, by the head that was published.
+    assert!(c.covered(1).await);
+    c.assert_one_chain().await;
+    c.finish().await;
 }

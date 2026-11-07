@@ -164,13 +164,22 @@ impl RequestSource for StoreSource {
                 .store
                 .head_after(prev.as_ref())
                 .await
-                .map_err(|_| ClientError::Source)?
-                .ok_or(ClientError::Source)?;
+                .map_err(|error| {
+                    tracing::warn!(event = "source_store_error", error = %error);
+                    ClientError::Source
+                })?
+                .ok_or_else(|| {
+                    tracing::warn!(event = "source_unknown_head");
+                    ClientError::Source
+                })?;
             let material = self
                 .store
                 .cosign_material(&stored.head)
                 .await
-                .map_err(|_| ClientError::Source)?;
+                .map_err(|error| {
+                    tracing::warn!(event = "source_store_error", error = %error);
+                    ClientError::Source
+                })?;
             let log_signature: [u8; 64] = stored
                 .log_signature
                 .as_slice()

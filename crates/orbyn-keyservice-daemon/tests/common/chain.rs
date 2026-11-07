@@ -6,7 +6,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use axum::extract::Request;
 use axum::http::StatusCode;
@@ -29,6 +29,8 @@ pub struct W {
     pub url: String,
     pub public: [u8; 32],
     pub up: Arc<AtomicBool>,
+    /// How many cosign requests reached this witness while it was up.
+    pub cosign_posts: Arc<AtomicUsize>,
     pub clock: TestClock,
     pub service: Arc<Service<Arc<orbyn_witness::MemoryStore>, TestClock>>,
     task: tokio::task::JoinHandle<()>,
@@ -107,14 +109,20 @@ impl Chain {
         let service = Arc::new(Service::new(witness, 1000));
         let up = Arc::new(AtomicBool::new(true));
         let gate = up.clone();
+        let posts = Arc::new(AtomicUsize::new(0));
+        let counted = posts.clone();
         let app = service
             .clone()
             .router()
             .layer(axum::middleware::from_fn(
                 move |req: Request, next: Next| {
                     let gate = gate.clone();
+                    let counted = counted.clone();
                     async move {
                         if gate.load(Ordering::SeqCst) {
+                            if req.uri().path() == "/v1/cosign" {
+                                counted.fetch_add(1, Ordering::SeqCst);
+                            }
                             next.run(req).await
                         } else {
                             StatusCode::SERVICE_UNAVAILABLE.into_response()
@@ -134,6 +142,7 @@ impl Chain {
             url,
             public,
             up,
+            cosign_posts: posts,
             clock,
             service,
             task,
@@ -201,6 +210,25 @@ impl Chain {
             .expect("read")
             .expect("key")
             .head_covers_entry
+    }
+
+    /// Every stored head is one link of one chain: the first names nothing, each next names the
+    /// one stored before it, and no two name the same previous head.
+    pub async fn assert_one_chain(&self) {
+        let rows: Vec<(Vec<u8>, Vec<u8>)> =
+            sqlx::query_as("SELECT prev_head_hash, head_hash FROM heads ORDER BY id")
+                .fetch_all(&self.db.runtime)
+                .await
+                .expect("heads");
+        let mut before = vec![0u8; 32];
+        for (i, (prev, hash)) in rows.iter().enumerate() {
+            assert_eq!(*prev, before, "head {i} does not name the head before it");
+            before = hash.clone();
+        }
+        let mut prevs: Vec<_> = rows.iter().map(|(p, _)| p.clone()).collect();
+        prevs.sort();
+        prevs.dedup();
+        assert_eq!(prevs.len(), rows.len(), "two heads name one previous head");
     }
 
     /// How many heads are stored.

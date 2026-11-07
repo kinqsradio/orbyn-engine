@@ -260,6 +260,7 @@ async fn catch_up(
     // of the last head it served as final. The first refusal as a rollback says where it stands,
     // and the run goes on from there, once.
     let mut resumed = false;
+    let mut steps = 0usize;
     loop {
         let mut request = source.next(after.as_ref()).await?;
         // Only the head that ends the catch-up is held to the clock.
@@ -297,13 +298,26 @@ async fn catch_up(
         if request.head.hash() == target.hash() {
             return Ok(cosignature);
         }
-        // A request that does not move toward the target would loop for ever.
-        if request.head.size >= target.size {
+        // A request that does not move along the chain would loop for ever, and one past the
+        // target is not on the way to it. **Size is not progress**: the chain has idle heads (the
+        // same size and roots, a later time) and a head that stands at the target's size is
+        // still a step on the way to it; the head named by `prev_head_hash` is what moves.
+        steps += 1;
+        if request.head.size > target.size
+            || steps > MAX_CATCH_UP_STEPS
+            || after
+                .as_ref()
+                .is_some_and(|a| a.hash() == request.head.hash())
+        {
             return Err(ClientError::Source);
         }
         after = Some(request.head);
     }
 }
+
+/// The most heads one catch-up walks (a witness away for a long time on a chain with a head every
+/// ten minutes: this is over two years of them). Past it the source is taken to be going nowhere.
+const MAX_CATCH_UP_STEPS: usize = 100_000;
 
 /// Runs every future to completion together, in order of the input.
 async fn join_all<T>(futures: Vec<impl Future<Output = T> + Send>) -> Vec<T> {
