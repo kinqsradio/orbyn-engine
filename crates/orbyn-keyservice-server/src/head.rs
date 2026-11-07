@@ -15,19 +15,12 @@ pub struct StoredHead {
     pub head: UnsignedHead,
     pub head_hash: [u8; 32],
     pub log_signature: Vec<u8>,
-    pub cosignatures: Vec<u8>,
 }
 
-pub(crate) async fn latest(conn: &mut PgConnection) -> Result<Option<StoredHead>> {
-    let Some(row) = sqlx::query(
-        "SELECT id, size, log_root, service_map_root, identity_map_root, time_ms, prev_head_hash, \
-         log_key_version, head_hash, log_signature, cosignatures FROM heads ORDER BY id DESC LIMIT 1",
-    )
-    .fetch_optional(conn)
-    .await?
-    else {
-        return Ok(None);
-    };
+const HEAD_COLUMNS: &str = "id, size, log_root, service_map_root, identity_map_root, time_ms, \
+     prev_head_hash, log_key_version, head_hash, log_signature";
+
+fn parse(row: &sqlx::postgres::PgRow) -> Result<StoredHead> {
     let head = UnsignedHead {
         size: to_u64(row.try_get("size")?)?,
         log_root: to_hash(row.try_get("log_root")?, "log root")?,
@@ -42,13 +35,52 @@ pub(crate) async fn latest(conn: &mut PgConnection) -> Result<Option<StoredHead>
     if head.hash() != head_hash {
         return Err(StoreError::Corrupt("a head does not match its hash"));
     }
-    Ok(Some(StoredHead {
+    Ok(StoredHead {
         id: row.try_get("id")?,
         head,
         head_hash,
         log_signature: row.try_get("log_signature")?,
-        cosignatures: row.try_get("cosignatures")?,
-    }))
+    })
+}
+
+async fn one(
+    conn: &mut PgConnection,
+    tail: &str,
+    bind: Option<&Hash>,
+) -> Result<Option<StoredHead>> {
+    let sql = format!("SELECT {HEAD_COLUMNS} FROM heads {tail}");
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+    if let Some(hash) = bind {
+        query = query.bind(hash.as_slice());
+    }
+    query
+        .fetch_optional(conn)
+        .await?
+        .map(|row| parse(&row))
+        .transpose()
+}
+
+pub(crate) async fn latest(conn: &mut PgConnection) -> Result<Option<StoredHead>> {
+    one(conn, "ORDER BY id DESC LIMIT 1", None).await
+}
+
+/// The newest head that is published.
+pub(crate) async fn latest_published(conn: &mut PgConnection) -> Result<Option<StoredHead>> {
+    one(
+        conn,
+        "WHERE id = (SELECT max(head_id) FROM published_heads)",
+        None,
+    )
+    .await
+}
+
+/// The stored head that names `prev` as its previous head (unique: the chain does not fork).
+pub(crate) async fn after(conn: &mut PgConnection, prev: &Hash) -> Result<Option<StoredHead>> {
+    one(conn, "WHERE prev_head_hash = $1", Some(prev)).await
+}
+
+pub(crate) async fn by_hash(conn: &mut PgConnection, hash: &Hash) -> Result<Option<StoredHead>> {
+    one(conn, "WHERE head_hash = $1", Some(hash)).await
 }
 
 /// Applies entries to the two map roots, in order: what a head's roots are, by definition.
@@ -116,7 +148,6 @@ pub(crate) async fn commit(
     conn: &mut PgConnection,
     head: &UnsignedHead,
     log_signature: &[u8; 64],
-    cosignatures: &[u8],
 ) -> Result<i64> {
     let (last_size, last_roots, last_hash, last_time) = base(&mut *conn).await?;
     if head.prev_head_hash != last_hash {
@@ -144,8 +175,8 @@ pub(crate) async fn commit(
     }
     let inserted = sqlx::query(
         "INSERT INTO heads (size, log_root, service_map_root, identity_map_root, time_ms, \
-         prev_head_hash, log_key_version, head_hash, log_signature, cosignatures) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id",
+         prev_head_hash, log_key_version, head_hash, log_signature) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
     )
     .bind(to_i64(head.size)?)
     .bind(head.log_root.as_slice())
@@ -156,7 +187,6 @@ pub(crate) async fn commit(
     .bind(i32::try_from(head.log_key_version).map_err(|_| StoreError::BadHead)?)
     .bind(head.hash().as_slice())
     .bind(log_signature.as_slice())
-    .bind(cosignatures)
     .fetch_one(&mut *conn)
     .await;
     // The unique constraint on the previous head is the last line against a fork.

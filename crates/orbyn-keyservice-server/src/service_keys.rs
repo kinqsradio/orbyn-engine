@@ -47,7 +47,8 @@ pub struct ServiceKeyRecord {
     pub state: ServiceKeyState,
     /// The certification entry's position in the log (its leaf index, from 0).
     pub entry_index: u64,
-    /// Whether a stored head covers the certification entry yet.
+    /// Whether a **published** head (one the witnesses cosigned) covers the certification entry.
+    /// A head that is stored and not yet cosigned does not count.
     pub head_covers_entry: bool,
 }
 
@@ -136,8 +137,9 @@ async fn record(
     let key = service_account_map_key(&public);
     // The certification is the first entry of the account's chain in the service map.
     let entry = sqlx::query(
-        "SELECT seq, included_in_head IS NOT NULL AS covered FROM log_entries \
-         WHERE map = $1 AND map_key = $2 AND chain_index = 0 AND kind = $3",
+        "SELECT seq, \
+         COALESCE(included_in_head <= (SELECT max(head_id) FROM published_heads), false) AS covered \
+         FROM log_entries WHERE map = $1 AND map_key = $2 AND chain_index = 0 AND kind = $3",
     )
     .bind(crate::map_column(MapId::Service))
     .bind(key.as_slice())

@@ -392,10 +392,7 @@ async fn heads_follow_the_model_and_chain_and_idle_heads_repeat_the_roots() {
     assert_eq!(genesis.identity_map_root, map_empty_root());
     assert_eq!(genesis.prev_head_hash, [0; 32]);
     assert!(store.latest_head().await.expect("latest").is_none());
-    let genesis_id = store
-        .commit_head(&genesis, &[1; 64], b"")
-        .await
-        .expect("commit");
+    let genesis_id = store.commit_head(&genesis, &[1; 64]).await.expect("commit");
 
     // Entries, with some accounts getting several, in both maps.
     let mut model = Model::new();
@@ -432,14 +429,10 @@ async fn heads_follow_the_model_and_chain_and_idle_heads_repeat_the_roots() {
     );
 
     // Committing stores it and marks every entry it covers.
-    let id = store
-        .commit_head(&head, &[2; 64], b"cosigs")
-        .await
-        .expect("commit");
+    let id = store.commit_head(&head, &[2; 64]).await.expect("commit");
     let stored = store.latest_head().await.expect("latest").expect("head");
     assert_eq!((stored.id, stored.head.clone()), (id, head.clone()));
     assert_eq!(stored.head_hash, head.hash());
-    assert_eq!(stored.cosignatures, b"cosigs");
     let pending: i64 =
         sqlx::query("SELECT count(*) AS n FROM log_entries WHERE included_in_head IS NULL")
             .fetch_one(&db.runtime)
@@ -489,7 +482,7 @@ async fn heads_follow_the_model_and_chain_and_idle_heads_repeat_the_roots() {
     );
     assert_eq!((idle.time_ms, idle.prev_head_hash), (3_000, head.hash()));
     store
-        .commit_head(&idle, &[3; 64], b"")
+        .commit_head(&idle, &[3; 64])
         .await
         .expect("idle commit");
 
@@ -528,17 +521,14 @@ async fn a_head_cannot_go_back_in_time_or_be_stored_twice_or_after_another() {
         .expect("append");
     let first = store.build_head(5_000, 1, None).await.expect("first");
     let competing = store.build_head(5_001, 1, None).await.expect("competing");
-    store
-        .commit_head(&first, &[1; 64], b"")
-        .await
-        .expect("commit");
+    store.commit_head(&first, &[1; 64]).await.expect("commit");
     // A head built on the same previous head is superseded, and so is storing one twice.
     assert!(matches!(
-        store.commit_head(&competing, &[1; 64], b"").await,
+        store.commit_head(&competing, &[1; 64]).await,
         Err(StoreError::HeadSuperseded)
     ));
     assert!(matches!(
-        store.commit_head(&first, &[1; 64], b"").await,
+        store.commit_head(&first, &[1; 64]).await,
         Err(StoreError::HeadSuperseded)
     ));
     // Time may not go back.
@@ -551,17 +541,17 @@ async fn a_head_cannot_go_back_in_time_or_be_stored_twice_or_after_another() {
     let mut wrong_root = good.clone();
     wrong_root.log_root = [7; 32];
     assert!(matches!(
-        store.commit_head(&wrong_root, &[1; 64], b"").await,
+        store.commit_head(&wrong_root, &[1; 64]).await,
         Err(StoreError::BadHead)
     ));
     let mut too_big = good.clone();
     too_big.size = 99;
     assert!(matches!(
-        store.commit_head(&too_big, &[1; 64], b"").await,
+        store.commit_head(&too_big, &[1; 64]).await,
         Err(StoreError::BadHead)
     ));
     store
-        .commit_head(&good, &[1; 64], b"")
+        .commit_head(&good, &[1; 64])
         .await
         .expect("good commit");
     db.cleanup().await;
@@ -583,10 +573,7 @@ async fn the_runtime_role_cannot_update_delete_truncate_or_change_the_schema() {
         .await
         .expect("append");
     let head = store.build_head(1, 1, None).await.expect("head");
-    let head_id = store
-        .commit_head(&head, &[1; 64], b"")
-        .await
-        .expect("commit");
+    let head_id = store.commit_head(&head, &[1; 64]).await.expect("commit");
     store
         .append(&entry(MapId::Service, 2, [0; 32], 1))
         .await
@@ -655,7 +642,7 @@ async fn the_runtime_role_cannot_update_delete_truncate_or_change_the_schema() {
     let idle = store.build_head(2, 1, Some(0)).await.expect("idle head");
     assert_eq!(idle.size, 1);
     let idle_id = store
-        .commit_head(&idle, &[2; 64], b"")
+        .commit_head(&idle, &[2; 64])
         .await
         .expect("commit idle");
     denied(
@@ -761,10 +748,7 @@ async fn the_triggers_stop_even_the_owner_from_changing_or_truncating_the_log() 
         .await
         .expect("append");
     let head = store.build_head(1, 1, None).await.expect("head");
-    store
-        .commit_head(&head, &[1; 64], b"")
-        .await
-        .expect("commit");
+    store.commit_head(&head, &[1; 64]).await.expect("commit");
     sqlx::query(
         "INSERT INTO service_keys (account_id, wrapped, public, identity_version, statement, signature) \
          VALUES ($1, $2, $3, 1, $4, $5)",
@@ -859,7 +843,7 @@ async fn a_head_with_a_wrong_map_root_is_refused_and_later_heads_still_build() {
         ("emptied", emptied),
         ("swapped", swapped),
     ] {
-        let result = store.commit_head(&bad, &[1; 64], b"").await;
+        let result = store.commit_head(&bad, &[1; 64]).await;
         assert!(
             matches!(result, Err(StoreError::BadHead)),
             "{what}: {result:?}"
@@ -868,7 +852,7 @@ async fn a_head_with_a_wrong_map_root_is_refused_and_later_heads_still_build() {
     // Nothing was stored, nothing marked, and the good head still commits and builds on.
     assert!(store.latest_head().await.expect("latest").is_none());
     store
-        .commit_head(&good, &[1; 64], b"")
+        .commit_head(&good, &[1; 64])
         .await
         .expect("good commit");
     store
@@ -886,7 +870,7 @@ async fn a_head_with_a_wrong_map_root_is_refused_and_later_heads_still_build() {
     let mut tampered = idle.clone();
     tampered.identity_map_root = [5; 32];
     assert!(matches!(
-        store.commit_head(&tampered, &[1; 64], b"").await,
+        store.commit_head(&tampered, &[1; 64]).await,
         Err(StoreError::BadHead)
     ));
     // A head that claims fewer entries than its roots cover, and one that claims more.
@@ -894,11 +878,11 @@ async fn a_head_with_a_wrong_map_root_is_refused_and_later_heads_still_build() {
     short.size = 6;
     short.log_root = store.log_root(6).await.expect("root");
     assert!(matches!(
-        store.commit_head(&short, &[1; 64], b"").await,
+        store.commit_head(&short, &[1; 64]).await,
         Err(StoreError::BadHead)
     ));
     store
-        .commit_head(&next, &[1; 64], b"")
+        .commit_head(&next, &[1; 64])
         .await
         .expect("next commit");
     db.cleanup().await;
@@ -921,10 +905,7 @@ async fn the_chain_of_heads_cannot_fork_even_when_the_database_defaults_to_repea
         .await
         .expect("append");
     let first = store.build_head(1, 1, None).await.expect("first");
-    store
-        .commit_head(&first, &[1; 64], b"")
-        .await
-        .expect("commit");
+    store.commit_head(&first, &[1; 64]).await.expect("commit");
     // Many idle heads built on the same previous head, committed at once: exactly one wins.
     for round in 0..5u64 {
         let latest = store.latest_head().await.expect("latest").expect("head");
@@ -942,7 +923,7 @@ async fn the_chain_of_heads_cannot_fork_even_when_the_database_defaults_to_repea
         for head in heads {
             let store = store.clone();
             tasks.push(tokio::spawn(async move {
-                store.commit_head(&head, &[1; 64], b"").await
+                store.commit_head(&head, &[1; 64]).await
             }));
         }
         let mut ok = 0;
@@ -1050,10 +1031,7 @@ async fn a_head_covers_at_most_max_entries_and_the_rest_wait() {
             tree_root(&model.leaves[..head.size as usize])
         );
         sizes.push(head.size);
-        store
-            .commit_head(&head, &[1; 64], b"")
-            .await
-            .expect("commit");
+        store.commit_head(&head, &[1; 64]).await.expect("commit");
     }
     assert_eq!(sizes, [10, 20, 25, 25]);
     // The last head covers everything, so its service root is the model's.
@@ -1312,10 +1290,7 @@ async fn a_thousand_entry_head_builds_and_commits_in_reasonable_time() {
     let build = built.elapsed();
     assert_eq!(head.size, 1000);
     let committed = std::time::Instant::now();
-    store
-        .commit_head(&head, &[1; 64], b"")
-        .await
-        .expect("commit");
+    store.commit_head(&head, &[1; 64]).await.expect("commit");
     let commit = committed.elapsed();
     eprintln!("1000 entries: build {build:?}, commit {commit:?}");
     // Each statement is under the 120 s statement timeout or the store would have said `Busy`; the
@@ -1337,10 +1312,7 @@ async fn a_temporary_table_cannot_shadow_heads_to_pass_the_append_only_check() {
     // would let an entry be marked.
     let genesis = store.build_head(1, 1, Some(0)).await.expect("head");
     assert_eq!(genesis.size, 0);
-    let real_id = store
-        .commit_head(&genesis, &[1; 64], b"")
-        .await
-        .expect("commit");
+    let real_id = store.commit_head(&genesis, &[1; 64]).await.expect("commit");
     assert_eq!(real_id, 1);
 
     // First wall: the runtime role has no right to make temporary tables.
@@ -1651,10 +1623,7 @@ async fn creating_a_service_key_is_idempotent_and_logs_one_certification() {
     assert_eq!(store.service_key(&[8; 16]).await.expect("read"), None);
     // The head that covers it says so.
     let head = store.build_head(10, 1, None).await.expect("head");
-    store
-        .commit_head(&head, &[1; 64], b"")
-        .await
-        .expect("commit");
+    store.commit_head(&head, &[1; 64]).await.expect("commit");
     assert!(
         store
             .service_key(&account)

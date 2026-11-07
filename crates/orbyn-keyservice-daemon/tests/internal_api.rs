@@ -83,7 +83,7 @@ async fn a_certification_appears_in_the_next_head_and_verifies_under_the_pinned_
     let signature = h.state.keys.sign_head(&head).expect("sign");
     h.state
         .store
-        .commit_head(&head, &signature, b"")
+        .commit_head(&head, &signature)
         .await
         .expect("commit");
     let read = ok.get(&A).await.expect("read").expect("there");
