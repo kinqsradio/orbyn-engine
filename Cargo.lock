@@ -1908,6 +1908,7 @@ dependencies = [
  "orbyn-keyservice-client",
  "orbyn-keyservice-server",
  "orbyn-translog",
+ "orbyn-witness",
  "rcgen",
  "reqwest",
  "rustls-pki-types",

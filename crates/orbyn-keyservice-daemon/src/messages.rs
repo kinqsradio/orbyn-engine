@@ -307,3 +307,54 @@ pub fn reload_setting(error: TlsError) -> &'static str {
         TlsError::Rejected => "ORBYN_KS_TLS_CERT and ORBYN_KS_TLS_KEY",
     }
 }
+
+// The head publisher's settings (Account Designs v51, frame `ks-publisher`).
+
+pub fn witness_url_invalid() -> String {
+    error(
+        "a witness URL is not a valid https address (ORBYN_KS_WITNESSES)",
+        "Use an https address. Plain http is allowed only on a loopback address in development.",
+    )
+}
+
+pub fn witness_key_invalid() -> String {
+    error(
+        "a witness key is not 64 hex digits (ORBYN_KS_WITNESS_KEYS)",
+        "Give each witness public key as 64 hex digits.",
+    )
+}
+
+pub fn witness_count_mismatch() -> String {
+    error(
+        "the number of witness keys does not match the number of witness URLs",
+        "Give one key for each URL, in the same order.",
+    )
+}
+
+pub fn witness_key_twice() -> String {
+    error(
+        "a witness key is pinned twice (ORBYN_KS_WITNESS_KEYS)",
+        "Remove the duplicate.",
+    )
+}
+
+pub fn witness_threshold() -> String {
+    error(
+        "the witness threshold must be more than half of the witnesses (ORBYN_KS_WITNESS_THRESHOLD)",
+        "With 3 witnesses it must be at least 2.",
+    )
+}
+
+pub fn log_key_missing() -> String {
+    error(
+        "the log key isn't in the HSM (ORBYN_KS_LOG_KEY_VERSION)",
+        "Run init-log-key to create log key 1, or set ORBYN_KS_LOG_KEY_VERSION to a version the HSM has.",
+    )
+}
+
+pub fn interval_out_of_range() -> String {
+    error(
+        "ORBYN_KS_HEAD_INTERVAL_SECS is out of range",
+        "Use a value from 60 to 900 seconds.",
+    )
+}

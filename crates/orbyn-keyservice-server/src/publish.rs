@@ -58,7 +58,7 @@ struct Nodes {
 /// below its length, as the RFC does).
 fn needed(start: u64, end: u64, out: &mut Vec<(i16, u64)>) {
     let n = end - start;
-    if n.is_power_of_two() && start % n == 0 {
+    if n.is_power_of_two() && start.is_multiple_of(n) {
         out.push((n.trailing_zeros() as i16, start / n));
         return;
     }
@@ -73,7 +73,7 @@ impl Subtrees for Nodes {
     }
     fn root(&self, start: u64, end: u64) -> Hash {
         let n = end - start;
-        if n.is_power_of_two() && start % n == 0 {
+        if n.is_power_of_two() && start.is_multiple_of(n) {
             return self
                 .stored
                 .get(&(n.trailing_zeros() as i16, start / n))
@@ -204,6 +204,17 @@ impl Store {
     pub async fn head_by_hash(&self, hash: &Hash) -> Result<Option<StoredHead>> {
         let mut conn = self.pool.acquire().await?;
         head::by_hash(&mut conn, hash).await
+    }
+
+    /// The consistency proof that the log of the first `old` entries is a prefix of the log of the
+    /// first `new`, read from the stored complete subtrees (nothing is recomputed from leaves).
+    /// Empty from nothing and when the sizes are equal. `new` must not be above the log's size.
+    pub async fn consistency_proof(&self, old: u64, new: u64) -> Result<Vec<Hash>> {
+        if old > new || new > self.size().await? {
+            return Err(StoreError::BadHead);
+        }
+        let mut conn = self.pool.acquire().await?;
+        consistency(&mut conn, old, new).await
     }
 
     /// What a witness needs to check `head` on top of the head that precedes it (named by its

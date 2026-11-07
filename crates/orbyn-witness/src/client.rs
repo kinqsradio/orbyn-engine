@@ -306,10 +306,10 @@ async fn catch_up(
 }
 
 /// Runs every future to completion together, in order of the input.
-async fn join_all<T>(futures: Vec<impl Future<Output = T>>) -> Vec<T> {
-    let mut pending: Vec<Option<Pin<Box<dyn Future<Output = T> + '_>>>> = futures
+async fn join_all<T>(futures: Vec<impl Future<Output = T> + Send>) -> Vec<T> {
+    let mut pending: Vec<Option<Pin<Box<dyn Future<Output = T> + Send + '_>>>> = futures
         .into_iter()
-        .map(|f| Some(Box::pin(f) as Pin<Box<dyn Future<Output = T> + '_>>))
+        .map(|f| Some(Box::pin(f) as Pin<Box<dyn Future<Output = T> + Send + '_>>))
         .collect();
     let mut done: Vec<Option<T>> = pending.iter().map(|_| None).collect();
     std::future::poll_fn(|cx| {

@@ -17,6 +17,8 @@ use orbyn_keyservice_server::{Store, migrate};
 use sqlx::AssertSqlSafe;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 
+pub mod chain;
+
 pub type Hsm = Spy<MemoryHsm>;
 
 pub struct Db {
