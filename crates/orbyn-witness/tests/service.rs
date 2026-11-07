@@ -826,19 +826,19 @@ fn the_binary_says_what_the_designs_say_for_help_and_for_each_start_up_error() {
     wrong_size.size = 7;
     assert_eq!(
         stderr_of(&run_pin(&signed(&wrong_size))),
-        format!("{}\n", messages::replay_mismatch("size"))
+        format!("{}\n", messages::replay_mismatch("size is"))
     );
     let mut wrong_root = head.clone();
     wrong_root.log_root = [9; 32];
     assert_eq!(
         stderr_of(&run_pin(&signed(&wrong_root))),
-        format!("{}\n", messages::replay_mismatch("root"))
+        format!("{}\n", messages::replay_mismatch("log root is"))
     );
     let mut wrong_maps = head.clone();
     wrong_maps.identity_map_root = [9; 32];
     assert_eq!(
         stderr_of(&run_pin(&signed(&wrong_maps))),
-        format!("{}\n", messages::replay_mismatch("map roots"))
+        format!("{}\n", messages::replay_mismatch("map roots are"))
     );
     // A head the log key did not sign.
     assert_eq!(
@@ -928,6 +928,39 @@ fn the_binary_says_what_the_designs_say_for_help_and_for_each_start_up_error() {
     );
     assert!(messages::HELP.contains("\n  --newest-per-hour <COUNT>  Most reads of the newest cosignature per address per hour [default: 60]\n"));
     assert!(!messages::HELP.contains("head hash is not"));
+
+    // The words of the final designs (v45) for the pinned head, word for word.
+    assert_eq!(
+        messages::replay_needs_pin(),
+        "error: --bootstrap-replay needs --pin-head\n  Give the signed head the replayed log must end at."
+    );
+    assert_eq!(
+        messages::pin_not_signed(),
+        "error: the pinned head is not signed by a pinned log key\n  Check that --pin-head is a head signed by one of the keys in --log-keys."
+    );
+    for (cause, line) in [
+        ("size is", "its size is not the pinned head's"),
+        ("log root is", "its log root is not the pinned head's"),
+        ("map roots are", "its map roots are not the pinned head's"),
+    ] {
+        assert_eq!(
+            messages::replay_mismatch(cause),
+            format!(
+                "error: the replayed log is not the pinned head ({line})\n  Check that the entries file and --pin-head describe the same head."
+            )
+        );
+    }
+    assert_eq!(
+        messages::key_file_readable_by_others(p),
+        "error: the key file can be read by other users (/etc/orbyn-witness/witness.key)\n  Run chmod 600 on it, then start again."
+    );
+    assert!(messages::HELP.contains("\n  --log-keys <KEYS>          Public keys (versions of the log's key) this witness accepts heads from\n"));
+    assert!(messages::HELP.contains(
+        "\n  --pin-head <HEX>           The signed head the replayed log must end at, in hex\n"
+    ));
+    assert!(
+        !messages::HELP.contains("--pin-size") && !messages::HELP.contains("signature, in hex")
+    );
 
     // A key file that can't be written: the directory is not there.
     let nowhere = dir.join("no-such-directory").join("key");

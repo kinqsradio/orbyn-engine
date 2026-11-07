@@ -16,12 +16,12 @@ Options:
   --bind <ADDRESS>           Address to listen on [default: 127.0.0.1:8480]
   --state-dir <DIRECTORY>    Where the witness keeps its saved state
   --key-file <FILE>          File holding the signing key (64 hex digits)
-  --log-keys <KEYS>          Public keys of the logs this witness cosigns for
+  --log-keys <KEYS>          Public keys (versions of the log's key) this witness accepts heads from
   --recosign-secs <SECONDS>  How often to cosign the newest head again [default: 600]
   --newest-per-hour <COUNT>  Most reads of the newest cosignature per address per hour [default: 60]
   --bootstrap-empty          First start with an empty log
   --bootstrap-replay <FILE>  First start by replaying the entries in FILE
-  --pin-head <HEX>           The signed head the replayed log must match (head, then its signature, in hex)
+  --pin-head <HEX>           The signed head the replayed log must end at, in hex
   -h, --help                 Print help
 ";
 
@@ -55,26 +55,27 @@ pub fn both_bootstraps() -> String {
 
 pub fn replay_needs_pin() -> String {
     format!(
-        "{ERROR}--bootstrap-replay needs --pin-head\n  Give the signed head the replayed log must match."
+        "{ERROR}--bootstrap-replay needs --pin-head\n  Give the signed head the replayed log must end at."
     )
 }
 
-/// `cause` is what did not match the pinned head: its size, root or map roots.
+/// `cause` is what did not match the pinned head, with its verb: `size is`, `log root is` or
+/// `map roots are`.
 pub fn replay_mismatch(cause: &str) -> String {
     format!(
-        "{ERROR}the replayed log is not the pinned head (its {cause} is not the pinned head's)\n  Check that the entries file and --pin-head describe the same head."
+        "{ERROR}the replayed log is not the pinned head (its {cause} not the pinned head's)\n  Check that the entries file and --pin-head describe the same head."
     )
 }
 
 pub fn pin_not_signed() -> String {
     format!(
-        "{ERROR}the pinned head is not signed by a pinned log key\n  Check --pin-head and --log-keys."
+        "{ERROR}the pinned head is not signed by a pinned log key\n  Check that --pin-head is a head signed by one of the keys in --log-keys."
     )
 }
 
 pub fn key_file_readable_by_others(path: &Path) -> String {
     format!(
-        "{ERROR}the key file can be read by other users ({})\n  Make it readable by its owner only, for example with chmod 600.",
+        "{ERROR}the key file can be read by other users ({})\n  Run chmod 600 on it, then start again.",
         path.display()
     )
 }

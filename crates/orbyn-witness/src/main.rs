@@ -211,9 +211,9 @@ fn start_error(error: StartError, state_dir: &Path) -> String {
         StartError::NeedsBootstrap => messages::needs_bootstrap(),
         StartError::AlreadyStarted => messages::already_started(),
         StartError::Replay(ReplayCause::Signature) => messages::pin_not_signed(),
-        StartError::Replay(ReplayCause::Size) => messages::replay_mismatch("size"),
-        StartError::Replay(ReplayCause::LogRoot) => messages::replay_mismatch("root"),
-        StartError::Replay(ReplayCause::MapRoots) => messages::replay_mismatch("map roots"),
+        StartError::Replay(ReplayCause::Size) => messages::replay_mismatch("size is"),
+        StartError::Replay(ReplayCause::LogRoot) => messages::replay_mismatch("log root is"),
+        StartError::Replay(ReplayCause::MapRoots) => messages::replay_mismatch("map roots are"),
         StartError::Replay(ReplayCause::Entries) => messages::entries_file_unreadable(),
         StartError::Replay(ReplayCause::Chain) => messages::chain_broken(),
         // The state could not be written, or could not be read back (a checksum that fails).
