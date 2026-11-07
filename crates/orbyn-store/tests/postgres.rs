@@ -2679,12 +2679,79 @@ async fn protection_settings_are_rate_limited_per_account_after_the_signature_ve
         store.put_protection(&me, &fourth).await,
         Err(StoreError::TooManyProtectionChanges)
     ));
-    // Nothing was stored for it, and a conflict (a valid signature on a request that does not
-    // fit) counts like any other attempt.
+    // Nothing was stored for it.
     assert_eq!(
         store.protection_chain(&me, 1).await.expect("chain").0.len(),
         3
     );
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn requests_that_never_fit_the_chain_do_not_use_up_what_the_next_valid_setting_needs() {
+    let (store, db) = store_with(Limits {
+        protection_per_hour: Limit::new(3, Duration::from_secs(3600)),
+        protection_per_day: Limit::new(5, Duration::from_secs(86_400)),
+        ..Limits::default()
+    })
+    .await;
+    let account = account(&db).await;
+    let (me, keys) = keyed_device(&db, account, "trusted").await;
+    let (thief, thief_keys) = keyed_device(&db, account, "trusted").await;
+    let now = now_secs();
+    let first = setting(
+        &me,
+        &keys,
+        ProtectionLevel::Standard,
+        1,
+        auth::PROTECTION_GENESIS,
+        now,
+    );
+    store.put_protection(&me, &first).await.expect("first");
+    // A thief's trusted device sends far more validly signed requests than the limit allows, none
+    // of which is the head's successor: each is a conflict and stores nothing.
+    for n in 0..30u8 {
+        let wrong_seq = setting(
+            &thief,
+            &thief_keys,
+            ProtectionLevel::Advanced,
+            5 + u64::from(n),
+            [n; 32],
+            now,
+        );
+        assert!(matches!(
+            store.put_protection(&thief, &wrong_seq).await,
+            Err(StoreError::ProtectionConflict(Some(_)))
+        ));
+    }
+    let replay = setting(
+        &thief,
+        &thief_keys,
+        ProtectionLevel::Standard,
+        1,
+        auth::PROTECTION_GENESIS,
+        now,
+    );
+    assert!(matches!(
+        store.put_protection(&thief, &replay).await,
+        Err(StoreError::ProtectionConflict(Some(_)))
+    ));
+    // The owner's valid next links still go in, up to the limit on stored settings (3 an hour:
+    // the first above and two more); the fourth is refused.
+    let mut prev = hash_of(&me, &first);
+    for seq in 2..=3u64 {
+        let next = setting(&me, &keys, ProtectionLevel::Advanced, seq, prev, now);
+        prev = hash_of(&me, &next);
+        store
+            .put_protection(&me, &next)
+            .await
+            .expect("within the limit");
+    }
+    let fourth = setting(&me, &keys, ProtectionLevel::Standard, 4, prev, now);
+    assert!(matches!(
+        store.put_protection(&me, &fourth).await,
+        Err(StoreError::TooManyProtectionChanges)
+    ));
 }
 
 #[tokio::test]

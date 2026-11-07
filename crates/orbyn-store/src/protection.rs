@@ -147,8 +147,10 @@ impl Store {
         {
             return Err(StoreError::InvalidProtectionSignature);
         }
-        // Counted per account, after the signature verified: only a trusted device's own signed
-        // requests use it up, conflicts included.
+        // Counted per account, after the signature verified, and only for a setting that is
+        // stored: a request that does not fit the chain (a conflict, a replay) and stores nothing
+        // gives its slot back, so requests that never fit cannot use up what the owner's valid
+        // next link needs.
         let subject: [u8; 32] = Sha256::digest(session.account_id.as_bytes()).into();
         let hour = limits::allow(
             &self.pool,
@@ -164,10 +166,33 @@ impl Store {
             self.limits.protection_per_day,
         )
         .await?;
+        let give_back = |hour: bool, day: bool| async move {
+            if hour {
+                limits::give_back(&self.pool, "protection-hour", &subject).await?;
+            }
+            if day {
+                limits::give_back(&self.pool, "protection-day", &subject).await?;
+            }
+            Ok::<(), sqlx::Error>(())
+        };
         if !(hour && day) {
+            give_back(hour, day).await?;
             return Err(StoreError::TooManyProtectionChanges);
         }
+        let stored = self.store_next_protection(session, new, &message).await;
+        if stored.is_err() {
+            give_back(hour, day).await?;
+        }
+        stored
+    }
 
+    /// Stores `new` as the head's successor under the account's lock, or says why it is not.
+    async fn store_next_protection(
+        &self,
+        session: &Session,
+        new: &NewProtection,
+        message: &[u8],
+    ) -> Result<ProtectionRecord> {
         let mut tx = self.pool.begin().await?;
         // The account first, then the device, like every other writer, so none of them deadlock.
         sqlx::query("SELECT 1 FROM accounts WHERE id = $1 FOR NO KEY UPDATE")
@@ -202,7 +227,7 @@ impl Store {
         .bind(i64::try_from(new.seq).map_err(|_| StoreError::InvalidProtection)?)
         .bind(new.level.as_str())
         .bind(new.prev.as_slice())
-        .bind(auth::protection_hash(&message).as_slice())
+        .bind(auth::protection_hash(message).as_slice())
         .bind(new.signed_at)
         .bind(session.device_id)
         .bind(new.signature.as_slice())
