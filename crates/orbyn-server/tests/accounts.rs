@@ -6527,13 +6527,12 @@ async fn a_failed_deletion_leaves_no_tombstone() {
         .expect("trigger gone");
     assert!(failed.is_err(), "the deletion fails");
     assert_eq!(server.tombstones().await, before, "no tombstone");
-    let exists: bool = orbyn_core::sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM accounts WHERE id = $1)",
-    )
-    .bind(account)
-    .fetch_one(pool)
-    .await
-    .expect("exists");
+    let exists: bool =
+        orbyn_core::sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM accounts WHERE id = $1)")
+            .bind(account)
+            .fetch_one(pool)
+            .await
+            .expect("exists");
     assert!(exists, "the account is still there");
     assert_eq!(
         server.status_raw(&account.to_string()).await.0,
@@ -6541,6 +6540,12 @@ async fn a_failed_deletion_leaves_no_tombstone() {
         "a live account is not shown as deleted"
     );
     // And it deletes, with its tombstone, once the trap is gone.
-    assert!(server.worker().delete_if_due(account).await.expect("worker"));
+    assert!(
+        server
+            .worker()
+            .delete_if_due(account)
+            .await
+            .expect("worker")
+    );
     assert_eq!(server.tombstones().await, before + 1);
 }
