@@ -30,6 +30,20 @@ const FINISHED_JOBS_KEPT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const FINISHED_JOBS_BATCH: i64 = 1000;
 const PURGE_STEPS: usize = 50;
 
+/// How the reason starts when a message could not be built at all.
+const BUILD_FAILED: &str = "the message couldn't be built";
+
+/// The log line for an email job given up on: `email job <id> gave up after <n> tries: <reason>`,
+/// with `1 try` for a first try that was also the last.
+pub fn email_gave_up_line(job: impl std::fmt::Display, attempts: i32, reason: &str) -> String {
+    let tries = if attempts == 1 {
+        "1 try".to_owned()
+    } else {
+        format!("{attempts} tries")
+    };
+    format!("email job {job} gave up after {tries}: {reason}")
+}
+
 /// What a handler decided about a job.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
@@ -228,7 +242,13 @@ pub async fn run(
                 let result = match outcome {
                     Outcome::Done => jobs::complete(db.pool(), job.id, &worker_id).await,
                     Outcome::GiveUp(reason) => {
-                        tracing::warn!(job = %job.id, kind = %job.kind, "job given up: {reason}");
+                        if job.kind == mail::JOB_KIND && reason.starts_with(BUILD_FAILED) {
+                            // The designed line: the job, the tries, the reason; never the address
+                            // or the body.
+                            tracing::warn!("{}", email_gave_up_line(job.id, job.attempts, &reason));
+                        } else {
+                            tracing::warn!(job = %job.id, kind = %job.kind, "job given up: {reason}");
+                        }
                         jobs::abandon(db.pool(), job.id, &worker_id, &reason).await
                     }
                     Outcome::Retry(reason) => {
@@ -427,5 +447,19 @@ mod tests {
             .expect("clean");
         assert_eq!(left, 1, "nothing was deleted");
         assert_eq!(state, "done", "the other work ran");
+    }
+
+    #[test]
+    fn the_give_up_line_has_the_job_the_tries_and_the_reason_and_nothing_personal() {
+        let id = uuid::Uuid::nil();
+        let reason = "the message couldn't be built (it has no code)";
+        assert_eq!(
+            email_gave_up_line(id, 1, reason),
+            "email job 00000000-0000-0000-0000-000000000000 gave up after 1 try: the message couldn't be built (it has no code)"
+        );
+        assert_eq!(
+            email_gave_up_line(id, 7, reason),
+            "email job 00000000-0000-0000-0000-000000000000 gave up after 7 tries: the message couldn't be built (it has no code)"
+        );
     }
 }

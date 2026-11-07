@@ -52,6 +52,14 @@ pub struct Config {
     pub smtp_ca_file: Option<String>,
 }
 
+impl ConfigError {
+    /// Whether the message is written for the operator (it starts `error: ` and has its own
+    /// hint lines), to be printed to stderr as it is.
+    pub fn is_operator_message(&self) -> bool {
+        matches!(self, Self::MissingMailFrom | Self::CaFileWithoutSmtp)
+    }
+}
+
 impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Config")
@@ -86,9 +94,13 @@ pub enum ConfigError {
     InvalidAddressUploadCap,
     #[error("ORBYN_DATABASE_POOL_SIZE is not a whole number from 4 to 200")]
     InvalidPoolSize,
-    #[error("ORBYN_SMTP_URL needs ORBYN_MAIL_FROM, the address email is sent from")]
+    #[error(
+        "error: ORBYN_SMTP_URL is set, but ORBYN_MAIL_FROM isn't\n  Orbyn needs a sender address. Set ORBYN_MAIL_FROM, for example:\n  Orbyn <hello@orbyn.dev>"
+    )]
     MissingMailFrom,
-    #[error("ORBYN_SMTP_CA_FILE needs ORBYN_SMTP_URL: it is the CA for that mail server")]
+    #[error(
+        "error: ORBYN_SMTP_CA_FILE is set, but ORBYN_SMTP_URL isn't\n  The CA file only applies to mail sent through ORBYN_SMTP_URL. Set\n  ORBYN_SMTP_URL, or unset ORBYN_SMTP_CA_FILE."
+    )]
     CaFileWithoutSmtp,
     #[error("ORBYN_MAIL can only be `log`")]
     InvalidMailMode,
@@ -405,5 +417,22 @@ mod tests {
         assert_eq!(config.auth_setup.as_deref(), Some("setup-secret"));
         assert!(!format!("{config:?}").contains("secret"));
         Ok(())
+    }
+
+    #[test]
+    fn the_missing_companion_messages_are_as_designed() {
+        assert_eq!(
+            ConfigError::MissingMailFrom.to_string(),
+            "error: ORBYN_SMTP_URL is set, but ORBYN_MAIL_FROM isn't\n  Orbyn needs a sender address. Set ORBYN_MAIL_FROM, for example:\n  Orbyn <hello@orbyn.dev>"
+        );
+        assert_eq!(
+            ConfigError::CaFileWithoutSmtp.to_string(),
+            "error: ORBYN_SMTP_CA_FILE is set, but ORBYN_SMTP_URL isn't\n  The CA file only applies to mail sent through ORBYN_SMTP_URL. Set\n  ORBYN_SMTP_URL, or unset ORBYN_SMTP_CA_FILE."
+        );
+        for message in [ConfigError::MissingMailFrom, ConfigError::CaFileWithoutSmtp] {
+            assert!(message.is_operator_message());
+            assert!(message.to_string().lines().skip(1).all(|l| l.len() <= 72));
+        }
+        assert!(!ConfigError::InvalidMailMode.is_operator_message());
     }
 }

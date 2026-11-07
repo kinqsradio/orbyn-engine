@@ -14,12 +14,23 @@ use chrono::{DateTime, Utc};
 
 use super::{Kind, Mail};
 
-/// A message ready to send: the subject, and the same message as plain text and as HTML.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A message ready to send: the subject, and the same message as plain text and as HTML. It holds
+/// a code or a cancel token, so `Debug` shows none of it, only sizes.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Rendered {
     pub subject: String,
     pub text: String,
     pub html: String,
+}
+
+impl std::fmt::Debug for Rendered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Rendered")
+            .field("subject", &format_args!("({} bytes)", self.subject.len()))
+            .field("text", &format_args!("({} bytes)", self.text.len()))
+            .field("html", &format_args!("({} bytes)", self.html.len()))
+            .finish()
+    }
 }
 
 const FOOTER_HTML: &str = "Sent by Orbyn because of an action on your account. You can reply to this email. Orbyn never asks for your password or codes by email.";
@@ -164,7 +175,7 @@ fn delete_email(to: &str, at: DateTime<Utc>, link: Option<&str>) -> Rendered {
             format!("check your devices at {host}"),
         ),
         None => (
-            "check your devices in Settings >\nAccount > Devices".to_owned(),
+            "check your devices in\nSettings > Account > Devices".to_owned(),
             "check your devices in Settings › Account › Devices".to_owned(),
         ),
     };
@@ -516,8 +527,8 @@ mod tests {
                  signed in and go to Settings > Account > Cancel deletion.\n\
                  You have until the date above.\n\n\
                  If you asked for this, there's nothing else to do. If you\n\
-                 didn't, cancel now and then check your devices in Settings >\n\
-                 Account > Devices.\n\n{FOOTER_LINES}"
+                 didn't, cancel now and then check your devices in\n\
+                 Settings > Account > Devices.\n\n{FOOTER_LINES}"
             )
         );
         assert!(!r.html.contains("<a ") && !r.text.contains("http"));
@@ -550,6 +561,43 @@ mod tests {
         assert!(
             r.html
                 .contains("href=\"https://a.example/sign-in?x=1&amp;y=&quot;2&quot;\"")
+        );
+    }
+
+    #[test]
+    fn debug_shows_sizes_and_never_the_code_or_the_token() {
+        let code = rendered(Kind::VerifyEmail, "482913");
+        let shown = format!("{code:?}");
+        assert!(
+            !shown.contains("482913") && !shown.contains("Orbyn"),
+            "{shown}"
+        );
+        let link = "https://account.orbyn.dev/cancel-deletion#TOKENTOKEN";
+        let delete = rendered(
+            Kind::DeletionScheduled,
+            &format!("2026-11-14T12:00:00Z\n{link}"),
+        );
+        let shown = format!("{delete:?}");
+        assert!(
+            !shown.contains("TOKENTOKEN") && !shown.contains("sam@example.com"),
+            "{shown}"
+        );
+        assert!(shown.contains("bytes"));
+    }
+
+    #[test]
+    fn the_reason_a_message_cannot_be_built_names_no_person() {
+        assert_eq!(
+            mail(Kind::VerifyEmail, None).cannot_build_reason(),
+            "the message couldn't be built (it has no code)"
+        );
+        assert_eq!(
+            mail(Kind::SignUpAttempt, None).cannot_build_reason(),
+            "the message couldn't be built (it has no time)"
+        );
+        assert_eq!(
+            mail(Kind::DeletionScheduled, Some("later\n")).cannot_build_reason(),
+            "the message couldn't be built (its time can't be read)"
         );
     }
 }

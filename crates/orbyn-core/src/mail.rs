@@ -87,6 +87,16 @@ impl std::fmt::Debug for Mail {
 }
 
 impl Mail {
+    /// Why [`Mail::render`] gave nothing, in the words the worker logs when it gives the message
+    /// up: `the message couldn't be built (<reason>)`. Never the address or the value.
+    pub fn cannot_build_reason(&self) -> &'static str {
+        match (self.kind, &self.code) {
+            (Kind::VerifyEmail, _) => "the message couldn't be built (it has no code)",
+            (_, None) => "the message couldn't be built (it has no time)",
+            (_, Some(_)) => "the message couldn't be built (its time can't be read)",
+        }
+    }
+
     /// The message as designed: subject, plain text and HTML, to be sent together. `None` for a
     /// message that lacks the value its kind needs (a code email without its code, or a notice
     /// without its time), which cannot be sent.
