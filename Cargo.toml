@@ -48,6 +48,12 @@ hmac = "0.12"
 sha1 = { version = "0.10", default-features = false }
 # MIT OR Apache-2.0. Sends the worker's email over SMTP; TLS is rustls, with no native TLS library.
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls", "ring", "webpki-roots"] }
+# MIT OR Apache-2.0. The worker reads the extra SMTP CA bundle with it (already in the build through lettre).
+rustls-pki-types = { version = "1", features = ["std"] }
+# MIT OR Apache-2.0. Dev only: the worker's TLS test mail server. Same crate as lettre's TLS, with the ring provider.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+# MIT OR Apache-2.0. Dev only: makes the tests' private CA and server certificates.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
 jiff = { version = "0.2", default-features = false, features = ["std", "serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
