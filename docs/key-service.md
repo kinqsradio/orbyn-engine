@@ -92,16 +92,28 @@ It does not trust its own rows for time. A recovery's 72 hours are measured from
   - **Why P-256 and not X25519**, which devices use between themselves: ECDH on P-256 (CKM_ECDH1_DERIVE) is the key agreement PKCS#11 HSMs most commonly offer; the production HSM's support is to be checked when the provider is chosen. SoftHSM 2.6.1 has no Montgomery keys at all, which was checked on 7 November 2026: X25519 key generation answers CKR_MECHANISM_INVALID, and P-256 derive works. With X25519 the private key would have to leave the HSM to be used. P-256 keeps it inside the HSM.
   - The private key leaves the HSM only wrapped under the key-encryption key (CKM_AES_KEY_WRAP_KWP), stored in the key service's schema.
   - To open envelopes, it is unwrapped back into the HSM as a non-extractable session object and destroyed afterwards.
-- **Service envelopes.** These are the device envelope format with a P-256 recipient: `orbyn_crypto::wrap_key_p256`.
-  - The sender makes a one-time P-256 key, does ECDH with the service public key, and runs HKDF-SHA256 over the shared secret and both public keys (SEC1 compressed), bound to the same label (`orbyn/zone-key/v1`, account, zone, key id).
-  - It seals with XChaCha20-Poly1305 and signs with the device's Ed25519 key, as device envelopes are.
-  - The envelope starts with a format byte (`2` = P-256 recipient), so it can never be read as a device envelope.
-  - The P-256 code is the RustCrypto `p256` crate (Apache-2.0 or MIT), and it runs in wasm as well. It sits beside the existing crypto in `orbyn-crypto` and falls under the same outside review.
+- **Service envelopes.** These are a separate suite, `orbyn_crypto::wrap_key_p256`. They are not a variant of the device format, and are never told apart from it by looking at bytes.
+  - **Context.** The suite has its own context, `orbyn/wrap-p256/v1`, used for the HKDF info, the AEAD context and the Ed25519 signature, so no signature, key or ciphertext of one suite is valid in the other.
+  - **Encoding.** Every P-256 public key is SEC1 compressed (33 bytes) wherever it is signed, hashed or used as input: in the `orbyn/service-key/v1` certification, in the map key, and in the HKDF salt.
+  - **Sealing.** The sender makes a one-time P-256 key and does ECDH with the service public key. The shared secret is the 32-byte x-coordinate.
+    - HKDF-SHA256 runs with salt `ephemeral ‖ recipient` (66 bytes) and info `orbyn/wrap-p256/v1 ‖ len(label) ‖ label`, where the label is `orbyn/zone-key/v1`, account, zone, key id, as for device envelopes.
+    - The zone key is sealed with XChaCha20-Poly1305.
+  - **Signing.** The device signs a transcript in which every field is length-prefixed:
+    - the suite id;
+    - the ephemeral key and the recipient key;
+    - the certified key's identity version and the hash of its `orbyn/service-key/v1` statement;
+    - the label and the sealed bytes.
+
+    This binds the envelope to the exact certified service key, so it cannot be presented against a rotated or other key.
+  - **Storage.** `key_envelopes` tells the suites apart by its recipient kind column (`device`, `service`, and later `account`), never by sniffing bytes.
+  - **Library.** The P-256 code is the RustCrypto `p256` crate (Apache-2.0 or MIT), which runs in wasm too. It sits beside the existing crypto in `orbyn-crypto` and falls under the same outside review.
   - `key_envelopes` gains a recipient kind, `device` or `service`.
   - The 5000-envelope cap and the replace-on-retry rule apply per recipient.
 - **Opening one.**
-  - **Preferred:** CKM_ECDH1_DERIVE on the P-256 key, then CKM_HKDF_DERIVE (PKCS#11 3.0), all inside the HSM. Only the unwrapped zone key leaves the HSM.
-  - **Fallback**, where the HSM lacks HKDF, SoftHSM included: the derived shared secret is extractable, and the key service runs HKDF in memory. It opens one envelope at a time, seals it to the recovered device and zeroes it before the next. The service's private key stays in the HSM either way.
+  - **Validate first.** Before anything reaches the HSM, the key service parses the envelope's ephemeral key with `p256::PublicKey::from_sec1_bytes`, which rejects a point off the curve or the identity. It does not trust the HSM to check: the service key is static and envelopes come from any device, so an invalid-curve point must never reach a derive.
+  - **Derive parameters.** CKM_ECDH1_DERIVE with `CKD_NULL`, the ephemeral key as uncompressed public data, and the 32-byte x-coordinate as the shared secret.
+  - **Preferred:** that derive, then CKM_HKDF_DERIVE (PKCS#11 3.0) with exactly the salt and info above, all inside the HSM. Only the unwrapped zone key leaves the HSM.
+  - **Fallback**, where the HSM lacks HKDF, SoftHSM included: the derived shared secret is extractable, and the key service runs HKDF in memory with exactly the same inputs as the in-HSM path. A test opens one envelope through both paths and checks they agree. It opens one envelope at a time, seals it to the recovered device and zeroes it before the next. The service's private key stays in the HSM either way.
   - **Never** are all of an account's zone keys in memory at once.
 
 ### Rotation
