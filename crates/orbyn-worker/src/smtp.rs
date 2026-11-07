@@ -5,7 +5,7 @@ use lettre::message::{Mailbox, MultiPart};
 use lettre::transport::smtp::AsyncSmtpTransport;
 use lettre::transport::smtp::client::{Certificate, Tls, TlsParameters};
 use lettre::{AsyncTransport, Message, Tokio1Executor};
-use orbyn_core::mail::{Mail, SendError, SendFuture, Sender, scrub};
+use orbyn_core::mail::{Mail, SendError, SendFuture, Sender, scrub_for};
 use rustls_pki_types::pem::PemObject;
 
 /// Sends through one SMTP server as one sender address.
@@ -425,7 +425,7 @@ fn name_text(name: &[u8]) -> Option<String> {
     Some(parts.join(", "))
 }
 
-/// The only part of the address a message may show: `scheme://[user:***@]host[:port]`, built from
+/// The only part of the address a message may show: `scheme://[***:***@]host[:port]`, built from
 /// what parsed, never copied from the text as typed. **Nothing after the host is shown** (no path,
 /// no query, no fragment), because a password with an unencoded `#`, `?` or `/` parses as a short
 /// host followed by a fragment, query or path that holds the rest of the secret, and then no
@@ -438,17 +438,29 @@ fn shown_base(raw: &str, parsed: &url::Url) -> Option<String> {
         return None;
     }
     let host = parsed.host_str().filter(|host| !host.is_empty())?;
+    if !rest[..authority_end].contains('@') && looks_like_userinfo(host, parsed.port()) {
+        return None;
+    }
     let mut shown = format!("{}://", parsed.scheme());
-    if parsed.password().is_some() {
-        shown.push_str(&format!("{}:***@", parsed.username()));
-    } else if !parsed.username().is_empty() {
-        shown.push_str(&format!("{}@", parsed.username()));
+    // Never the username either: some providers use the token as the user name.
+    if parsed.password().is_some() || !parsed.username().is_empty() {
+        shown.push_str("***:***@");
     }
     shown.push_str(host);
     if let Some(port) = parsed.port() {
         shown.push_str(&format!(":{port}"));
     }
     Some(shown)
+}
+
+/// `smtp://user:12345` has no `@`, so `user` parses as the host and the password as its port. A
+/// one-word host (no dot, not an IP address, not `localhost`) with a port that no mail server
+/// usually listens on is taken as that mistake, and the address is no address. Ports 25, 465,
+/// 587, 1025, 2525 and 3025 are the usual ones, so a container's own `mailhog:1025` stands.
+fn looks_like_userinfo(host: &str, port: Option<u16>) -> bool {
+    let Some(port) = port else { return false };
+    let one_word = !host.contains(['.', ':']) && host != "localhost";
+    one_word && ![25, 465, 587, 1025, 2525, 3025].contains(&port)
 }
 
 /// Replaces the password, and the whole address as given, in a message from elsewhere.
@@ -461,6 +473,9 @@ fn redact(message: &str, url: &str) -> String {
         }
         if let Some(password) = parsed.password().filter(|p| !p.is_empty()) {
             out = out.replace(password, "***");
+        }
+        if !parsed.username().is_empty() {
+            out = out.replace(parsed.username(), "***");
         }
     }
     out
@@ -480,7 +495,7 @@ fn mail_from_refused() -> String {
 
 fn not_an_address() -> String {
     format!(
-        "{OPERATOR_ERROR}ORBYN_SMTP_URL isn't an address\n  It should look like smtps://mail.example.com:465 or\n  smtp://user:***@mail.example.com:587."
+        "{OPERATOR_ERROR}ORBYN_SMTP_URL isn't an address\n  It should look like smtps://mail.example.com:465 or\n  smtp://***:***@mail.example.com:587."
     )
 }
 
@@ -648,14 +663,14 @@ impl Sender for Smtp {
                 .map_err(|error| SendError {
                     reason: format!(
                         "the message couldn't be built (the mail library refused it: {})",
-                        scrub(&error.to_string())
+                        scrub_for(&error.to_string(), &mail.to)
                     ),
                     permanent: true,
                 })?;
             match self.transport.send(message).await {
                 Ok(_) => Ok(()),
                 Err(error) if error.is_permanent() => Err(SendError {
-                    reason: refused_for_good(&error),
+                    reason: refused_for_good(&error, &mail.to),
                     permanent: true,
                 }),
                 Err(_) => Err(SendError {
@@ -669,7 +684,7 @@ impl Sender for Smtp {
 
 /// `the mail server refused it for good (<code> <server text>)`, with the server's text cleaned
 /// of any address (servers echo the recipient) and cut short.
-fn refused_for_good(error: &lettre::transport::smtp::Error) -> String {
+fn refused_for_good(error: &lettre::transport::smtp::Error, to: &str) -> String {
     use std::error::Error as _;
     let code = error
         .status()
@@ -677,7 +692,7 @@ fn refused_for_good(error: &lettre::transport::smtp::Error) -> String {
         .unwrap_or_default();
     let text = error
         .source()
-        .map(|s| scrub(&s.to_string()))
+        .map(|s| scrub_for(&s.to_string(), to))
         .unwrap_or_default();
     let said = [code.as_str(), text.as_str()]
         .iter()
@@ -765,7 +780,7 @@ mod tests {
         // Not an address, no host, not a mail scheme.
         assert_eq!(
             url_error("mail.example.com"),
-            "error: ORBYN_SMTP_URL isn't an address\n  It should look like smtps://mail.example.com:465 or\n  smtp://user:***@mail.example.com:587."
+            "error: ORBYN_SMTP_URL isn't an address\n  It should look like smtps://mail.example.com:465 or\n  smtp://***:***@mail.example.com:587."
         );
         for empty in ["smtps://", "smtp://:587?tls=required"] {
             assert_eq!(
@@ -781,7 +796,7 @@ mod tests {
         // No tls= at all, or an empty query: how to fix it, with the password hidden.
         assert_eq!(
             url_error("smtp://user:hunter2@mail.example.com:587"),
-            "error: ORBYN_SMTP_URL (smtp://user:***@mail.example.com:587) doesn't say how to encrypt\n  Orbyn only sends mail over TLS. Add ?tls=required to the address:\n    smtp://user:***@mail.example.com:587?tls=required\n  Or use smtps://mail.example.com:465."
+            "error: ORBYN_SMTP_URL (smtp://***:***@mail.example.com:587) doesn't say how to encrypt\n  Orbyn only sends mail over TLS. Add ?tls=required to the address:\n    smtp://***:***@mail.example.com:587?tls=required\n  Or use smtps://mail.example.com:465."
         );
         assert_eq!(
             url_error("smtp://mail.example.com:25?"),
@@ -819,7 +834,7 @@ mod tests {
         }
         assert_eq!(
             url_error("smtp://user:hunter2@mail.example.com:587?x=1#tls=required"),
-            "error: ORBYN_SMTP_URL has tls=required after a '#', where it has no effect\n  Put it before the '#':\n    smtp://user:***@mail.example.com:587?tls=required"
+            "error: ORBYN_SMTP_URL has tls=required after a '#', where it has no effect\n  Put it before the '#':\n    smtp://***:***@mail.example.com:587?tls=required"
         );
         assert_eq!(
             url_error("smtp://mail.example.com:587?other=tls=required"),
@@ -853,7 +868,7 @@ mod tests {
         let shown = library_refused(url, &format!("bad url {url} for user:hunter2 at host."));
         assert_eq!(
             shown,
-            "error: the mail library didn't accept ORBYN_SMTP_URL\n  The library said: bad url smtp://user:***@mail.example.com:587 for user:*** at host.\n  Check the host, the port, and any special characters in the\n  password (write them as %xx)."
+            "error: the mail library didn't accept ORBYN_SMTP_URL\n  The library said: bad url smtp://***:***@mail.example.com:587 for ***:*** at host.\n  Check the host, the port, and any special characters in the\n  password (write them as %xx)."
         );
         assert!(!shown.contains("hunter2"));
         // No password in the address: the message is only tidied.
@@ -1955,6 +1970,44 @@ mod tests {
             "{error:?}"
         );
         assert_eq!(error.lines().count(), 2, "{error:?}");
+    }
+
+    #[test]
+    fn the_user_name_is_never_shown_and_a_port_that_is_a_password_is_no_port() {
+        // A provider that uses its token as the user name.
+        let error = url_error("smtp://TOKEN123:TOKEN123@mail.example.com:587");
+        assert!(
+            error.contains("smtp://***:***@mail.example.com:587") && !error.contains("TOKEN123"),
+            "{error}"
+        );
+        let error = url_error("smtp://TOKEN123@mail.example.com:587");
+        assert!(
+            !error.contains("TOKEN123") && error.contains("***:***@"),
+            "{error}"
+        );
+        // `user:12345` parses as host and port: it is no address, and nothing of it is shown.
+        let error = url_error("smtp://user:12345");
+        assert!(
+            error.contains("isn't an address") && !error.contains("12345"),
+            "{error}"
+        );
+        // A container's own host name with a usual port stands.
+        assert!(
+            Smtp::new(
+                "smtp://mailhog:1025?tls=required",
+                "hello@example.com",
+                None
+            )
+            .is_ok()
+        );
+        assert!(
+            Smtp::new(
+                "smtp://localhost:2525?tls=required",
+                "hello@example.com",
+                None
+            )
+            .is_ok()
+        );
     }
 
     #[tokio::test]

@@ -130,48 +130,137 @@ pub fn lifetime_words(seconds: u64) -> String {
 /// The longest text from a server or a library that goes into a log line.
 pub const SCRUBBED_MAX: usize = 200;
 
-/// Text a mail server or a mail library sent, made safe for a log line: **every email address in
-/// it becomes `<address>`** (servers often echo the recipient, as in
-/// `550 5.1.1 <sam@example.com>: user unknown`, and an address in angle brackets keeps just the
-/// one pair), control characters go, and it is cut to [`SCRUBBED_MAX`] characters.
+/// Text a mail server or a mail library sent, made safe for a log line, in two layers.
+///
+/// 1. **The recipient, exactly** ([`scrub_for`] only): the address as given, its local part and
+///    both percent-encoded forms go first, so whatever shape the address has, it does not survive
+///    in the text, however odd (`a!b@x`, `"sam smith"@x`, `sam@[192.0.2.1]`).
+/// 2. **Every other address-like token**: the text is cut into tokens at whitespace, `<`, `>`, `"`,
+///    `,`, `;`, `(` and `)`, and **every token that contains `@` or `%40` becomes `<address>`**
+///    (a quoted part right before an `@` belongs to its token, and one pair of angle brackets
+///    around a token goes with it). This is deliberately wider than any grammar: a token that
+///    only looks like an address goes too.
+///
+/// Control characters go, and the result is cut to [`SCRUBBED_MAX`] characters.
 pub fn scrub(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
-    let local = |c: char| c.is_alphanumeric() || "._%+-'".contains(c);
-    let domain = |c: char| c.is_alphanumeric() || ".-".contains(c);
+    let delimiter = |c: char| c.is_whitespace() || "<>\",;()".contains(c);
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
     while i < chars.len() {
-        if chars[i] == '@' {
-            let mut start = i;
-            while start > 0 && local(chars[start - 1]) {
-                start -= 1;
+        if !delimiter(chars[i]) || (chars[i] == '"' && quoted_local_end(&chars, i).is_some()) {
+            // A token: from here to the next delimiter, taking in a quoted local part.
+            let mut end = i;
+            if chars[i] == '"' {
+                end = quoted_local_end(&chars, i).unwrap_or(i);
             }
-            let mut end = i + 1;
-            while end < chars.len() && domain(chars[end]) {
+            while end < chars.len() && !delimiter(chars[end]) {
                 end += 1;
             }
-            if start < i && end > i + 1 {
-                // Take back what was already written for the local part.
-                for _ in start..i {
-                    out.pop();
-                }
+            let token: String = chars[i..end].iter().collect();
+            let lower = token.to_ascii_lowercase();
+            if (token.contains('@') && token.chars().count() > 1) || lower.contains("%40") {
                 let bracketed = out.ends_with('<') && chars.get(end) == Some(&'>');
                 if bracketed {
                     out.pop();
                     end += 1;
                 }
                 out.push_str("<address>");
-                i = end;
-                continue;
+            } else {
+                out.push_str(&token);
             }
+            i = end;
+        } else {
+            out.push(chars[i]);
+            i += 1;
         }
-        out.push(chars[i]);
-        i += 1;
     }
     out.chars()
         .filter(|c| !c.is_control())
         .take(SCRUBBED_MAX)
         .collect()
+}
+
+/// For a `"` at `open`: the index just after the closing `"` when an `@` follows it at once.
+fn quoted_local_end(chars: &[char], open: usize) -> Option<usize> {
+    let close = chars[open + 1..].iter().position(|&c| c == '"')? + open + 1;
+    (chars.get(close + 1) == Some(&'@')).then_some(close + 1)
+}
+
+/// [`scrub`], after the recipient `to` is taken out exactly: the address as given, its local part
+/// and the percent-encoded forms of both, whatever case the server used. A local part goes only
+/// as a whole word, so a short one does not eat the middle of other words (a one-letter local
+/// part still removes every standalone use of that letter, which is the price of never
+/// echoing it).
+pub fn scrub_for(text: &str, to: &str) -> String {
+    let to = to.trim();
+    let mut out = text.to_owned();
+    if to.is_empty() {
+        return scrub(&out);
+    }
+    let local = to.rsplit_once('@').map_or("", |(local, _)| local);
+    let mut whole = [
+        to.to_owned(),
+        percent_encode(to),
+        to.replace('@', "%40"),
+        to.trim_matches('"').to_owned(),
+    ];
+    whole.sort_by_key(|form| std::cmp::Reverse(form.len()));
+    for form in whole.iter().filter(|form| !form.is_empty()) {
+        out = replace_ignoring_case(&out, form, false);
+    }
+    for form in [
+        local.to_owned(),
+        percent_encode(local),
+        local.trim_matches('"').to_owned(),
+    ] {
+        if !form.is_empty() {
+            out = replace_ignoring_case(&out, &form, true);
+        }
+    }
+    // The recipient inside one pair of angle brackets keeps just the one pair.
+    scrub(&out.replace("<<address>>", "<address>"))
+}
+
+/// Every byte that is not an ASCII letter, digit or one of `-._~` as `%XX`.
+fn percent_encode(text: &str) -> String {
+    text.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+                char::from(b).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+/// Replaces every occurrence of `needle` in `text`, whatever its case, with `<address>`; with
+/// `whole_word`, only where the characters on both sides are not letters or digits.
+fn replace_ignoring_case(text: &str, needle: &str, whole_word: bool) -> String {
+    let (hay, pat): (Vec<char>, Vec<char>) = (
+        text.chars().map(|c| c.to_ascii_lowercase()).collect(),
+        needle.chars().map(|c| c.to_ascii_lowercase()).collect(),
+    );
+    let original: Vec<char> = text.chars().collect();
+    let word = |c: Option<&char>| c.is_some_and(|c| c.is_alphanumeric());
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < original.len() {
+        let end = i + pat.len();
+        let hit = end <= hay.len()
+            && hay[i..end] == pat[..]
+            && (!whole_word
+                || (!word(i.checked_sub(1).and_then(|j| hay.get(j))) && !word(hay.get(end))));
+        if hit {
+            out.push_str("<address>");
+            i = end;
+        } else {
+            out.push(original[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Why a message could not be sent. Never carries an address or a code.
@@ -380,8 +469,9 @@ async fn deliver_at(
     };
     match sender.send(&mail).await {
         Ok(()) => Delivery::Sent,
-        Err(error) if error.permanent => Delivery::GiveUp(error.reason),
-        Err(error) => Delivery::Retry(error.reason),
+        // Whatever a sender says, the address is taken out of it before it is logged or stored.
+        Err(error) if error.permanent => Delivery::GiveUp(scrub_for(&error.reason, &mail.to)),
+        Err(error) => Delivery::Retry(scrub_for(&error.reason, &mail.to)),
     }
 }
 
@@ -478,6 +568,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn whatever_a_sender_says_the_delivery_has_no_part_of_the_address() {
+        let secrets = secrets();
+        let queued = 1_000_000;
+        for shape in [
+            "a!b@example.com",
+            "first=last@example.com",
+            "x/y@example.com",
+            "a#b@example.com",
+            "sam@mail_x.example.com",
+            "sam@[192.0.2.1]",
+            "\"sam smith\"@example.com",
+        ] {
+            let mut m = mail(Some("123456"));
+            m.to = shape.to_owned();
+            let id = Uuid::new_v4();
+            let mut job = job(payload(&secrets, id, &m, queued).expect("payload"));
+            job.id = id;
+            for text in [
+                format!("550 <{shape}> no such user"),
+                format!("550 {} no", shape.replace('@', "%40")),
+                format!("rejected {shape}."),
+            ] {
+                let sender = Failing(SendError {
+                    reason: text,
+                    permanent: true,
+                });
+                let Delivery::GiveUp(reason) =
+                    deliver_at(&job, Some(&secrets), &sender, queued).await
+                else {
+                    panic!("given up")
+                };
+                for part in [
+                    "sam", "smith", "a!b", "first", "x/y", "a#b", "192.0", "example", "%40",
+                ] {
+                    assert!(!reason.contains(part), "{shape}: {reason}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn a_delivery_is_sent_retried_or_given_up_on() {
         let secrets = secrets();
         let m = mail(Some("123456"));
@@ -571,21 +702,60 @@ mod tests {
         );
         assert_eq!(scrub("<a@b.com> <c@d.com>"), "<address> <address>");
         // Not addresses: nothing to remove.
-        for plain in [
-            "user @ host",
-            "@mention",
-            "trailing@",
-            "550 mailbox full",
-            "",
-        ] {
+        for plain in ["user @ host", "550 mailbox full", ""] {
             assert_eq!(scrub(plain), plain);
         }
+        // Token-based, so anything with an @ in it goes, grammar or not.
+        assert_eq!(scrub("@mention"), "<address>");
+        assert_eq!(scrub("trailing@ x"), "<address> x");
         // Control characters go, and the text is cut to 200 characters.
         assert_eq!(scrub("a\r\nb\u{7}c"), "abc");
         assert_eq!(scrub(&"x".repeat(500)).chars().count(), 200);
         let long = format!("{} sam@example.com", "y".repeat(190));
         assert!(!scrub(&long).contains("example.com"));
         assert!(scrub(&long).chars().count() <= 200);
+    }
+
+    #[test]
+    fn every_shape_of_address_goes_from_server_text() {
+        for shape in [
+            "a!b@example.com",
+            "first=last@example.com",
+            "x/y@example.com",
+            "a#b@example.com",
+            "sam@mail_x.example.com",
+            "sam@[192.0.2.1]",
+            "\"sam smith\"@example.com",
+            "sam%40example.com",
+            "SAM@EXAMPLE.COM",
+        ] {
+            // Said back by a server that knows nothing about the recipient.
+            let said = format!("550 5.1.1 <{shape}>: user unknown; also {shape}, bye");
+            let clean = scrub(&said);
+            for part in [
+                "sam", "smith", "a!b", "first", "x/y", "a#b", "192.0", "example", "EXAMPLE", "%40",
+            ] {
+                assert!(!clean.contains(part), "{shape}: {clean}");
+            }
+            // And with the recipient known, in any case or percent-encoded.
+            let known = format!("{said} {} {}", shape.to_uppercase(), percent_encode(shape));
+            let clean = scrub_for(&known, shape);
+            for part in [
+                "sam", "smith", "a!b", "first", "x/y", "a#b", "192.0", "example",
+            ] {
+                assert!(!clean.to_lowercase().contains(part), "{shape}: {clean}");
+            }
+        }
+        // The recipient's local part alone is removed too, as a word, even when no @ follows.
+        assert_eq!(
+            scrub_for("user smithy rejected, smith unknown", "smith@example.com"),
+            "user smithy rejected, <address> unknown"
+        );
+        assert!(!scrub_for("%73mith@example.com", "smith@example.com").contains("mith"));
+        assert_eq!(
+            scrub_for("550 mailbox full", "sam@example.com"),
+            "550 mailbox full"
+        );
     }
 
     #[test]
