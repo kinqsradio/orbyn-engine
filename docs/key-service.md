@@ -89,7 +89,7 @@ It does not trust its own rows for time. A recovery's 72 hours are measured from
     - recovery approvals.
   - **Certification.** The key service signs a service key only one it generated inside the HSM in the same call. It has no API that takes a key to sign.
 - **Account service key.** One **P-256** pair per Standard account, generated in the HSM when the account first signs Standard.
-  - **Why P-256 and not X25519**, which devices use between themselves: ECDH on P-256 (CKM_ECDH1_DERIVE) is what HSMs and cloud KMS services widely support. SoftHSM 2.6.1 has no Montgomery keys at all, which was checked on 7 November 2026: X25519 key generation answers CKR_MECHANISM_INVALID, and P-256 derive works. With X25519 the private key would have to leave the HSM to be used. P-256 keeps it inside on every HSM we would run.
+  - **Why P-256 and not X25519**, which devices use between themselves: ECDH on P-256 (CKM_ECDH1_DERIVE) is the key agreement PKCS#11 HSMs most commonly offer; the production HSM's support is to be checked when the provider is chosen. SoftHSM 2.6.1 has no Montgomery keys at all, which was checked on 7 November 2026: X25519 key generation answers CKR_MECHANISM_INVALID, and P-256 derive works. With X25519 the private key would have to leave the HSM to be used. P-256 keeps it inside the HSM.
   - The private key leaves the HSM only wrapped under the key-encryption key (CKM_AES_KEY_WRAP_KWP), stored in the key service's schema.
   - To open envelopes, it is unwrapped back into the HSM as a non-extractable session object and destroyed afterwards.
 - **Service envelopes.** These are the device envelope format with a P-256 recipient: `orbyn_crypto::wrap_key_p256`.
