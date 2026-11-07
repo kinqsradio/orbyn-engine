@@ -317,6 +317,29 @@ pub struct CancelDeletionByMail {
     pub token: String,
 }
 
+/// `POST /v1/accounts/delete-unused`: asks for the link that deletes an unused account (one with
+/// no key-holding device and nothing ever stored), so the address can sign up again. No sign-in.
+/// Always answers 202 `{}`, whatever the address is (an account or not, unused or not, an address
+/// or not), so the answer says nothing about the account; the link is mailed only when the
+/// account is unused. 429 `too_many_attempts` only for a flood from one network.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct DeleteUnusedRequest {
+    pub email: String,
+}
+
+/// `POST /v1/accounts/delete-unused/confirm`: the token from the link in that email. No sign-in;
+/// it deletes the account at once if it is still unused and does nothing else. The planner's page
+/// opens from the link and posts the token only when its button is pressed (a mail scanner that
+/// opens the link changes nothing). Answer 204; 400 `invalid_delete_unused_token` for any wrong,
+/// used, voided or expired token; 409 `delete_unused_not_possible` when the account holds keys or
+/// stored data now (nothing is deleted).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct DeleteUnusedConfirm {
+    pub token: String,
+}
+
 /// A device of the account.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]

@@ -41,6 +41,11 @@ pub(crate) fn routes() -> Router<AppState> {
             "/v1/accounts/delete/cancel-by-mail",
             post(cancel_deletion_by_mail),
         )
+        .route("/v1/accounts/delete-unused", post(delete_unused_request))
+        .route(
+            "/v1/accounts/delete-unused/confirm",
+            post(delete_unused_confirm),
+        )
         .route("/v1/sessions/current", delete(revoke_current))
         .route("/v1/sessions", delete(revoke_all))
         .route("/v1/devices", get(list_devices))
@@ -121,6 +126,12 @@ impl IntoResponse for Failure {
             }
             AccountError::DeletionScheduled => (StatusCode::CONFLICT, "deletion_scheduled"),
             AccountError::InvalidCancelToken => (StatusCode::BAD_REQUEST, "invalid_cancel_token"),
+            AccountError::InvalidDeleteUnusedToken => {
+                (StatusCode::BAD_REQUEST, "invalid_delete_unused_token")
+            }
+            AccountError::DeleteUnusedNotPossible => {
+                (StatusCode::CONFLICT, "delete_unused_not_possible")
+            }
             AccountError::TotpAlreadyEnabled => (StatusCode::CONFLICT, "totp_already_enabled"),
             AccountError::TotpNotEnabled => (StatusCode::CONFLICT, "totp_not_enabled"),
             AccountError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
@@ -751,6 +762,29 @@ async fn cancel_deletion_by_mail(
 ) -> Answer<StatusCode> {
     service(&state)?
         .cancel_deletion_by_mail(&client, &body.token)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Always 202 `{}`: the service takes the same steps for every address and never reads the account.
+async fn delete_unused_request(
+    State(state): State<AppState>,
+    Caller(client): Caller,
+    Body(body): Body<wire::DeleteUnusedRequest>,
+) -> Answer<(StatusCode, Json<serde_json::Value>)> {
+    service(&state)?
+        .request_delete_unused(&client, &body.email)
+        .await?;
+    Ok((StatusCode::ACCEPTED, Json(serde_json::json!({}))))
+}
+
+async fn delete_unused_confirm(
+    State(state): State<AppState>,
+    Caller(client): Caller,
+    Body(body): Body<wire::DeleteUnusedConfirm>,
+) -> Answer<StatusCode> {
+    service(&state)?
+        .confirm_delete_unused(&client, &body.token)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }

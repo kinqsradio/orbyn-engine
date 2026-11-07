@@ -41,6 +41,8 @@ pub enum Kind {
     SignUpAttempt,
     /// Tells an account's address that its deletion is scheduled, with the date in `code`.
     DeletionScheduled,
+    /// The link that deletes an unused account, in `code` (empty when there is no account site).
+    DeleteUnused,
 }
 
 impl Kind {
@@ -49,6 +51,7 @@ impl Kind {
             Self::VerifyEmail => "verify_email",
             Self::SignUpAttempt => "sign_up_attempt",
             Self::DeletionScheduled => "deletion_scheduled",
+            Self::DeleteUnused => "delete_unused",
         }
     }
 
@@ -57,6 +60,7 @@ impl Kind {
             "verify_email" => Some(Self::VerifyEmail),
             "sign_up_attempt" => Some(Self::SignUpAttempt),
             "deletion_scheduled" => Some(Self::DeletionScheduled),
+            "delete_unused" => Some(Self::DeleteUnused),
             _ => None,
         }
     }
@@ -92,6 +96,7 @@ impl Mail {
     pub fn cannot_build_reason(&self) -> &'static str {
         match (self.kind, &self.code) {
             (Kind::VerifyEmail, _) => "the message couldn't be built (it has no code)",
+            (Kind::DeleteUnused, _) => "the message couldn't be built (it has no link)",
             (_, None) => "the message couldn't be built (it has no time)",
             (_, Some(_)) => "the message couldn't be built (its time can't be read)",
         }
@@ -111,6 +116,7 @@ pub fn kind_in_words(kind: &str) -> &'static str {
         Some(Kind::VerifyEmail) => "verification code",
         Some(Kind::SignUpAttempt) => "sign-up notice",
         Some(Kind::DeletionScheduled) => "account deletion notice",
+        Some(Kind::DeleteUnused) => "unused account deletion link",
         None => "email",
     }
 }
