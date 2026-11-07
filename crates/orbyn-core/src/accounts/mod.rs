@@ -829,8 +829,8 @@ impl Accounts {
     ) -> Result<NewSession> {
         let mut tx = self.pool.begin().await?;
         // The account first (the deletion takes it before the devices), then the device row. `FOR NO
-        // KEY UPDATE` serializes sign-ins, which the pending-device cap below needs, and still lets the
-        // foreign-key checks of the rows inserted below through.
+        // KEY UPDATE` serializes sign-ins, which the pending-device cap below needs, while still letting
+        // other transactions' foreign-key checks (`FOR KEY SHARE`) on this account through.
         sqlx::query("SELECT id FROM accounts WHERE id = $1 FOR NO KEY UPDATE")
             .bind(account_id)
             .execute(&mut *tx)
